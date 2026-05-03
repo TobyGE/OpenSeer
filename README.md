@@ -68,14 +68,37 @@ memory-aware, locally-running, model-agnostic, open source.
 git clone https://github.com/TobyGE/OpenSeer.git
 cd OpenSeer
 pip install -e .
+```
 
-# Requires:
-#   - macOS (tested on Sequoia)
-#   - Codex CLI installed and signed in (~/.codex/auth.json present)
-#   - System Settings → Privacy & Security → Accessibility:
-#       enable iTerm (or whichever terminal you'll run from)
+OpenSeer authenticates against the ChatGPT codex backend by reusing
+the OAuth tokens that the official **Codex CLI** stores locally —
+so your ChatGPT subscription powers the model, no API key required.
+Install Codex CLI once, then log in through OpenSeer:
 
+```bash
+# 1. install Codex CLI (one-time, system-wide)
+npm install -g @openai/codex
+
+# 2. log in — opens your browser, drops a token in ~/.codex/auth.json
+openseer auth login
+
+# 3. confirm
+openseer auth status
+# → ✅ logged in — auth_mode=chatgpt plan=plus expires_in=…h
+```
+
+You also need to grant your terminal **Accessibility** permission
+(System Settings → Privacy & Security → Accessibility), otherwise
+pyautogui will silently fail to inject mouse / keyboard events.
+
+Then run a task:
+
+```bash
 openseer "Open Calculator and compute 999 * 123"
+# equivalent to: openseer task "Open Calculator and compute 999 * 123"
+
+openseer --execute "Open Calculator and compute 999 * 123"   # actually drive the UI
+openseer --execute --confirm-each "..."                       # ask y/s/q per step
 ```
 
 The agent will take over the mouse and keyboard while it runs. To

@@ -25,7 +25,6 @@ from pathlib import Path
 
 from PIL import Image
 
-_AUTH = Path.home() / ".codex" / "auth.json"
 _URL = "https://chatgpt.com/backend-api/codex/responses"
 
 MODEL = "gpt-5.5"
@@ -40,8 +39,21 @@ class Prediction:
 
 
 def _tokens() -> tuple[str, str]:
-    auth = json.loads(_AUTH.read_text())
-    return auth["tokens"]["access_token"], auth["tokens"]["account_id"]
+    """Load ChatGPT OAuth tokens. Raises with a friendly message if the
+    user hasn't logged in yet."""
+    from .auth import load_tokens
+    try:
+        auth = load_tokens()
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e)) from e
+    tk = auth.get("tokens") or {}
+    access, account_id = tk.get("access_token"), tk.get("account_id")
+    if not access or not account_id:
+        raise RuntimeError(
+            "auth file exists but is missing access_token / account_id. "
+            "Run `openseer auth login` to refresh."
+        )
+    return access, account_id
 
 
 def _stream(payload: dict) -> str:

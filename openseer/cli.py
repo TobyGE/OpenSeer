@@ -1,37 +1,117 @@
-"""CLI: python -m openseer.cli_agent "open Calculator and compute 17 * 42"
+"""OpenSeer command-line interface.
 
-Default is dry-run (predict + annotate, never click). Pass --execute
-to actually drive the keyboard/mouse.
+Subcommands:
+    openseer task "<task>" [options]    drive the agent loop
+    openseer auth status                 show ChatGPT OAuth login state
+    openseer auth login                  log in via Codex CLI's OAuth flow
+    openseer auth logout                 wipe local tokens
+
+For convenience, ``openseer "<task>"`` (no subcommand) is an alias for
+``openseer task "<task>"``.
 """
 from __future__ import annotations
 
 import argparse
+import sys
 
+from . import auth as auth_mod
 from .agent import run
 
 
-def main():
-    ap = argparse.ArgumentParser(description="GPT-5.5 macOS computer-use agent (basic)")
+# ────────────────────────────  task subcommand  ──────────────────────────────
+
+def _add_task_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("task", help="Natural-language task description")
     ap.add_argument("--max-steps", type=int, default=10)
     ap.add_argument("--execute", action="store_true",
                     help="Actually execute pyautogui actions (default: dry-run)")
     ap.add_argument("--confirm-each", action="store_true",
-                    help="Prompt y/s/q before each action (recommended for first runs)")
-    ap.add_argument("--sleep", type=float, default=1.5,
-                    help="Seconds to wait between turns (lets UI settle)")
+                    help="Prompt y/s/q before each action")
+    ap.add_argument("--sleep", type=float, default=0.0,
+                    help="Seconds between turns (lets UI settle)")
     ap.add_argument("--grounder", default="gpt55", choices=["gpt55", "haiku"],
                     help="Default backend that resolves target descriptions to (x,y)")
     ap.add_argument("--external-grounder", default=None,
                     choices=["gpt55", "haiku"],
-                    help="Specialist grounder invoked when model emits "
-                         "{action:'reground', external:true}. Defaults to "
-                         "same as --grounder (no real escalation).")
-    args = ap.parse_args()
+                    help="Specialist grounder for reground[external:true]")
+
+
+def cmd_task(args: argparse.Namespace) -> int:
+    # quick sanity check before running anything heavy
+    st = auth_mod.token_status()
+    if not st.has_file:
+        print(st.summary())
+        print("\nLog in first:\n    openseer auth login\n")
+        return 1
+    if st.expired:
+        print("⚠️  ChatGPT OAuth token appears expired.")
+        print(st.summary())
+        print("Try: openseer auth login")
+        return 1
 
     run(args.task, max_steps=args.max_steps, dry_run=not args.execute,
         confirm_each=args.confirm_each, sleep_between=args.sleep,
         grounder=args.grounder, external_grounder=args.external_grounder)
+    return 0
+
+
+# ────────────────────────────  auth subcommands  ─────────────────────────────
+
+def cmd_auth_status(args: argparse.Namespace) -> int:
+    st = auth_mod.token_status()
+    print(st.summary())
+    cli = auth_mod.codex_cli_path()
+    print(f"codex CLI:   {cli or 'NOT INSTALLED'}")
+    print(f"auth.json:   {auth_mod.AUTH_FILE}")
+    return 0 if (st.has_file and not st.expired) else 1
+
+
+def cmd_auth_login(args: argparse.Namespace) -> int:
+    return auth_mod.run_codex_login()
+
+
+def cmd_auth_logout(args: argparse.Namespace) -> int:
+    return auth_mod.run_codex_logout()
+
+
+# ────────────────────────────  argparse plumbing  ────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="openseer",
+        description="OpenSeer — chat-first, memory-aware macOS computer-use agent",
+    )
+    sub = ap.add_subparsers(dest="cmd", metavar="{task,auth}")
+
+    p_task = sub.add_parser("task", help="Run the agent on a task")
+    _add_task_args(p_task)
+    p_task.set_defaults(func=cmd_task)
+
+    p_auth = sub.add_parser("auth", help="Manage ChatGPT OAuth login")
+    sub_auth = p_auth.add_subparsers(dest="auth_cmd", metavar="{status,login,logout}")
+    sub_auth.required = True
+    sub_auth.add_parser("status", help="Show login state").set_defaults(func=cmd_auth_status)
+    sub_auth.add_parser("login",  help="Log in via Codex CLI").set_defaults(func=cmd_auth_login)
+    sub_auth.add_parser("logout", help="Wipe local tokens").set_defaults(func=cmd_auth_logout)
+
+    return ap
+
+
+_KNOWN_SUBCOMMANDS = {"task", "auth", "-h", "--help"}
+
+
+def main() -> None:
+    # Convenience: `openseer "<task>"` is an alias for `openseer task "<task>"`.
+    argv = sys.argv[1:]
+    if argv and argv[0] not in _KNOWN_SUBCOMMANDS and not argv[0].startswith("-"):
+        argv = ["task"] + argv
+
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "func", None):
+        ap.print_help()
+        sys.exit(2)
+    sys.exit(args.func(args) or 0)
 
 
 if __name__ == "__main__":

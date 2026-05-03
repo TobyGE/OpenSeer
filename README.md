@@ -89,6 +89,18 @@ Agent loop is intentionally small: **capture → ask model → parse
 action(s) → execute → loop**. Cross-cutting concerns (image retention,
 trajectory, budget) plug in as `Callback`s.
 
+## Contributing
+
+Tracked git hooks live in `.githooks/`. Enable them per-clone with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+`pre-push` runs `codex review` against the commits being pushed and
+prints findings (advisory; doesn't block). Set `OPENSEER_SKIP_REVIEW=1`
+to skip on a one-off basis.
+
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).

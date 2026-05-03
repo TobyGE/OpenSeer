@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# OpenSeer pre-push hook — run `codex review` against the commits about
+# to be pushed, surface findings BEFORE they hit the remote.
+#
+# Behaviour:
+#   - Advisory only: never blocks the push (always exits 0).
+#   - Skips when:
+#       * the env var OPENSEER_SKIP_REVIEW=1 is set
+#       * `codex` CLI isn't on PATH
+#       * the push is a delete or no real ref change
+#   - Reviews `${remote_sha}..${local_sha}` per ref being pushed.
+#     For brand-new branches (no remote_sha), reviews the last 10 commits.
+#
+# Install once per fresh clone:
+#     git config core.hooksPath .githooks
+# (Already configured if you cloned and ran `make hooks` or similar.)
+
+set -u
+
+if [[ "${OPENSEER_SKIP_REVIEW:-0}" == "1" ]]; then
+    exit 0
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+    echo "[pre-push] codex CLI not found, skipping review"
+    exit 0
+fi
+
+ZERO="0000000000000000000000000000000000000000"
+
+# stdin format per `git help hooks`:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # delete branch: nothing to review
+    [[ "$local_sha" == "$ZERO" ]] && continue
+    # no change
+    [[ "$local_sha" == "$remote_sha" ]] && continue
+
+    if [[ "$remote_sha" == "$ZERO" ]]; then
+        # brand new branch — review last 10 commits as a sane window
+        base="$(git rev-list --max-count=10 "$local_sha" | tail -n 1)"
+        scope="new branch — last 10 commits up to $(git rev-parse --short "$local_sha")"
+    else
+        base="$remote_sha"
+        scope="$(git rev-parse --short "$base")..$(git rev-parse --short "$local_sha")"
+    fi
+
+    echo
+    echo "── pre-push: codex review ($scope) ──"
+    if ! codex review --base "$base" \
+            --title "pre-push: $(git rev-parse --abbrev-ref HEAD)" 2>&1; then
+        echo "[pre-push] codex review exited non-zero — push continuing anyway"
+    fi
+done
+
+echo
+echo "── codex review done. Push? Ctrl+C to abort, anything else to continue. ──"
+read -r -t 10 -p "" _ || true   # 10s window to bail
+exit 0

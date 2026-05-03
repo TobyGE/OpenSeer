@@ -32,6 +32,18 @@ class Callback:
         """
         return items
 
+    def on_event(self, ctx: dict[str, Any], event: Any) -> None:
+        """Called for every TaskEvent emitted by the agent loop.
+
+        This is the fine-grained subscription point — model_started,
+        action_finished, safety_blocked, etc. UIs (REPL renderer, future
+        TUI / web) consume this to drive progressive output. See
+        ``openseer.events.EventType`` for the catalogue.
+
+        ``on_step_recorded`` / ``on_run_start`` / ``on_run_end`` remain
+        for callbacks that only care about coarse lifecycle points.
+        """
+
     def on_step_recorded(self, ctx: dict[str, Any], step: Any) -> None:
         """Called after a Step has been appended to ctx['history']."""
 

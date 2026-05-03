@@ -1,66 +1,13 @@
 # OpenSeer
 
 > **Sees. Remembers. Acts.**
->
 > Computer-use, but it actually knows you.
 
-OpenSeer is an open-source, local-first personal assistant for macOS.
-It can see your screen, drive your apps with mouse and keyboard, and
-remember what you've done — driven by LLMs you choose.
+An open-source, local-first personal assistant for macOS. Sees your
+screen, drives your apps, remembers what you've done.
 
-Most "computer-use" agents today are stateless task executors: start
-from blank, forget on exit. OpenSeer is built around the opposite
-premise — **the assistant should know you**. The long-term goal is to
-maintain memory of your machine state, learn preferences from how you
-actually work, and use that context to plan and verify each action.
-
-> Status: **pre-alpha**. Working internals, reckless edges. Not for
-> daily use yet — it will literally take over your mouse and keyboard.
-
-## Why this exists
-
-| Existing tool                 | What it gives you            | What's missing                      |
-|-------------------------------|------------------------------|-------------------------------------|
-| Claude / ChatGPT (web/app)    | Great conversation           | Can't drive your Mac                |
-| Anthropic computer-use tool   | Pixel-level GUI control      | No memory; blank every session      |
-| Codex desktop                 | Codes well                   | Coding only                         |
-| OpenClaw                      | Persona, channels, memory    | Doesn't actually operate GUIs       |
-| trycua/cua                    | Solid execution substrate    | No assistant layer — you build it   |
-
-OpenSeer aims at the layer those products are missing: chat-first,
-memory-aware, locally-running, model-agnostic, open source.
-
-## What works today
-
-- Full-screen capture via Quartz (`CGWindowListCreateImage`-style)
-- Multi-turn agent loop driven by GPT-5.5 (via the user's ChatGPT
-  subscription OAuth — no API key required)
-- Pluggable grounding backend (default: GPT-5.5 vision\_json; more
-  backends planned — Anthropic CU tool, OpenAI CUA, self-hosted UI-TARS)
-- `reground` action — the model can call for a focused grounding pass
-  with optional region zoom and an "external/specialist" flag
-- `open_app` action — bypass the Dock, launch any app via `open -a`
-- Multi-action chains — the model can emit `{"actions":[…]}` to run
-  several steps inside one API call (saves round-trips on
-  deterministic sequences like "click + hotkey + hotkey + hotkey")
-- Verification chain — `done` requires `verified_by_steps` listing
-  prior producing actions; pure observation isn't enough
-- Token-budget callback + 429/5xx exponential-backoff retry
-- Sliding-window image retention (4 most recent frames, older turns
-  drop image and keep text summary)
-- Per-step trajectory log: raw screenshot, annotated screenshot, full
-  multi-turn input, raw model response, complete SSE event stream,
-  `transcript.json`, human-readable `trace.md`
-
-## What's coming
-
-- **Memory bridge to PersonalMem** — the wedge: agent that knows what
-  you've actually been doing on your Mac
-- Skill/macro learning from repeated trajectories
-- Multi-channel input (CLI today; CLI + web + iMessage planned)
-- Sandbox / permission gates for risky actions
-- Additional grounding backends — Claude `computer_20251124` tool,
-  OpenAI `computer-use-preview`, self-hosted UI-TARS
+> **Status: pre-alpha.** Working internals, reckless edges. It will
+> literally take over your mouse and keyboard.
 
 ## Quick start
 
@@ -68,97 +15,93 @@ memory-aware, locally-running, model-agnostic, open source.
 git clone https://github.com/TobyGE/OpenSeer.git
 cd OpenSeer
 pip install -e .
+
+openseer setup        # guided onboarding (Codex CLI, OAuth, macOS perms)
+openseer              # drop into the chat shell
 ```
 
-First time, run the guided setup — it walks you through Codex CLI install,
-OAuth login, and the two macOS permissions OpenSeer needs:
-
-```bash
-openseer setup
-```
-
-What it checks:
+Inside the shell:
 
 ```
-[1/5] Codex CLI installed
-[2/5] ChatGPT OAuth login (no API key needed — uses your subscription)
-[3/5] macOS Accessibility permission   (lets us inject mouse/keyboard)
-[4/5] macOS Screen Recording permission (lets us see the screen)
-[5/5] Smoke test (1 model ping, no UI actions)
-```
-
-Manual subcommands if you ever need to redo just one step:
-
-```bash
-openseer auth login     # re-run the OAuth dance
-openseer auth status    # check token validity
-openseer auth logout    # wipe local tokens
-```
-
-Then drop into the chat shell:
-
-```bash
-$ openseer
-OpenSeer — Sees. Remembers. Acts.
-  Type a task, or /help for commands, /exit to leave.
-  logged in: plus
-
 openseer ❯ Open Calculator and compute 999 * 123
-[task] Open Calculator and compute 999 * 123
-...
-[finished] 6 step(s) in 31.4s — last: done
+  ▸ Open Calculator and compute 999 * 123
 
-openseer ❯ /history
-  run-20260502-211052  Open Safari, go to youtube.com, search for ...
-  run-20260502-205834  Open Calculator, compute 17 * 42, copy the ...
+  ● Launch Calculator without disturbing windows
+     └ open Calculator ✓
+  ● Type the expression and press equals
+     └ key 1, 7, *, 4, 2, enter (chain ×6) ✓
+  ...
+  ✓ done  6 steps · 14.2s · 18,775 in / 1,629 out · ~$0.016
+        ↳ run-20260502-211052
 
+openseer ❯ /history     # past runs
 openseer ❯ /exit
 ```
 
-Suffix flags work per-task: `Open Notes --dry`, `Find foo --steps 8 --confirm`.
-
-Or run one-off without the REPL:
+One-off (no REPL):
 
 ```bash
 openseer "Open Calculator and compute 999 * 123"
-# equivalent to: openseer task "Open Calculator and compute 999 * 123"
-
-openseer task --execute --confirm-each "..."   # actually drive the UI, step-confirm
+openseer task --execute --confirm-each "..."   # step-by-step confirm
 ```
 
-The agent will take over the mouse and keyboard while it runs. To
-abort, slam the cursor into a screen corner (pyautogui FAILSAFE) or
-hit `Ctrl+C` in the terminal.
+Suffix flags inside the REPL: `Open Notes --dry`, `Find foo --steps 8`.
+
+To abort mid-task: slam cursor into a screen corner (pyautogui FAILSAFE)
+or `Ctrl+C` in the terminal.
 
 Each run writes a full trajectory to `~/Desktop/openseer/run-{timestamp}/`.
+
+## Why
+
+| Existing tool | Strength | Missing |
+|---|---|---|
+| Claude / ChatGPT | Conversation | Can't drive your Mac |
+| Anthropic CU tool | Pixel-level GUI | No memory; blank every session |
+| Codex desktop | Coding | Coding only |
+| OpenClaw | Persona, channels | Doesn't operate GUIs |
+| trycua/cua | Solid substrate | No assistant layer |
+
+OpenSeer fills the layer those products miss: chat-first,
+memory-aware, locally-running, model-agnostic.
+
+## What's in
+
+- Multi-turn agent loop driven by GPT-5.5 (ChatGPT subscription OAuth — no API key)
+- Pluggable grounder (default: GPT-5.5 vision\_json)
+- `reground` — model-initiated focused grounding with optional region zoom
+- `open_app` — bypass the Dock via `open -a`
+- Multi-action chains — `{"actions":[…]}` saves round-trips on hotkey sequences
+- Verification chain — `done` must cite producing steps; observation alone isn't enough
+- Sliding-window image retention (4 most recent frames; older turns text-only)
+- 429/5xx exponential-backoff retry, token-budget callback
+- Per-step trajectory: screenshots, full multi-turn input, raw response, SSE events,
+  `transcript.json`, `trace.md`
+
+## What's coming
+
+- **Memory bridge to PersonalMem** — the wedge: an agent that knows
+  what you've actually been doing on your Mac
+- Skill / macro learning from repeated trajectories
+- Multi-channel input (CLI today; web + iMessage planned)
+- Sandbox / permission gates for risky actions
+- More grounders — Claude `computer_20251124`, OpenAI `computer-use-preview`,
+  self-hosted UI-TARS
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│ Brain (LLM router, planner)         │   GPT-5.5 today; Claude/local pluggable
-├─────────────────────────────────────┤
-│ Tools                               │
-│   - Computer-use (screen + click)   │   primary tool, where most action lives
-│   - Memory recall (planned)         │
-│   - Shell / APIs (planned)          │
-├─────────────────────────────────────┤
-│ Substrate                           │
-│   - Grounder (swappable)            │
-│   - Executor (pyautogui)            │
-│   - Screen capture (Quartz)         │
-└─────────────────────────────────────┘
+Brain (LLM planner)                — GPT-5.5; Claude / local pluggable
+   │
+Tools  ── computer-use ── memory recall (planned) ── shell (planned)
+   │
+Substrate  ── Grounder ── Executor (pyautogui) ── Screen capture (Quartz)
 ```
 
-The agent loop is intentionally small: capture → ask model → parse
-action(s) → execute → loop. Cross-cutting concerns (image retention,
-trajectory logging, budget tracking) plug in as `Callback`s.
+Agent loop is intentionally small: **capture → ask model → parse
+action(s) → execute → loop**. Cross-cutting concerns (image retention,
+trajectory, budget) plug in as `Callback`s.
 
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).
-
-## Status
-
-Pre-alpha. The README lists what works, but expect rough edges.
-Issues and ideas welcome — but this isn't a product yet.

@@ -22,6 +22,7 @@ from .callbacks import (
     TrajectoryCallback,
 )
 from .draw import annotate
+from .events import EventType, TaskEvent
 from .executor import Action, execute
 from .grounding import Grounder, GroundingResult, make as make_grounder
 from .openai_chatgpt import MODEL as OAI_MODEL, _data_url, _stream_full
@@ -334,6 +335,20 @@ def _validate_done(action: Action, history: list["Step"]) -> str | None:
     return None
 
 
+def _action_brief(a: Action) -> str:
+    """Short description of an action for events / progress UI."""
+    bits = [a.name]
+    if a.x is not None:    bits.append(f"({a.x},{a.y})")
+    if a.cmd:              bits.append(f"cmd={a.cmd[:40]!r}")
+    if a.text:             bits.append(f"text={a.text[:30]!r}")
+    if a.key:              bits.append(f"key={a.key}")
+    if a.app:              bits.append(f"app={a.app!r}")
+    if a.target:           bits.append(f"target={a.target[:30]!r}")
+    if a.amount is not None: bits.append(f"amt={a.amount}")
+    if a.status:           bits.append(f"status={a.status}")
+    return " ".join(bits)
+
+
 def _result_summary(s: "Step") -> str:
     """One-line description of what step `s` did and what changed afterwards."""
     a = s.action
@@ -604,12 +619,33 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         "out_dir": out_dir, "max_steps": max_steps, "dry_run": dry_run,
         "history": history,
     }
+    def emit(t: str, **data) -> None:
+        """Broadcast a typed event to every callback subscribed via on_event."""
+        ev = TaskEvent(type=t, step=ctx.get("step_idx"), data=data)
+        for cb in cbs:
+            cb.on_event(ctx, ev)
+
+    def record_step(step) -> None:
+        """Append a Step to history and fire BOTH the legacy on_step_recorded
+        hook and the typed STEP_RECORDED event. Use this everywhere instead
+        of bare append+on_step_recorded so progressive UIs see every step."""
+        history.append(step)
+        for cb in cbs:
+            cb.on_step_recorded(ctx, step)
+        emit(EventType.STEP_RECORDED, step_idx=step.idx,
+             action=step.action.name, result=step.result)
+
     for cb in cbs:
         cb.on_run_start(ctx)
+    emit(EventType.TASK_STARTED, task=task, model=OAI_MODEL,
+         max_steps=max_steps, dry_run=dry_run)
+
+    failed = False    # set when TASK_FAILED has been emitted (skip TASK_FINISHED)
 
     for i in range(max_steps):
         sn = i + 1
         ctx["step_idx"] = sn
+        emit(EventType.STEP_STARTED)
 
         # budget / circuit-breakers can stop us before the next API call
         if not all(cb.on_should_continue(ctx) for cb in cbs):
@@ -632,24 +668,34 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         for cb in cbs:
             input_items = cb.on_messages_built(ctx, input_items)
 
+        emit(EventType.MODEL_STARTED, n_history=len(history))
         t0 = time.time()
         try:
             raw, events, usage = _ask_model(instructions, input_items)
         except Exception as e:
             say(f"  model error: {repr(e)[:200]}")
             (out_dir / f"step{sn:02d}-error.txt").write_text(repr(e))
+            emit(EventType.TASK_FAILED, error=str(e))
+            failed = True
             break
         elapsed_ms = int((time.time() - t0) * 1000)
         ctx["_last_events"] = events  # TrajectoryCallback reads this
+        emit(EventType.MODEL_FINISHED, elapsed_ms=elapsed_ms, usage=usage,
+             raw_chars=len(raw or ""))
 
         try:
             actions = _parse_actions(raw)
         except Exception as e:
             say(f"  parse error: {e}\n  raw: {raw[:300]!r}")
+            emit(EventType.TASK_FAILED, error=f"parse error: {e}")
+            failed = True
             break
 
         if len(actions) > 1:
             say(f"  CHAIN of {len(actions)} actions")
+            emit(EventType.ACTION_PARSED, chain_len=len(actions))
+        else:
+            emit(EventType.ACTION_PARSED, chain_len=1)
 
         # Run each action in the chain. They share the same input frame /
         # raw screenshot, but each gets its own Step record and its own
@@ -698,8 +744,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                             elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
                             screenshot_path=raw_path, annotated_path=ann_path,
                             frame_hash=frame_hash)
-                history.append(step)
-                for cb in cbs: cb.on_step_recorded(ctx, step)
+                record_step(step)
                 continue
 
             # annotate predicted action point on screenshot
@@ -724,8 +769,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                                 elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
                                 screenshot_path=raw_path, annotated_path=ann_path,
                                 frame_hash=frame_hash)
-                    history.append(step)
-                    for cb in cbs: cb.on_step_recorded(ctx, step)
+                    record_step(step)
                     chain_aborted = True
                     terminate = True
                     break
@@ -736,8 +780,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                                 elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
                                 screenshot_path=raw_path, annotated_path=ann_path,
                                 frame_hash=frame_hash)
-                    history.append(step)
-                    for cb in cbs: cb.on_step_recorded(ctx, step)
+                    record_step(step)
                     continue
 
             # validate `done` (and `terminate` with status=done; missing
@@ -757,8 +800,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                                 elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
                                 screenshot_path=raw_path, annotated_path=ann_path,
                                 frame_hash=frame_hash)
-                    history.append(step)
-                    for cb in cbs: cb.on_step_recorded(ctx, step)
+                    record_step(step)
                     continue
 
             # Safety guard: ask SafetyCallback (if installed) whether this
@@ -801,14 +843,20 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                             elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
                             screenshot_path=raw_path, annotated_path=ann_path,
                             frame_hash=frame_hash)
-                history.append(step)
-                for cb in cbs: cb.on_step_recorded(ctx, step)
+                record_step(step)
                 say(f"\n[agent] aborted by safety guard — run terminated.")
+                emit(EventType.SAFETY_BLOCKED,
+                     name=action.name, reason="aborted by safety guard")
                 terminate = True
                 break
 
+            emit(EventType.ACTION_STARTED, name=action.name,
+                 chain_pos=chain_pos, chain_len=len(actions),
+                 summary=_action_brief(action))
             result = execute(action, dry_run=dry_run)
             say(f"  [{label}] result:  {result}{'  [DRY-RUN]' if dry_run else ''}")
+            emit(EventType.ACTION_FINISHED, name=action.name,
+                 chain_pos=chain_pos, result=result, dry_run=dry_run)
 
             step = Step(idx=sn_action, action=action, result=result,
                         raw_response=raw,
@@ -816,8 +864,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                         elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
                         screenshot_path=raw_path, annotated_path=ann_path,
                         frame_hash=frame_hash)
-            history.append(step)
-            for cb in cbs: cb.on_step_recorded(ctx, step)
+            record_step(step)
 
             if action.name in ("done", "fail", "terminate"):
                 lbl = action.status if action.name == "terminate" else action.name
@@ -833,6 +880,23 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         if terminate:
             break
         if sleep_between: time.sleep(sleep_between)
+
+    # Final status: derive from the last action recorded. Skipped if a
+    # TASK_FAILED was already emitted (in which case the consumer treats
+    # that as the terminal event, and adding TASK_FINISHED here would be
+    # a contradictory second terminal event).
+    if not failed:
+        last = history[-1] if history else None
+        if last is None:
+            final_status = "empty"
+        elif last.action.name == "terminate":
+            final_status = (last.action.status or "done").lower()
+        elif last.action.name in ("done", "fail", "verify_failed"):
+            final_status = last.action.name
+        else:
+            final_status = "cap"
+        emit(EventType.TASK_FINISHED, status=final_status,
+             n_steps=len(history))
 
     for cb in cbs:
         cb.on_run_end(ctx)

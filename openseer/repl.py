@@ -20,6 +20,7 @@ from pathlib import Path
 from . import auth as auth_mod
 from .agent import run, _default_callbacks
 from .callbacks import Callback
+from .events import EventType
 
 # ─── ANSI colors (no external deps) ────────────────────────────────────────────
 RESET, BOLD, DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
@@ -40,23 +41,92 @@ def _shorten(s: str | None, n: int) -> str:
 
 
 class _PrettyConsole(Callback):
-    """Render each Step as a single compact bullet line, cc/codex-style."""
+    """Progressive REPL renderer driven by TaskEvents.
+
+    UX intent: never leave the user staring at a blank terminal during
+    a slow model call or a long-running bash command. Show the current
+    phase as a transient status line that's overwritten in place when
+    the next event arrives, then commit a permanent bullet line per
+    step once the result is in.
+    """
 
     name = "PrettyConsole"
 
-    def on_step_recorded(self, ctx: dict, step) -> None:
-        a = step.action
-        # Each step is one line. Format:
-        #   ● <thought truncated>          <action summary>          ✓
+    def __init__(self) -> None:
+        self._transient_active = False    # is a \r-style line currently on screen?
+        self._model_t0: float | None = None
+
+    # ─── transient status helpers ───────────────────────────────────────
+    def _transient(self, text: str) -> None:
+        sys.stdout.write("\r\033[2K  " + text)
+        sys.stdout.flush()
+        self._transient_active = True
+
+    def _commit(self) -> None:
+        """Drop any transient line so the next print() lands on a clean row."""
+        if self._transient_active:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            self._transient_active = False
+
+    # ─── event router ───────────────────────────────────────────────────
+    def on_event(self, ctx: dict, event) -> None:
+        et = event.type
+
+        if et == EventType.MODEL_STARTED:
+            self._model_t0 = time.time()
+            self._transient(c("⏳ thinking …", DIM))
+            return
+
+        if et == EventType.MODEL_FINISHED:
+            self._model_t0 = None
+            usage = event.get("usage") or {}
+            in_t = usage.get("input_tokens", 0)
+            out_t = usage.get("output_tokens", 0)
+            self._transient(c(f"⌁ model ({event.get('elapsed_ms', 0)}ms · {in_t}+{out_t}t)", DIM))
+            return
+
+        if et == EventType.ACTION_STARTED:
+            name = event.get("name", "?")
+            summary = event.get("summary", "")
+            self._transient(f"{c('▶', YEL)} {name} {c(summary, DIM)}")
+            return
+
+        if et == EventType.ACTION_FINISHED:
+            # transient cleanup; the permanent line lands on STEP_RECORDED
+            # (which fires AFTER history.append, ensuring _render_action_line
+            # reads the just-recorded step, not a stale one)
+            return
+
+        if et == EventType.STEP_RECORDED:
+            self._commit()
+            self._render_action_line(event, ctx)
+            return
+
+        if et == EventType.SAFETY_BLOCKED:
+            self._commit()
+            print(f"  {c('✗', RED)} safety blocked: {c(event.get('reason', ''), RED)}")
+            return
+
+        if et == EventType.TASK_FAILED:
+            self._commit()
+            print(f"  {c('✗', RED)} task failed: {event.get('error', '')}")
+            return
+
+    def _render_action_line(self, event, ctx) -> None:
+        """One-line bullet for a completed action, mirroring the previous
+        post-step rendering style but driven by the action_finished event."""
+        history = ctx.get("history") or []
+        if not history:
+            return
+        s = history[-1]
+        a = s.action
         bullet = c("●", CYN)
 
-        # action summary
         if a.name == "open_app":
             act = f"open {a.app}"
         elif a.name == "click":
-            act = f"click ({a.x},{a.y})"
-        elif a.name == "double_click":
-            act = f"double-click ({a.x},{a.y})"
+            act = f"click ({a.x},{a.y})" + (f" ×{a.count}" if a.count > 1 else "")
         elif a.name == "type":
             text = _shorten(a.text, 40)
             act = f"type {text!r}" + (f" → ({a.x},{a.y})" if a.x is not None else "")
@@ -67,8 +137,7 @@ class _PrettyConsole(Callback):
         elif a.name == "wait":
             act = f"wait {a.amount}s"
         elif a.name == "bash":
-            cmd = _shorten(a.cmd, 60)
-            act = f"bash {cmd!r}"
+            act = f"bash {_shorten(a.cmd, 60)!r}"
         elif a.name == "reground":
             tag = "ext" if a.external else "default"
             act = f"reground[{tag}] {_shorten(a.target, 30)!r}"
@@ -76,31 +145,24 @@ class _PrettyConsole(Callback):
             st = (a.status or "done").lower()
             color = GRN if st == "done" else YEL
             act = c(f"terminate ({st})", color, BOLD) + " " + _shorten(a.reason, 60)
-        elif a.name == "done":         # legacy
-            act = c("done", GRN, BOLD) + " " + _shorten(a.reason, 60)
-        elif a.name == "fail":         # legacy
-            act = c("fail", RED, BOLD) + " " + _shorten(a.reason, 60)
+        elif a.name in ("done", "fail"):
+            act = c(a.name, GRN if a.name == "done" else RED, BOLD) + " " + _shorten(a.reason, 60)
         elif a.name == "verify_failed":
             act = c("done rejected", YEL) + " — " + _shorten(a.reason, 60)
         else:
             act = a.name or "<empty>"
 
-        # status indicator
-        result = (step.result or "").lower()
-        if "fail" in result or "error" in result or "reject" in result or "block" in result:
+        result = (s.result or "").lower()
+        if any(k in result for k in ("fail", "error", "reject", "block")):
             mark = c("✗", RED)
         elif a.name in ("done", "fail", "verify_failed", "terminate"):
             mark = ""
         else:
             mark = c("✓", GRN, DIM)
 
-        # thought, dimmed and truncated
         thought = _shorten(a.thought, 70)
-        thought_str = c(thought, DIM) if thought else ""
-
-        # one-line render
-        if thought_str:
-            print(f"  {bullet} {thought_str}")
+        if thought:
+            print(f"  {bullet} {c(thought, DIM)}")
             print(f"     {DIM}└{RESET} {act} {mark}")
         else:
             print(f"  {bullet} {act} {mark}")

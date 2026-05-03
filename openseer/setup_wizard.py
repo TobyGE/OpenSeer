@@ -68,8 +68,19 @@ def check_codex_cli() -> bool:
 
 def check_login(allow_login: bool = True) -> bool:
     st = auth_mod.token_status()
-    if st.has_file and not st.expired:
-        _ok(f"logged in — {st.summary().split('—', 1)[1].strip()}")
+    if st.error:
+        _fail(f"auth file is unreadable: {st.error}")
+        if not allow_login:
+            return False
+        if not _ask("Re-run codex login to recreate it? [Y/n]"):
+            return False
+        rc = auth_mod.run_codex_login()
+        if rc != 0:
+            _fail(f"codex login exited with code {rc}.")
+            return False
+        st = auth_mod.token_status()
+    if st.has_file and not st.expired and not st.error:
+        _ok(st.summary())
         return True
     if st.has_file and st.expired:
         _warn("Token expired.")
@@ -88,8 +99,8 @@ def check_login(allow_login: bool = True) -> bool:
         return False
     # re-check
     st = auth_mod.token_status()
-    if st.has_file and not st.expired:
-        _ok(f"logged in — {st.summary().split('—', 1)[1].strip()}")
+    if st.has_file and not st.expired and not st.error:
+        _ok(st.summary())
         return True
     _fail("Still not logged in after the browser flow.")
     return False
@@ -115,16 +126,22 @@ def check_accessibility() -> bool:
         return False
 
     before = pyautogui.position()
-    target = (before.x + 50, before.y)
+    # Pick a target ≥ 50 px away that's guaranteed inside the screen.
+    # If the cursor is near the right edge we go LEFT instead.
+    sw, sh = pyautogui.size()
+    if before.x + 50 < sw - 10:
+        target = (before.x + 50, before.y)
+    else:
+        target = (max(10, before.x - 50), before.y)
     pyautogui.moveTo(*target, duration=0.2)
     time.sleep(0.1)
     after = pyautogui.position()
-    if abs(after.x - target[0]) <= 5:
+    if abs(after.x - target[0]) <= 5 and abs(after.y - target[1]) <= 5:
         _ok("cursor moved — Accessibility perm OK")
         # nudge back so the user's cursor isn't "lost"
         pyautogui.moveTo(before.x, before.y, duration=0.1)
         return True
-    _fail(f"cursor didn't move (before={before}, after={after}). "
+    _fail(f"cursor didn't move (before={before}, target={target}, after={after}). "
           f"Accessibility likely still missing.")
     return False
 

@@ -46,7 +46,20 @@ strictly requires it. In particular:
   - Don't press Ctrl+C, Cmd+W, Cmd+Q on existing windows
   - Don't dismiss dialogs that aren't yours
   - Don't reorganize the desktop
-Pretend the user's existing windows are read-only background.
+
+**CRITICAL — never drive the OpenSeer terminal itself.**
+You are running INSIDE a terminal (likely iTerm). That terminal is
+visible in screenshots and shows OpenSeer's own output, including:
+  - the user's prompt "openseer ❯ ..."
+  - safety confirmation prompts like "Run anyway? [y/N]"
+  - your own action results
+DO NOT click into or type into that terminal. It is YOUR control plane,
+not a target. If you see "[y/N]" in the screenshot, that prompt has
+ALREADY been answered by the human; ignore it. Do not "complete" it
+by typing y.
+
+Pretend the user's existing windows (terminal included) are read-only
+background.
 
 You output a JSON object describing what to do next. Two formats:
 
@@ -741,8 +754,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                             say(f"  [{label}] ⚠ safety log: {why} (running anyway)")
                     break
             if safety_blocked:
-                step = Step(idx=sn_action, action=action,
-                            result="blocked by safety guard",
+                # Safety rejection terminates the WHOLE run, not just this
+                # action. Continuing risks a self-feedback loop: the next
+                # screenshot still shows the safety prompt in the terminal
+                # scrollback, and the model "helpfully" types `y` into it,
+                # which drives the OpenSeer REPL itself.
+                aborted = Action(name="terminate", status="fail",
+                                 reason="aborted by safety guard",
+                                 thought=action.thought)
+                step = Step(idx=sn_action, action=aborted,
+                            result="aborted by safety guard — run terminated",
                             raw_response=raw,
                             usage=usage if chain_pos == 0 else None,
                             elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
@@ -750,7 +771,9 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                             frame_hash=frame_hash)
                 history.append(step)
                 for cb in cbs: cb.on_step_recorded(ctx, step)
-                continue
+                say(f"\n[agent] aborted by safety guard — run terminated.")
+                terminate = True
+                break
 
             result = execute(action, dry_run=dry_run)
             say(f"  [{label}] result:  {result}{'  [DRY-RUN]' if dry_run else ''}")

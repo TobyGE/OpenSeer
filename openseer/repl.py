@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import os
 import readline
+import json
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+from dataclasses import dataclass
 
 from . import auth as auth_mod
 from .agent import run, _default_callbacks
@@ -196,13 +199,20 @@ def _save_history() -> None:
 
 # ─── slash commands ────────────────────────────────────────────────────────────
 
+_RUNS_ROOT = Path.home() / ".openseer" / "runs"
+
+
 def _cmd_help() -> None:
     print(c("Commands:", BOLD))
-    print("  /help            show this help")
-    print("  /status          show login state")
-    print("  /history         list recent runs (Desktop/openseer/run-*)")
-    print("  /clear           clear screen")
-    print("  /exit, /quit     leave")
+    print("  /help                 show this help")
+    print("  /status               show login state")
+    print("  /history [N]          list N most recent runs (default 10)")
+    print("  /show [last|<id>|<n>] show details of a run (default: last)")
+    print("  /open [last|<id>]     reveal the run dir in Finder")
+    print("  /context              print current session memory the model sees")
+    print("  /reset                clear session memory")
+    print("  /clear                clear screen")
+    print("  /exit, /quit          leave")
     print()
     print(c("Task syntax:", BOLD))
     print("  Just type what you want done. Example:")
@@ -221,16 +231,163 @@ def _cmd_status() -> None:
     print(f"  auth.json:  {auth_mod.AUTH_FILE}")
 
 
+def _list_runs(limit: int | None = None) -> list[Path]:
+    """Return run directories sorted newest-first. Skips the `latest` symlink."""
+    if not _RUNS_ROOT.exists():
+        return []
+    candidates = [
+        p for p in _RUNS_ROOT.iterdir()
+        if p.is_dir() and not p.is_symlink() and p.name != "latest"
+    ]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[:limit] if limit else candidates
+
+
+def _resolve_run(arg: str | None) -> Path | None:
+    """Resolve a `/show` / `/open` argument to a run directory.
+
+    Resolution order:
+      1. 'last' / empty → newest run via the `latest` symlink
+      2. exact directory match (full trace_id)
+      3. small all-digit arg (1..N) → Nth most recent (1-indexed)
+      4. prefix match against trace_id (so 'a3c8' picks 'a3c8f120')
+
+    Trace IDs are random hex and can start with digits, but a SHORT
+    all-digit arg ("1", "3", "10") is overwhelmingly more likely to
+    mean "Nth most recent" than to be a valid trace-ID prefix. Long
+    all-digit prefixes are still caught by step 4 because numeric
+    indices > 1000 are vanishingly rare.
+    """
+    if not arg or arg.lower() == "last":
+        latest = _RUNS_ROOT / "latest"
+        if latest.is_symlink() and latest.exists():
+            return latest.resolve()
+        runs = _list_runs(limit=1)
+        return runs[0] if runs else None
+
+    # 2: exact full trace_id
+    candidate = _RUNS_ROOT / arg
+    if candidate.is_dir() and not candidate.is_symlink():
+        return candidate
+
+    # 3: small all-digit → numeric index (Nth most recent)
+    if arg.isdigit() and len(arg) <= 3:
+        idx = int(arg) - 1
+        runs = _list_runs()
+        return runs[idx] if 0 <= idx < len(runs) else None
+
+    # 4: prefix match (handles short hex prefixes AND long digit-prefixes)
+    prefix = arg.lower()
+    for r in _list_runs():
+        if r.name.startswith(prefix):
+            return r
+    return None
+
+
 def _cmd_history(n: int = 10) -> None:
-    runs = sorted((Path.home() / "Desktop" / "openseer").glob("run-*"),
-                  reverse=True)[:n]
+    runs = _list_runs(limit=n)
     if not runs:
         print(c("(no runs yet)", DIM))
         return
     for r in runs:
-        task_file = r / "task.txt"
-        task = task_file.read_text().strip().splitlines()[0][:80] if task_file.exists() else "?"
-        print(f"  {c(r.name, CYN)}  {task}")
+        task = "?"
+        status = "?"
+        # prefer the new task.json + final.json; fall back to task.txt
+        task_json = r / "task.json"
+        final_json = r / "final.json"
+        if task_json.exists():
+            try:
+                t = json.loads(task_json.read_text())
+                task = (t.get("task") or "?").splitlines()[0][:80]
+            except Exception:
+                pass
+        elif (r / "task.txt").exists():
+            task = (r / "task.txt").read_text().strip().splitlines()[0][:80]
+        if final_json.exists():
+            try:
+                status = json.loads(final_json.read_text()).get("status", "?")
+            except Exception:
+                pass
+        sc = GRN if status == "done" else (YEL if status in ("fail", "verify_failed") else DIM)
+        print(f"  {c(r.name, CYN)}  {c(status, sc)}  {task}")
+
+
+def _cmd_show(arg: str | None) -> None:
+    run_dir = _resolve_run(arg)
+    if run_dir is None:
+        print(c(f"no run matching {arg!r}", RED))
+        return
+
+    # Header
+    task_meta = {}
+    if (run_dir / "task.json").exists():
+        try:
+            task_meta = json.loads((run_dir / "task.json").read_text())
+        except Exception:
+            pass
+    final_meta = {}
+    if (run_dir / "final.json").exists():
+        try:
+            final_meta = json.loads((run_dir / "final.json").read_text())
+        except Exception:
+            pass
+
+    print()
+    print(f"  {c('trace:', BOLD)} {c(run_dir.name, CYN)}  "
+          f"{c(task_meta.get('model', ''), DIM)}")
+    print(f"  {c('task:', BOLD)} {task_meta.get('task', '?')}")
+    if final_meta:
+        st = final_meta.get("status", "?")
+        sc = GRN if st == "done" else (YEL if st in ("fail", "verify_failed") else DIM)
+        totals = final_meta.get("totals") or {}
+        n_steps = final_meta.get("n_steps", 0)
+        in_tok = totals.get("input_tokens", 0)
+        out_tok = totals.get("output_tokens", 0)
+        steps_label = c(f"{n_steps} steps", DIM)
+        tok_label = c(f"{in_tok:,} in / {out_tok:,} out", DIM)
+        print(f"  {c('status:', BOLD)} {c(st, sc, BOLD)}  {steps_label}  {tok_label}")
+        if final_meta.get("last_reason"):
+            print(f"  {c('reason:', BOLD)} {final_meta['last_reason']}")
+
+    # Per-step lines from transcript.json
+    transcript = run_dir / "transcript.json"
+    if transcript.exists():
+        try:
+            data = json.loads(transcript.read_text())
+            print()
+            for s in data.get("steps", []):
+                _render_step_line(s)
+        except Exception as e:
+            print(c(f"  (transcript unreadable: {e})", DIM))
+    print()
+    print(f"  {c('dir:', DIM)} {run_dir}")
+    print(f"  {c('tip:', DIM)} {c(f'/open {run_dir.name}', CYN)} to reveal in Finder")
+
+
+def _render_step_line(s: dict) -> None:
+    name = s.get("action", "?")
+    bullet = c("●", CYN)
+    bits = [name]
+    if s.get("x") is not None:    bits.append(f"({s['x']},{s['y']})")
+    if s.get("text"):             bits.append(f"text={_shorten(s['text'], 40)!r}")
+    if s.get("key"):              bits.append(f"key={s['key']}")
+    if s.get("reason"):           bits.append(f"reason={_shorten(s['reason'], 60)!r}")
+    elapsed = s.get("elapsed_ms")
+    elapsed_s = c(f"  ({elapsed}ms)", DIM) if elapsed else ""
+    print(f"  {bullet} {' '.join(bits)}{elapsed_s}")
+    res = s.get("result") or ""
+    if res and not res.startswith("task ended"):
+        print(f"     {DIM}└{RESET} {c(_shorten(res, 100), DIM)}")
+
+
+def _cmd_open(arg: str | None) -> None:
+    run_dir = _resolve_run(arg)
+    if run_dir is None:
+        print(c(f"no run matching {arg!r}", RED))
+        return
+    import subprocess
+    subprocess.run(["open", "-R", str(run_dir / "task.json")], check=False)
+    print(f"  revealed {run_dir} in Finder")
 
 
 def _cmd_clear() -> None:
@@ -267,7 +424,39 @@ def _parse_task_flags(line: str) -> tuple[str, dict]:
 
 # ─── one task run ──────────────────────────────────────────────────────────────
 
-def _run_task(task: str, opts: dict) -> None:
+@dataclass
+class TaskSummary:
+    """Tiny per-task summary for session memory. Held in REPL state and
+    prepended to next task's prompt so the model has context across
+    tasks WITHOUT replaying full screenshot history."""
+    task: str
+    status: str            # "done" | "fail" | "verify_failed" | "cap"
+    result: str            # last action's reason, truncated
+    trace_id: str | None   # for /show
+    n_steps: int
+
+
+def _build_session_context(history: list["TaskSummary"], variables: dict) -> str:
+    """Format session memory as a short prompt prefix for the next task.
+
+    Bounded — keep last 3 tasks + variables. Avoids the Cua-style
+    long-transcript explosion: we ONLY include {task, status, result},
+    no screenshots, no per-step trace.
+    """
+    if not history and not variables:
+        return ""
+    lines = ["RECENT SESSION CONTEXT (read-only, for reference):"]
+    for s in history[-3:]:
+        lines.append(f'  - "{s.task}" → {s.status}: {_shorten(s.result, 100)}')
+    if variables:
+        var_str = ", ".join(f"{k}={v!r}" for k, v in variables.items())
+        lines.append(f"  variables: {var_str}")
+    lines.append("END SESSION CONTEXT")
+    return "\n".join(lines)
+
+
+def _run_task(task: str, opts: dict,
+              session: list["TaskSummary"], variables: dict) -> None:
     # one-line header, dimmed
     flags = []
     if opts["dry_run"]:    flags.append(c("dry", YEL))
@@ -276,6 +465,11 @@ def _run_task(task: str, opts: dict) -> None:
     flag_str = ("  " + " ".join(flags)) if flags else ""
     print(f"  {c('▸', BLU)} {c(task, BOLD)}{flag_str}")
     print()
+
+    # Pass session context separately so trace files record the user's
+    # clean task (not the augmented one) — fixes a /history mismatch
+    # where the displayed task was the prefixed context block.
+    ctx_block = _build_session_context(session, variables)
 
     t0 = time.time()
     try:
@@ -286,6 +480,7 @@ def _run_task(task: str, opts: dict) -> None:
             confirm_each=opts["confirm_each"],
             sleep_between=0.0,
             callbacks=_build_repl_callbacks(),
+            session_context=ctx_block,
             quiet=True,
         )
     except KeyboardInterrupt:
@@ -300,34 +495,89 @@ def _run_task(task: str, opts: dict) -> None:
     last = history[-1] if history else None
     status = last.action.name if last else "?"
 
-    # totals were stashed by TrajectoryCallback
-    totals = {}
-    # find the trajectory ctx via callbacks isn't easy; use the latest run dir
-    runs = sorted((Path.home() / "Desktop" / "openseer").glob("run-*"), reverse=True)
-    out_dir = runs[0] if runs else None
+    # Locate the run directory via the trace_id symlink we just updated.
+    out_dir = None
+    latest = _RUNS_ROOT / "latest"
+    if latest.is_symlink():
+        try:
+            out_dir = latest.resolve()
+        except Exception:
+            out_dir = None
 
     in_tok = sum((s.usage or {}).get("input_tokens", 0)  for s in history)
     out_tok = sum((s.usage or {}).get("output_tokens", 0) for s in history)
     cost = in_tok / 1e6 * 0.50 + out_tok / 1e6 * 4.00
 
     print()
-    # `terminate` is the new shape; `done`/`fail` are legacy aliases.
-    term_status = (last.action.status or "done").lower() if last and last.action.name == "terminate" else None
-    if status == "done" or (status == "terminate" and term_status == "done"):
+    # Prefer the canonical status from final.json (it correctly handles
+    # crashed runs as "failed", which deriving from history alone cannot).
+    canonical_status = "cap"
+    if out_dir is not None:
+        final_p = out_dir / "final.json"
+        if final_p.exists():
+            try:
+                canonical_status = (json.loads(final_p.read_text()).get("status")
+                                    or "cap").lower()
+            except Exception:
+                pass
+    if canonical_status == "cap":   # fall back to the action-derived view
+        term_status = (last.action.status or "done").lower() if last and last.action.name == "terminate" else None
+        if status == "done" or (status == "terminate" and term_status == "done"):
+            canonical_status = "done"
+        elif status in ("fail", "verify_failed") or (status == "terminate" and term_status == "fail"):
+            canonical_status = term_status if status == "terminate" else status
+
+    if canonical_status == "done":
         head = c("✓ done", GRN, BOLD)
-    elif status in ("fail", "verify_failed") or (status == "terminate" and term_status == "fail"):
-        lbl = term_status if status == "terminate" else status
-        head = c("⚠ " + lbl, YEL, BOLD)
+    elif canonical_status == "failed":
+        head = c("✗ failed", RED, BOLD)
+    elif canonical_status in ("fail", "verify_failed"):
+        head = c("⚠ " + canonical_status, YEL, BOLD)
     else:
         head = c("• cap", DIM, BOLD)
     summary = (f"  {head}  {n} step{'s' if n != 1 else ''} · {secs:.1f}s · "
                f"{c(f'{in_tok:,} in / {out_tok:,} out', DIM)} · "
                f"{c(f'~${cost:.3f}', DIM)}")
     print(summary)
-    if last and last.action.reason:
-        print(c(f"        → {_shorten(last.action.reason, 80)}", DIM))
+    result_text = last.action.reason if (last and last.action.reason) else ""
+    if result_text:
+        print(c(f"        → {_shorten(result_text, 80)}", DIM))
     if out_dir:
         print(c(f"        ↳ {out_dir.name}", DIM))
+
+    # Append to session memory + update $last
+    session.append(TaskSummary(
+        task=task,
+        status=canonical_status,
+        result=result_text,
+        trace_id=(out_dir.name if out_dir else None),
+        n_steps=n,
+    ))
+    if result_text:
+        # Bounded — long termination reasons (e.g. document summaries)
+        # would otherwise inflate every subsequent prompt indefinitely.
+        variables["last"] = _shorten(result_text, 200)
+
+
+def _cmd_context(session: list["TaskSummary"], variables: dict) -> None:
+    if not session and not variables:
+        print(c("(empty session — model will see no prior context)", DIM))
+        return
+    print(c("Session context the model sees on the next task:", BOLD))
+    print()
+    block = _build_session_context(session, variables)
+    if block:
+        for line in block.splitlines():
+            print(f"  {c(line, DIM)}")
+    else:
+        print(c("  (none)", DIM))
+
+
+def _cmd_reset(session: list["TaskSummary"], variables: dict) -> None:
+    n = len(session)
+    session.clear()
+    variables.clear()
+    print(c(f"  cleared {n} task(s) from session memory", DIM))
 
 
 # ─── main loop ─────────────────────────────────────────────────────────────────
@@ -363,6 +613,12 @@ def repl() -> int:
     print(c(f"  logged in: {auth_mod.token_status().plan_type or '?'}", DIM))
     print()
 
+    # Session memory: bounded summary of recent tasks + variable bag.
+    # Cleared by /reset; passed to _run_task so each next task sees a
+    # short context block prefixed to the user's request.
+    session: list[TaskSummary] = []
+    variables: dict[str, str] = {}
+
     try:
         while True:
             try:
@@ -376,7 +632,9 @@ def repl() -> int:
 
             # slash commands
             if line.startswith("/"):
-                cmd = line.split()[0].lower()
+                parts = line.split()
+                cmd = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else None
                 if cmd in ("/exit", "/quit"):
                     break
                 if cmd == "/help":
@@ -384,7 +642,16 @@ def repl() -> int:
                 elif cmd == "/status":
                     _cmd_status()
                 elif cmd == "/history":
-                    _cmd_history()
+                    n = int(arg) if arg and arg.isdigit() else 10
+                    _cmd_history(n)
+                elif cmd == "/show":
+                    _cmd_show(arg)
+                elif cmd == "/open":
+                    _cmd_open(arg)
+                elif cmd == "/context":
+                    _cmd_context(session, variables)
+                elif cmd == "/reset":
+                    _cmd_reset(session, variables)
                 elif cmd == "/clear":
                     _cmd_clear()
                 else:
@@ -394,7 +661,7 @@ def repl() -> int:
             task, opts = _parse_task_flags(line)
             if not task:
                 continue
-            _run_task(task, opts)
+            _run_task(task, opts, session, variables)
 
     finally:
         _save_history()

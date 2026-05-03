@@ -1,10 +1,12 @@
 """Persists the full trajectory of a run to disk: per-step screenshots,
-prompts, raw responses, SSE events, plus a final transcript.json and a
-human-readable trace.md.
+prompts, raw responses, SSE events, plus task.json header, events.jsonl
+firehose, final.json footer, transcript.json (machine), trace.md (human).
 """
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,25 +36,76 @@ def _redact_input_for_log(input_items: list[dict]) -> list[dict]:
 
 class TrajectoryCallback(Callback):
     """Writes:
-      out_dir/task.txt
+      out_dir/task.json               (header — task, model, trace_id, started_at)
       out_dir/system_prompt.txt
+      out_dir/events.jsonl            (every TaskEvent in order — replayable)
       out_dir/step{N}-raw.png         (set by agent before this hook)
       out_dir/step{N}-action.png      (set by agent)
       out_dir/step{N}-input.json      (we write)
       out_dir/step{N}-response.txt    (we write)
-      out_dir/step{N}-events.jsonl    (we write)
-      out_dir/transcript.json
-      out_dir/trace.md
+      out_dir/step{N}-events.jsonl    (SSE events from the model call)
+      out_dir/final.json              (footer — final_status, totals, n_steps)
+      out_dir/transcript.json         (machine-readable full trace)
+      out_dir/trace.md                (human-readable Markdown)
+
+    Also maintains ~/.openseer/runs/latest as a symlink to the most
+    recent trace_id directory so `/show last` is O(1).
     """
 
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
+        self._events_fh = None        # open file handle for events.jsonl
+        self._failed_error: str | None = None    # set if TASK_FAILED fires
 
     def on_run_start(self, ctx: dict[str, Any]) -> None:
+        # Reset per-run state so a callback instance reused across
+        # multiple run() calls doesn't leak failure status from a
+        # previous run into the current one's final.json.
+        self._failed_error = None
         out_dir: Path = ctx["out_dir"]
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "task.txt").write_text(ctx["task"])
         (out_dir / "system_prompt.txt").write_text(ctx["system_prompt"])
+        (out_dir / "task.json").write_text(json.dumps({
+            "task": ctx["task"],
+            "model": ctx.get("model"),
+            "trace_id": ctx.get("trace_id"),
+            "max_steps": ctx.get("max_steps"),
+            "dry_run": ctx.get("dry_run"),
+            "started_at": ctx.get("started_at", time.time()),
+        }, indent=2, ensure_ascii=False))
+        # Open events.jsonl for streaming writes; closed in on_run_end.
+        self._events_fh = (out_dir / "events.jsonl").open("w")
+        # Update ~/.openseer/runs/latest symlink
+        runs_root = out_dir.parent
+        if runs_root.name == "runs":
+            latest = runs_root / "latest"
+            try:
+                if latest.is_symlink() or latest.exists():
+                    latest.unlink()
+                latest.symlink_to(out_dir.name)  # relative symlink → trace_id
+            except OSError:
+                pass    # symlink creation can fail in odd filesystems; non-fatal
+
+    def on_event(self, ctx: dict[str, Any], event: Any) -> None:
+        """Stream every TaskEvent to events.jsonl as it happens."""
+        # Capture failure so on_run_end can write the right status into
+        # final.json — without this, /history shows model errors as `cap`
+        # or `empty` because no terminal action was recorded.
+        if event.type == "task_failed":
+            self._failed_error = str(event.get("error", "unknown error"))
+        if self._events_fh is None:
+            return
+        try:
+            payload = {
+                "type": event.type,
+                "ts": event.timestamp,
+                "step": event.step,
+                "data": event.data,
+            }
+            self._events_fh.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._events_fh.flush()
+        except Exception:
+            pass    # never let logging break the loop
 
     def on_messages_built(self, ctx: dict[str, Any],
                           items: list[dict]) -> list[dict]:
@@ -134,6 +187,44 @@ class TrajectoryCallback(Callback):
         (out_dir / "trace.md").write_text("\n".join(md))
 
         ctx["_totals"] = {"input_tokens": total_in, "output_tokens": total_out}
+
+        # final.json — minimal footer for /show last and tooling.
+        # If the run was aborted by an exception (model error, parse
+        # error), TASK_FAILED was emitted; reflect that in the status
+        # so /history doesn't display crashed runs as "cap" or "empty".
+        last = history[-1] if history else None
+        if self._failed_error is not None:
+            final_status = "failed"
+            error = self._failed_error
+        else:
+            error = None
+            if last is None:
+                final_status = "empty"
+            elif last.action.name == "terminate":
+                final_status = (last.action.status or "done").lower()
+            elif last.action.name in ("done", "fail", "verify_failed"):
+                final_status = last.action.name
+            else:
+                final_status = "cap"
+        (out_dir / "final.json").write_text(json.dumps({
+            "trace_id": ctx.get("trace_id"),
+            "task": ctx["task"],
+            "status": final_status,
+            "error": error,
+            "n_steps": len(history),
+            "started_at": ctx.get("started_at"),
+            "ended_at": time.time(),
+            "totals": ctx["_totals"],
+            "last_reason": (last.action.reason if last else None),
+        }, indent=2, ensure_ascii=False))
+
+        # close streaming events.jsonl
+        if self._events_fh is not None:
+            try:
+                self._events_fh.close()
+            finally:
+                self._events_fh = None
+
         if self.verbose:
             print(f"\n[agent] wrote {out_dir / 'transcript.json'}")
             print(f"[agent] wrote {out_dir / 'trace.md'}")

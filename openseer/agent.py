@@ -362,7 +362,8 @@ def _result_summary(s: "Step") -> str:
 
 
 def _build_input(task: str, frame: Frame, current_hash: str,
-                 history: list[Step]) -> list[dict]:
+                 history: list[Step],
+                 session_context: str = "") -> list[dict]:
     """Construct a full multi-turn `input` array for the Responses API.
 
     Layout:
@@ -383,8 +384,9 @@ def _build_input(task: str, frame: Frame, current_hash: str,
     items: list[dict] = []
     last_sent_hash: str = ""
 
+    ctx_block = (session_context.rstrip() + "\n\n") if session_context else ""
     initial_text = (
-        f"TASK: {task}\n\n"
+        f"{ctx_block}TASK: {task}\n\n"
         "The screenshot below is the user's CURRENT desktop at the start. "
         "Treat their existing windows as read-only background — do NOT "
         "close, dismiss, or interrupt anything unless the task requires it.\n\n"
@@ -569,11 +571,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         callbacks: list[Callback] | None = None,
         grounder: Grounder | str = "gpt55",
         external_grounder: Grounder | str | None = None,
+        session_context: str = "",
         quiet: bool = False) -> list[Step]:
     """Run the agent loop. Returns the list of steps."""
+    # Each task gets a short trace_id; runs land under ~/.openseer/runs/<id>/
+    # so they're separate from user Desktop content. /show last and /history
+    # both read this directory.
+    import uuid as _uuid
+    trace_id = _uuid.uuid4().hex[:8]
     if out_dir is None:
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_dir = Path.home() / "Desktop" / "openseer" / f"run-{ts}"
+        out_dir = Path.home() / ".openseer" / "runs" / trace_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cbs = callbacks if callbacks is not None else _default_callbacks(quiet=quiet)
@@ -617,7 +624,9 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
     ctx: dict = {
         "task": task, "model": OAI_MODEL, "system_prompt": SYSTEM_PROMPT,
         "out_dir": out_dir, "max_steps": max_steps, "dry_run": dry_run,
-        "history": history,
+        "history": history, "trace_id": trace_id,
+        "started_at": time.time(),
+        "session_context": session_context,    # prefix for first user msg, NOT stored as task
     }
     def emit(t: str, **data) -> None:
         """Broadcast a typed event to every callback subscribed via on_event."""
@@ -664,7 +673,8 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             W=frame.logical_size[0], H=frame.logical_size[1])
         if skill_block:
             instructions = instructions + "\n\n" + skill_block
-        input_items = _build_input(task, frame, frame_hash, history)
+        input_items = _build_input(task, frame, frame_hash, history,
+                                   session_context=session_context)
         for cb in cbs:
             input_items = cb.on_messages_built(ctx, input_items)
 

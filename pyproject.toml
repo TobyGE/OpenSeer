@@ -35,3 +35,6 @@ openseer = "openseer.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["openseer*"]
+
+[tool.setuptools.package-data]
+openseer = ["skills/**/*.md"]

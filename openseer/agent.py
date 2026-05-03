@@ -304,7 +304,12 @@ def _validate_done(action: Action, history: list["Step"]) -> str | None:
     Only `terminate` with status="done" (or legacy `done`) needs verification —
     `fail` is the model giving up and doesn't need a verification chain.
     """
-    is_done = action.name == "done" or (action.name == "terminate" and (action.status or "").lower() == "done")
+    # `terminate` defaults to status="done" (matches executor); treat
+    # missing status the same as explicit "done" so the verification
+    # chain isn't bypassable by simply omitting status.
+    is_done = action.name == "done" or (
+        action.name == "terminate" and (action.status or "done").lower() == "done"
+    )
     if not is_done:
         return None
     cited = action.verified_by_steps or []
@@ -486,8 +491,15 @@ def _default_callbacks(quiet: bool = False) -> list[Callback]:
     ]
 
 
-# Where SKILL.md files live. Resolved at run-time.
-_SKILLS_ROOT = Path(__file__).resolve().parent.parent / "skills"
+# Where SKILL.md files live.
+# - bundled: openseer/skills/  (ships with the wheel; package data)
+# - user:    ~/.openseer/skills/  (override / extend per-machine, optional)
+_BUNDLED_SKILLS_ROOT = Path(__file__).resolve().parent / "skills"
+_USER_SKILLS_ROOT = Path.home() / ".openseer" / "skills"
+
+
+def _skill_roots() -> list[Path]:
+    return [p for p in (_BUNDLED_SKILLS_ROOT, _USER_SKILLS_ROOT) if p.exists()]
 
 
 def _handle_reground(action: Action, frame: Frame,
@@ -567,10 +579,15 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
     say(f"[agent] grounder:  default={grounder.name}  external={external_grounder.name}")
 
     # Load skill knowledge once per run; injected into every system prompt.
-    skills = load_available(_SKILLS_ROOT)
+    # Bundled skills ship with the package; user can extend via ~/.openseer/skills/.
+    skills: list = []
+    for root in _skill_roots():
+        skills.extend(load_available(root))
     skill_block = render_for_prompt(skills)
-    say(f"[agent] skills:    {len(skills)} loaded ({sum(1 for s in skills if s.family == 'bash')} bash, "
-        f"{sum(1 for s in skills if s.family == 'cu')} cu)")
+    n_bash = sum(1 for s in skills if s.family == "bash")
+    n_cu = sum(1 for s in skills if s.family == "cu")
+    say(f"[agent] skills:    {len(skills)} loaded ({n_bash} bash, {n_cu} cu) "
+        f"from {len(_skill_roots())} location(s)")
 
     history: list[Step] = []
     ctx: dict = {
@@ -711,9 +728,10 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                     for cb in cbs: cb.on_step_recorded(ctx, step)
                     continue
 
-            # validate `done` (and `terminate` with status=done)
+            # validate `done` (and `terminate` with status=done; missing
+            # status defaults to done, matching executor behaviour)
             is_done = action.name == "done" or \
-                (action.name == "terminate" and (action.status or "").lower() == "done")
+                (action.name == "terminate" and (action.status or "done").lower() == "done")
             if is_done:
                 err = _validate_done(action, history)
                 if err:
@@ -732,14 +750,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                     continue
 
             # Safety guard: ask SafetyCallback (if installed) whether this
-            # action is suspicious. If yes and mode != "log", we either
-            # block or prompt for confirmation.
+            # action is suspicious. In dry_run we never actually execute,
+            # so we just log the warning and let the preview proceed.
             safety_blocked = False
             for cb in cbs:
                 if isinstance(cb, SafetyCallback):
                     ok, why = cb.check(action)
                     if not ok:
-                        if cb.mode == "block":
+                        if dry_run:
+                            say(f"  [{label}] ⚠ safety (dry-run): {why} — preview only, would prompt in real run")
+                        elif cb.mode == "block":
                             say(f"  [{label}] ⚠ BLOCKED by safety: {why}")
                             safety_blocked = True
                         elif cb.mode == "confirm":

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Run artifacts
+logs/
+*.log
+
+# Personal cache (OAuth tokens etc — never commit)
+.codex/
+.openseer/
+oauth-tokens.json
+openseer.egg-info

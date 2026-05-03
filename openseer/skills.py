@@ -209,10 +209,12 @@ def render_for_prompt(groups: list[list[Skill]] | list[Skill],
         return ""
 
     parts = ["## Skills available\n",
-             "These domain knowledge documents tell you how to use specific",
-             "CLIs (via `bash`) or apps (via CU primitives). Consult them",
-             "before guessing. They are loaded only if their dependencies",
-             "exist on this machine, so anything listed below is usable.\n"]
+             "Each skill below documents one specific app or CLI integration",
+             "where the exact syntax matters and is hard to recall (e.g.",
+             "AppleScript dialects). They are NOT general recipes.\n",
+             "If exactly one skill clearly applies to the task, follow it.",
+             "If several could apply, pick the most specific. If none clearly",
+             "apply, do NOT consult any of them — use your tools directly.\n"]
     used = sum(len(p) + 1 for p in parts)
     for i, s in enumerate(ordered):
         block = (

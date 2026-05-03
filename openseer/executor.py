@@ -21,7 +21,7 @@ pyautogui.PAUSE = 0.1
 
 @dataclass
 class Action:
-    name: str                      # click | type | key | scroll | wait | open_app | bash | reground | terminate
+    name: str                      # click | type | key | scroll | wait | open_app | bash | web_search | web_fetch | reground | terminate
     x: int | None = None
     y: int | None = None
     text: str | None = None
@@ -32,6 +32,9 @@ class Action:
     cmd: str | None = None         # for bash
     cwd: str | None = None         # for bash (working directory; default: current)
     timeout: int = 30              # for bash (seconds)
+    query: str | None = None       # for web_search
+    url: str | None = None         # for web_fetch
+    freshness: str | None = None   # for web_search: "day" | "week" | "month" | "year"
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
@@ -143,6 +146,26 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
             else:
                 pyautogui.hotkey(*keys)
         return f"pressed {'+'.join(keys)}"
+
+    # ─── web ──────────────────────────────────────────────────────────────
+    if name == "web_search":
+        from .web import web_search
+        q = (action.query or action.text or "").strip()
+        if not q:
+            return "ERROR: web_search needs `query`"
+        if dry_run:
+            return f"would search: {q!r}"
+        return web_search(q, count=int(action.amount or 5),
+                          freshness=action.freshness)
+
+    if name == "web_fetch":
+        from .web import web_fetch
+        u = (action.url or action.text or "").strip()
+        if not u:
+            return "ERROR: web_fetch needs `url`"
+        if dry_run:
+            return f"would fetch: {u}"
+        return web_fetch(u)
 
     # ─── shell ────────────────────────────────────────────────────────────
     if name == "bash":

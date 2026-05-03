@@ -541,7 +541,14 @@ def _run_task(task: str, opts: dict,
     print(summary)
     result_text = last.action.reason if (last and last.action.reason) else ""
     if result_text:
-        print(c(f"        → {_shorten(result_text, 80)}", DIM))
+        # Print the full reason, wrapped at 90 chars so terminal users see
+        # everything. Long news/research summaries shouldn't be truncated to
+        # one line — the user just spent tokens to produce them.
+        import textwrap
+        body = textwrap.fill(result_text, width=90,
+                             initial_indent="        → ",
+                             subsequent_indent="          ")
+        print(c(body, DIM))
     if out_dir:
         print(c(f"        ↳ {out_dir.name}", DIM))
 

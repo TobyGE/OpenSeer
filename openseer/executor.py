@@ -21,19 +21,24 @@ pyautogui.PAUSE = 0.1
 
 @dataclass
 class Action:
-    name: str                      # click | double_click | type | key | scroll | wait | open_app | reground | done | fail
+    name: str                      # click | type | key | scroll | wait | open_app | bash | reground | terminate
     x: int | None = None
     y: int | None = None
     text: str | None = None
     key: str | None = None
     amount: int | None = None
+    count: int = 1                 # for click: number of clicks (1=single, 2=double, ...)
     app: str | None = None         # for open_app
+    cmd: str | None = None         # for bash
+    cwd: str | None = None         # for bash (working directory; default: current)
+    timeout: int = 30              # for bash (seconds)
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
+    status: str | None = None      # for terminate: "done" | "fail"
     reason: str | None = None
     thought: str | None = None
-    verified_by_steps: list[int] | None = None   # for `done`: prior step indices that ACTUALLY produced this result
+    verified_by_steps: list[int] | None = None   # for terminate(done): prior step indices that ACTUALLY produced this result
     grounding_backend: str | None = None         # which grounder produced (x,y) when from target
     grounding_elapsed_ms: int | None = None
 
@@ -47,6 +52,11 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
     w, h = pyautogui.size()
     name = action.name
 
+    # ─── control flow ─────────────────────────────────────────────────────
+    if name == "terminate":
+        st = (action.status or "").lower() or "done"
+        return f"task ended: {st} — {action.reason or ''}"
+    # backward-compat alias for old `done`/`fail`
     if name in ("done", "fail"):
         return f"task ended: {name} — {action.reason or ''}"
 
@@ -56,26 +66,34 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
             time.sleep(s)
         return f"waited {s}s"
 
-    if name in ("click", "double_click", "scroll"):
+    # ─── computer-use primitives ──────────────────────────────────────────
+    if name in ("click", "scroll"):
         if action.x is None or action.y is None:
             return "ERROR: missing x,y"
         x = _clamp(int(action.x), 0, w)
         y = _clamp(int(action.y), 0, h)
         clamped = (x, y) != (int(action.x), int(action.y))
         if name == "click":
+            count = max(1, int(action.count or 1))
             if not dry_run:
-                pyautogui.click(x, y)
-            return f"clicked ({x},{y})" + (" [clamped]" if clamped else "")
-        if name == "double_click":
-            if not dry_run:
-                pyautogui.doubleClick(x, y)
-            return f"double-clicked ({x},{y})" + (" [clamped]" if clamped else "")
+                pyautogui.click(x, y, clicks=count, interval=0.06 if count > 1 else 0)
+            verb = "clicked" if count == 1 else f"{count}-clicked"
+            return f"{verb} ({x},{y})" + (" [clamped]" if clamped else "")
         if name == "scroll":
             amt = int(action.amount or 0)
             if not dry_run:
                 pyautogui.moveTo(x, y)
                 pyautogui.scroll(-amt)  # pyautogui: negative=down on macOS
             return f"scrolled at ({x},{y}) by {amt}"
+    # backward-compat alias
+    if name == "double_click":
+        if action.x is None or action.y is None:
+            return "ERROR: missing x,y"
+        x = _clamp(int(action.x), 0, w)
+        y = _clamp(int(action.y), 0, h)
+        if not dry_run:
+            pyautogui.doubleClick(x, y)
+        return f"double-clicked ({x},{y})"
 
     if name == "open_app":
         app = (action.app or action.text or "").strip()
@@ -125,5 +143,36 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
             else:
                 pyautogui.hotkey(*keys)
         return f"pressed {'+'.join(keys)}"
+
+    # ─── shell ────────────────────────────────────────────────────────────
+    if name == "bash":
+        cmd = (action.cmd or "").strip()
+        if not cmd:
+            return "ERROR: bash needs `cmd`"
+        timeout = max(1, min(120, int(action.timeout or 30)))
+        cwd = action.cwd or None
+        if dry_run:
+            return f"would run: {cmd[:200]}"
+        try:
+            r = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=timeout, cwd=cwd,
+            )
+        except subprocess.TimeoutExpired:
+            return f"bash TIMEOUT after {timeout}s: {cmd[:120]}"
+        except OSError as e:
+            return f"bash exec error: {e}"
+        # Return a compact result for the next-turn prompt. Truncate aggressively.
+        out = (r.stdout or "")[:1500]
+        err = (r.stderr or "")[:500]
+        head = f"rc={r.returncode}"
+        parts = [head]
+        if out.strip():
+            parts.append(f"stdout:\n{out}")
+        if err.strip():
+            parts.append(f"stderr:\n{err}")
+        if not out.strip() and not err.strip():
+            parts.append("(no output)")
+        return "\n".join(parts)
 
     return f"ERROR: unknown action {name}"

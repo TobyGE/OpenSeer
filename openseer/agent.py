@@ -711,7 +711,10 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             (annotate(frame.image, marks) if marks else frame.image).save(ann_path)
 
             # per-step confirmation
-            if confirm_each and not dry_run and action.name not in ("done", "fail"):
+            # Skip confirm prompt for terminal actions (done/fail/terminate) —
+            # they end the loop, prompting "execute?" makes no sense and
+            # treating Enter as abort would cancel a successful task.
+            if confirm_each and not dry_run and action.name not in ("done", "fail", "terminate"):
                 ans = _confirm(action)
                 if ans == "q":
                     say("  [aborted by user]")

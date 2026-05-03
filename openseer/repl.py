@@ -485,9 +485,23 @@ def _run_task(task: str, opts: dict,
         )
     except KeyboardInterrupt:
         print(c("\n  ⏵ interrupted", YEL))
+        # Still record the attempt so the next task's session context
+        # reflects what the user was last working on. Without this, a
+        # follow-up like "试试不用bash再来" loses its referent and the
+        # model anchors to the previous successful task instead.
+        session.append(TaskSummary(
+            task=task, status="interrupted",
+            result="user interrupted before completion",
+            trace_id=None, n_steps=0,
+        ))
         return
     except Exception as e:
         print(c(f"\n  ✗ {e}", RED))
+        session.append(TaskSummary(
+            task=task, status="error",
+            result=f"runtime error: {e}",
+            trace_id=None, n_steps=0,
+        ))
         return
 
     secs = time.time() - t0

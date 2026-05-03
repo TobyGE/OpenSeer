@@ -52,19 +52,6 @@ or `Ctrl+C` in the terminal.
 
 Each run writes a full trajectory to `~/Desktop/openseer/run-{timestamp}/`.
 
-## Why
-
-| Existing tool | Strength | Missing |
-|---|---|---|
-| Claude / ChatGPT | Conversation | Can't drive your Mac |
-| Anthropic CU tool | Pixel-level GUI | No memory; blank every session |
-| Codex desktop | Coding | Coding only |
-| OpenClaw | Persona, channels | Doesn't operate GUIs |
-| trycua/cua | Solid substrate | No assistant layer |
-
-OpenSeer fills the layer those products miss: chat-first,
-memory-aware, locally-running, model-agnostic.
-
 ## What's in
 
 - Multi-turn agent loop driven by GPT-5.5 (ChatGPT subscription OAuth — no API key)

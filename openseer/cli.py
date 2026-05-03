@@ -16,6 +16,7 @@ import sys
 
 from . import auth as auth_mod
 from .agent import run
+from .repl import repl as run_repl
 
 
 # ────────────────────────────  task subcommand  ──────────────────────────────
@@ -76,14 +77,21 @@ def cmd_auth_logout(args: argparse.Namespace) -> int:
 
 # ────────────────────────────  argparse plumbing  ────────────────────────────
 
+def cmd_chat(args: argparse.Namespace) -> int:
+    return run_repl()
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="openseer",
         description="OpenSeer — chat-first, memory-aware macOS computer-use agent",
     )
-    sub = ap.add_subparsers(dest="cmd", metavar="{task,auth}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,auth}")
 
-    p_task = sub.add_parser("task", help="Run the agent on a task")
+    p_chat = sub.add_parser("chat", help="Interactive REPL (default if no args)")
+    p_chat.set_defaults(func=cmd_chat)
+
+    p_task = sub.add_parser("task", help="Run the agent on a one-off task")
     _add_task_args(p_task)
     p_task.set_defaults(func=cmd_task)
 
@@ -97,13 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"task", "auth", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "auth", "-h", "--help"}
 
 
 def main() -> None:
-    # Convenience: `openseer "<task>"` is an alias for `openseer task "<task>"`.
     argv = sys.argv[1:]
-    if argv and argv[0] not in _KNOWN_SUBCOMMANDS and not argv[0].startswith("-"):
+
+    # `openseer`            → enter REPL
+    # `openseer "<task>"`   → one-off task (alias for `openseer task ...`)
+    # `openseer task ...`   → explicit one-off
+    # `openseer auth ...`   → auth subcommand
+    if not argv:
+        argv = ["chat"]
+    elif argv[0] not in _KNOWN_SUBCOMMANDS and not argv[0].startswith("-"):
         argv = ["task"] + argv
 
     ap = build_parser()

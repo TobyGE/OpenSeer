@@ -91,14 +91,35 @@ You also need to grant your terminal **Accessibility** permission
 (System Settings → Privacy & Security → Accessibility), otherwise
 pyautogui will silently fail to inject mouse / keyboard events.
 
-Then run a task:
+Then drop into the chat shell:
+
+```bash
+$ openseer
+OpenSeer — Sees. Remembers. Acts.
+  Type a task, or /help for commands, /exit to leave.
+  logged in: plus
+
+openseer ❯ Open Calculator and compute 999 * 123
+[task] Open Calculator and compute 999 * 123
+...
+[finished] 6 step(s) in 31.4s — last: done
+
+openseer ❯ /history
+  run-20260502-211052  Open Safari, go to youtube.com, search for ...
+  run-20260502-205834  Open Calculator, compute 17 * 42, copy the ...
+
+openseer ❯ /exit
+```
+
+Suffix flags work per-task: `Open Notes --dry`, `Find foo --steps 8 --confirm`.
+
+Or run one-off without the REPL:
 
 ```bash
 openseer "Open Calculator and compute 999 * 123"
 # equivalent to: openseer task "Open Calculator and compute 999 * 123"
 
-openseer --execute "Open Calculator and compute 999 * 123"   # actually drive the UI
-openseer --execute --confirm-each "..."                       # ask y/s/q per step
+openseer task --execute --confirm-each "..."   # actually drive the UI, step-confirm
 ```
 
 The agent will take over the mouse and keyboard while it runs. To

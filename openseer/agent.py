@@ -18,13 +18,15 @@ from datetime import datetime
 from pathlib import Path
 
 from .callbacks import (
-    BudgetCallback, Callback, ImageRetentionCallback, TrajectoryCallback,
+    BudgetCallback, Callback, ImageRetentionCallback, SafetyCallback,
+    TrajectoryCallback,
 )
 from .draw import annotate
 from .executor import Action, execute
 from .grounding import Grounder, GroundingResult, make as make_grounder
 from .openai_chatgpt import MODEL as OAI_MODEL, _data_url, _stream_full
 from .screen import Frame, capture
+from .skills import load_available, render_for_prompt
 
 
 SYSTEM_PROMPT = """You are a macOS computer-use agent. You drive the user's
@@ -87,19 +89,41 @@ No prose, no markdown fences.
 Schema (only include fields relevant to the action):
 {{
   "thought": "<one short sentence: what you observe + why this action>",
-  "action":  "click" | "double_click" | "type" | "key" | "scroll" | "wait"
-           | "open_app" | "reground" | "done" | "fail",
-  "x":      <int>,           // for click/double_click/scroll/type
+  "action":  "click" | "type" | "key" | "scroll" | "wait"
+           | "open_app" | "bash" | "reground" | "terminate",
+  "x":      <int>,           // for click/scroll/type
   "y":      <int>,           // same
+  "count":  <int>,           // for click — 1 (default) for single, 2 for double-click, 3 for triple, ...
   "text":   "<string>",      // for type — exact text to type
   "key":    "<combo>",       // for key — e.g. "cmd+w", "enter", "esc", "tab"
   "amount": <int>,           // for scroll (positive=down, negative=up) or wait (seconds, max 5)
   "app":    "<string>",      // for open_app — application name e.g. "Calculator", "Notes", "Safari"
-  "target": "<natural-language description>",   // for reground
-  "region": [<x1>,<y1>,<x2>,<y2>],              // for reground: optional crop bbox
-  "external": <bool>,                           // for reground: true ⇒ specialist grounder
-  "reason": "<string>"                          // for done/fail
+  "cmd":    "<string>",      // for bash — full shell command line (run via /bin/sh -c)
+  "cwd":    "<path>",        // for bash — optional working directory (default: pwd)
+  "timeout":<int>,           // for bash — seconds before kill (default 30, max 120)
+  "target": "<description>", // for reground
+  "region": [<x1>,<y1>,<x2>,<y2>],     // for reground: optional crop bbox
+  "external": <bool>,                  // for reground: true ⇒ specialist grounder
+  "status": "done" | "fail",           // for terminate
+  "reason": "<string>"                 // for terminate
 }}
+
+Tool taxonomy (high level):
+  - **`bash`** — universal CLI bridge. Use when a command-line tool can do
+    the job: opening URLs (`open https://...`), file system ops (`mv`,
+    `find`, `mdfind`), clipboard (`pbcopy`/`pbpaste`), `git`, `gh`,
+    `curl`, `osascript`, etc. Returns rc + stdout + stderr.
+  - **CU primitives** (click/type/key/scroll/wait/open_app) — use for any
+    GUI-only operation that has no good CLI equivalent (specialised apps,
+    Canvas-based UIs, web apps without APIs).
+  - **`reground`** — ask for help locating something visually.
+  - **`terminate`** — end the task with status "done" or "fail".
+
+**Strongly prefer `bash` when a one-liner solves the task.** Examples:
+  - "open URL X" → `bash open <URL>`, not navigating Safari.
+  - "find my doc" → `bash mdfind` / `find`, not Finder.
+  - "what's on the clipboard" → `bash pbpaste`, not click+paste.
+  - "save this to a file" → `bash echo … > file`, not opening TextEdit.
 
 Grounding contract:
   - For click/double_click/type/scroll, you give `(x, y)` DIRECTLY.
@@ -179,10 +203,15 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         text=obj.get("text"),
         key=obj.get("key"),
         amount=obj.get("amount"),
+        count=int(obj.get("count") or 1),
         app=obj.get("app"),
+        cmd=obj.get("cmd"),
+        cwd=obj.get("cwd"),
+        timeout=int(obj.get("timeout") or 30),
         target=obj.get("target"),
         region=obj.get("region"),
         external=bool(obj.get("external", False)),
+        status=obj.get("status"),
         reason=obj.get("reason"),
         thought=obj.get("thought") or fallback_thought,
         verified_by_steps=obj.get("verified_by_steps"),
@@ -235,14 +264,19 @@ def _parse_actions(raw: str) -> list[Action]:
 # Action types that count as the agent actively producing output / state
 # changes. `open_app` is a state change too. `wait` / `reground` /
 # `screenshot` do NOT count as evidence of having done the work.
-_PRODUCING_ACTIONS = {"click", "double_click", "type", "key", "scroll", "open_app"}
+_PRODUCING_ACTIONS = {"click", "double_click", "type", "key", "scroll", "open_app", "bash"}
 
 
 def _validate_done(action: Action, history: list["Step"]) -> str | None:
     """Returns None if `done` is acceptable, otherwise an error string
     explaining why so the model can be told to keep working.
+
+    Accepts both legacy `done`/`fail` and the new `terminate` form.
+    Only `terminate` with status="done" (or legacy `done`) needs verification —
+    `fail` is the model giving up and doesn't need a verification chain.
     """
-    if action.name != "done":
+    is_done = action.name == "done" or (action.name == "terminate" and (action.status or "").lower() == "done")
+    if not is_done:
         return None
     cited = action.verified_by_steps or []
     if not cited:
@@ -413,13 +447,18 @@ def _confirm(action: Action) -> str:
 def _default_callbacks(quiet: bool = False) -> list[Callback]:
     """Default callback stack: image retention (keep 4 most recent images,
     drop the rest with summary text) + per-step trajectory persistence +
-    a generous token budget. `quiet` silences any print() from these."""
+    token budget + safety guard for dangerous bash/click."""
     return [
         ImageRetentionCallback(n=4, mode="summary"),
         TrajectoryCallback(verbose=not quiet),
         BudgetCallback(max_input_tokens=300_000, max_output_tokens=30_000,
                        verbose=not quiet),
+        SafetyCallback(mode="confirm"),
     ]
+
+
+# Where SKILL.md files live. Resolved at run-time.
+_SKILLS_ROOT = Path(__file__).resolve().parent.parent / "skills"
 
 
 def _handle_reground(action: Action, frame: Frame,
@@ -498,6 +537,12 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
     say(f"[agent] callbacks: {[c.label for c in cbs]}")
     say(f"[agent] grounder:  default={grounder.name}  external={external_grounder.name}")
 
+    # Load skill knowledge once per run; injected into every system prompt.
+    skills = load_available(_SKILLS_ROOT)
+    skill_block = render_for_prompt(skills)
+    say(f"[agent] skills:    {len(skills)} loaded ({sum(1 for s in skills if s.family == 'bash')} bash, "
+        f"{sum(1 for s in skills if s.family == 'cu')} cu)")
+
     history: list[Step] = []
     ctx: dict = {
         "task": task, "model": OAI_MODEL, "system_prompt": SYSTEM_PROMPT,
@@ -526,6 +571,8 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         # (image retention dropping old screenshots happens here)
         instructions = SYSTEM_PROMPT.format(
             W=frame.logical_size[0], H=frame.logical_size[1])
+        if skill_block:
+            instructions = instructions + "\n\n" + skill_block
         input_items = _build_input(task, frame, frame_hash, history)
         for cb in cbs:
             input_items = cb.on_messages_built(ctx, input_items)
@@ -635,8 +682,10 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                     for cb in cbs: cb.on_step_recorded(ctx, step)
                     continue
 
-            # validate `done`
-            if action.name == "done":
+            # validate `done` (and `terminate` with status=done)
+            is_done = action.name == "done" or \
+                (action.name == "terminate" and (action.status or "").lower() == "done")
+            if is_done:
                 err = _validate_done(action, history)
                 if err:
                     say(f"  [{label}] ⚠ done REJECTED: {err}")
@@ -653,6 +702,40 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                     for cb in cbs: cb.on_step_recorded(ctx, step)
                     continue
 
+            # Safety guard: ask SafetyCallback (if installed) whether this
+            # action is suspicious. If yes and mode != "log", we either
+            # block or prompt for confirmation.
+            safety_blocked = False
+            for cb in cbs:
+                if isinstance(cb, SafetyCallback):
+                    ok, why = cb.check(action)
+                    if not ok:
+                        if cb.mode == "block":
+                            say(f"  [{label}] ⚠ BLOCKED by safety: {why}")
+                            safety_blocked = True
+                        elif cb.mode == "confirm":
+                            try:
+                                ans = input(f"  ⚠ safety: {why}. Run anyway? [y/N] ").strip().lower()
+                            except EOFError:
+                                ans = ""
+                            if ans not in ("y", "yes"):
+                                say(f"  [{label}] aborted by safety check")
+                                safety_blocked = True
+                        else:  # "log" — just print
+                            say(f"  [{label}] ⚠ safety log: {why} (running anyway)")
+                    break
+            if safety_blocked:
+                step = Step(idx=sn_action, action=action,
+                            result="blocked by safety guard",
+                            raw_response=raw,
+                            usage=usage if chain_pos == 0 else None,
+                            elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                            screenshot_path=raw_path, annotated_path=ann_path,
+                            frame_hash=frame_hash)
+                history.append(step)
+                for cb in cbs: cb.on_step_recorded(ctx, step)
+                continue
+
             result = execute(action, dry_run=dry_run)
             say(f"  [{label}] result:  {result}{'  [DRY-RUN]' if dry_run else ''}")
 
@@ -665,8 +748,9 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             history.append(step)
             for cb in cbs: cb.on_step_recorded(ctx, step)
 
-            if action.name in ("done", "fail"):
-                say(f"\n[agent] terminated: {action.name} — {action.reason}")
+            if action.name in ("done", "fail", "terminate"):
+                lbl = action.status if action.name == "terminate" else action.name
+                say(f"\n[agent] terminated: {lbl} — {action.reason}")
                 terminate = True
                 break
 

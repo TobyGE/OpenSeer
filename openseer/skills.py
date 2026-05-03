@@ -159,7 +159,7 @@ def load_available(root: Path) -> list[Skill]:
     return [s for s in discover(root) if _is_available(s)]
 
 
-def render_for_prompt(skills: list[Skill], max_chars: int = 6000) -> str:
+def render_for_prompt(skills: list[Skill], max_chars: int = 20_000) -> str:
     """Concatenate skill bodies into a single markdown block for the
     system prompt. Caps total size to avoid prompt bloat."""
     if not skills:

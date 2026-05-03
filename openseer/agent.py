@@ -499,7 +499,9 @@ _USER_SKILLS_ROOT = Path.home() / ".openseer" / "skills"
 
 
 def _skill_roots() -> list[Path]:
-    return [p for p in (_BUNDLED_SKILLS_ROOT, _USER_SKILLS_ROOT) if p.exists()]
+    # User skills first so they win the prompt budget over bundled ones
+    # (the user-installed copy is the override; bundled is the fallback).
+    return [p for p in (_USER_SKILLS_ROOT, _BUNDLED_SKILLS_ROOT) if p.exists()]
 
 
 def _handle_reground(action: Action, frame: Frame,
@@ -580,9 +582,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
 
     # Load skill knowledge once per run; injected into every system prompt.
     # Bundled skills ship with the package; user can extend via ~/.openseer/skills/.
+    # User-root is walked FIRST and we dedup by skill name, so a user-installed
+    # skill with the same name overrides the bundled fallback cleanly.
     skills: list = []
+    _seen_names: set[str] = set()
     for root in _skill_roots():
-        skills.extend(load_available(root))
+        for s in load_available(root):
+            if s.name in _seen_names:
+                continue
+            _seen_names.add(s.name)
+            skills.append(s)
     skill_block = render_for_prompt(skills)
     n_bash = sum(1 for s in skills if s.family == "bash")
     n_cu = sum(1 for s in skills if s.family == "cu")

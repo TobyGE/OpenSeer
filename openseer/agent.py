@@ -133,11 +133,33 @@ Tool taxonomy (high level):
   - **`reground`** — ask for help locating something visually.
   - **`terminate`** — end the task with status "done" or "fail".
 
-**Strongly prefer `bash` when a one-liner solves the task.** Examples:
+**Prefer `bash` when a one-liner can semantically reach the target.**
+Good cases:
   - "open URL X" → `bash open <URL>`, not navigating Safari.
-  - "find my doc" → `bash mdfind` / `find`, not Finder.
+  - "find my doc named X" → `bash mdfind` / `find`, not Finder.
   - "what's on the clipboard" → `bash pbpaste`, not click+paste.
   - "save this to a file" → `bash echo … > file`, not opening TextEdit.
+
+**bash CANNOT do these — use CU primitives:**
+  - "Find a photo OF <person>" / "open the picture that shows <thing>"
+    — image filenames almost never include their depicted subject;
+    only your eyes can match content to a file.
+  - "Click the button labelled X" / "what does the screen currently say"
+    — visual semantics, not on disk.
+  - "Open the file behind the thumbnail labelled <X>" — the visible
+    label in Finder may be a Stack / Spotlight result / synthetic group,
+    NOT a real filename. `open ~/Desktop/<label>` will fail.
+
+**CU click-failure reflex.** After a click/double_click/type, if the
+next screenshot does NOT show the change you expected:
+  1. RETRY the same action with adjusted coords, or use `reground`
+     for that target.
+  2. Re-screenshot first — the action may have succeeded but the
+     window came up behind another, or you're looking at the previous
+     frame.
+  **Do NOT abandon CU for bash unless bash can semantically reach the
+  content.** Switching to filename search when the user asked for a
+  visual content match wastes turns and produces wrong answers.
 
 **Ending the task — `terminate` example (memorise this exact shape):**
 ```
@@ -603,21 +625,25 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
     say(f"[agent] grounder:  default={grounder.name}  external={external_grounder.name}")
 
     # Load skill knowledge once per run; injected into every system prompt.
-    # Bundled skills ship with the package; user can extend via ~/.openseer/skills/.
-    # User-root is walked FIRST and we dedup by skill name, so a user-installed
-    # skill with the same name overrides the bundled fallback cleanly.
-    skills: list = []
-    _seen_names: set[str] = set()
+    # We keep user and bundled groups SEPARATE through to render_for_prompt,
+    # so the size cap evicts within the bundled tier first; user skills
+    # always make it into the prompt as long as they fit at all.
+    skill_groups: list[list] = []
+    seen_names: set[str] = set()
     for root in _skill_roots():
+        group: list = []
         for s in load_available(root):
-            if s.name in _seen_names:
-                continue
-            _seen_names.add(s.name)
-            skills.append(s)
-    skill_block = render_for_prompt(skills)
-    n_bash = sum(1 for s in skills if s.family == "bash")
-    n_cu = sum(1 for s in skills if s.family == "cu")
-    say(f"[agent] skills:    {len(skills)} loaded ({n_bash} bash, {n_cu} cu) "
+            if s.name in seen_names:
+                continue       # later root yields a shadowed bundled copy → skip
+            seen_names.add(s.name)
+            group.append(s)
+        if group:
+            skill_groups.append(group)
+    skill_block = render_for_prompt(skill_groups)
+    all_skills = [s for g in skill_groups for s in g]
+    n_bash = sum(1 for s in all_skills if s.family == "bash")
+    n_cu = sum(1 for s in all_skills if s.family == "cu")
+    say(f"[agent] skills:    {len(all_skills)} loaded ({n_bash} bash, {n_cu} cu) "
         f"from {len(_skill_roots())} location(s)")
 
     history: list[Step] = []

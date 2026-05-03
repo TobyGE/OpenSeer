@@ -159,25 +159,69 @@ def load_available(root: Path) -> list[Skill]:
     return [s for s in discover(root) if _is_available(s)]
 
 
-def render_for_prompt(skills: list[Skill], max_chars: int = 20_000) -> str:
+def _round_robin_by_family(skills: list[Skill]) -> list[Skill]:
+    """Within one priority group, interleave one skill per family per
+    pass so a single huge family doesn't monopolise the budget."""
+    by_family: dict[str, list[Skill]] = {}
+    family_order: list[str] = []
+    for s in skills:
+        fam = s.family or "misc"
+        if fam not in by_family:
+            by_family[fam] = []
+            family_order.append(fam)
+        by_family[fam].append(s)
+    out: list[Skill] = []
+    while any(by_family[f] for f in family_order):
+        for f in family_order:
+            if by_family[f]:
+                out.append(by_family[f].pop(0))
+    return out
+
+
+def render_for_prompt(groups: list[list[Skill]] | list[Skill],
+                      max_chars: int = 30_000) -> str:
     """Concatenate skill bodies into a single markdown block for the
-    system prompt. Caps total size to avoid prompt bloat."""
-    if not skills:
+    system prompt, with a soft size cap.
+
+    The first argument is one or more priority groups (highest first):
+    typically [user_skills, bundled_skills] so user-installed skills
+    consume the budget first. Within a group, skills are family
+    round-robin'd so a huge family doesn't monopolise that group's
+    share of the cap.
+
+    Backward-compat: if a flat ``list[Skill]`` is passed, it's treated
+    as a single priority group.
+    """
+    if not groups:
         return ""
+    # Detect flat list vs list of lists
+    if groups and isinstance(groups[0], Skill):
+        groups_norm: list[list[Skill]] = [groups]   # type: ignore[list-item]
+    else:
+        groups_norm = list(groups)                  # type: ignore[assignment]
+
+    # Build the emission order: each group's skills round-robin'd by
+    # family, groups concatenated in priority order.
+    ordered: list[Skill] = []
+    for g in groups_norm:
+        ordered.extend(_round_robin_by_family(g))
+    if not ordered:
+        return ""
+
     parts = ["## Skills available\n",
              "These domain knowledge documents tell you how to use specific",
              "CLIs (via `bash`) or apps (via CU primitives). Consult them",
              "before guessing. They are loaded only if their dependencies",
              "exist on this machine, so anything listed below is usable.\n"]
     used = sum(len(p) + 1 for p in parts)
-    for s in skills:
+    for i, s in enumerate(ordered):
         block = (
             f"\n### {s.name}  ({s.family or 'misc'})\n"
             f"{s.description}\n\n"
             f"{s.body}\n"
         )
         if used + len(block) > max_chars:
-            parts.append(f"\n_(skipped {len(skills) - skills.index(s)} more skill(s) — prompt size cap)_\n")
+            parts.append(f"\n_(skipped {len(ordered) - i} more skill(s) — prompt size cap)_\n")
             break
         parts.append(block)
         used += len(block)

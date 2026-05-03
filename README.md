@@ -35,8 +35,8 @@ memory-aware, locally-running, model-agnostic, open source.
 - Full-screen capture via Quartz (`CGWindowListCreateImage`-style)
 - Multi-turn agent loop driven by GPT-5.5 (via the user's ChatGPT
   subscription OAuth — no API key required)
-- Pluggable grounding backends (default: GPT-5.5 vision\_json;
-  alternative: Anthropic Haiku via OAuth)
+- Pluggable grounding backend (default: GPT-5.5 vision\_json; more
+  backends planned — Anthropic CU tool, OpenAI CUA, self-hosted UI-TARS)
 - `reground` action — the model can call for a focused grounding pass
   with optional region zoom and an "external/specialist" flag
 - `open_app` action — bypass the Dock, launch any app via `open -a`
@@ -70,26 +70,30 @@ cd OpenSeer
 pip install -e .
 ```
 
-OpenSeer authenticates against the ChatGPT codex backend by reusing
-the OAuth tokens that the official **Codex CLI** stores locally —
-so your ChatGPT subscription powers the model, no API key required.
-Install Codex CLI once, then log in through OpenSeer:
+First time, run the guided setup — it walks you through Codex CLI install,
+OAuth login, and the two macOS permissions OpenSeer needs:
 
 ```bash
-# 1. install Codex CLI (one-time, system-wide)
-npm install -g @openai/codex
-
-# 2. log in — opens your browser, drops a token in ~/.codex/auth.json
-openseer auth login
-
-# 3. confirm
-openseer auth status
-# → ✅ logged in — auth_mode=chatgpt plan=plus expires_in=…h
+openseer setup
 ```
 
-You also need to grant your terminal **Accessibility** permission
-(System Settings → Privacy & Security → Accessibility), otherwise
-pyautogui will silently fail to inject mouse / keyboard events.
+What it checks:
+
+```
+[1/5] Codex CLI installed
+[2/5] ChatGPT OAuth login (no API key needed — uses your subscription)
+[3/5] macOS Accessibility permission   (lets us inject mouse/keyboard)
+[4/5] macOS Screen Recording permission (lets us see the screen)
+[5/5] Smoke test (1 model ping, no UI actions)
+```
+
+Manual subcommands if you ever need to redo just one step:
+
+```bash
+openseer auth login     # re-run the OAuth dance
+openseer auth status    # check token validity
+openseer auth logout    # wipe local tokens
+```
 
 Then drop into the chat shell:
 

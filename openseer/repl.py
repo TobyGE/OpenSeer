@@ -18,7 +18,8 @@ from datetime import datetime
 from pathlib import Path
 
 from . import auth as auth_mod
-from .agent import run
+from .agent import run, _default_callbacks
+from .callbacks import Callback
 
 # ─── ANSI colors (no external deps) ────────────────────────────────────────────
 RESET, BOLD, DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
@@ -27,6 +28,81 @@ RED, GRN, YEL, BLU, MAG, CYN = (f"\x1b[3{i}m" for i in range(1, 7))
 
 def c(s: str, *codes: str) -> str:
     return f"{''.join(codes)}{s}{RESET}"
+
+
+# ─── pretty per-step renderer (used as a Callback) ─────────────────────────────
+
+def _shorten(s: str | None, n: int) -> str:
+    if not s:
+        return ""
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+class _PrettyConsole(Callback):
+    """Render each Step as a single compact bullet line, cc/codex-style."""
+
+    name = "PrettyConsole"
+
+    def on_step_recorded(self, ctx: dict, step) -> None:
+        a = step.action
+        # Each step is one line. Format:
+        #   ● <thought truncated>          <action summary>          ✓
+        bullet = c("●", CYN)
+
+        # action summary
+        if a.name == "open_app":
+            act = f"open {a.app}"
+        elif a.name == "click":
+            act = f"click ({a.x},{a.y})"
+        elif a.name == "double_click":
+            act = f"double-click ({a.x},{a.y})"
+        elif a.name == "type":
+            text = _shorten(a.text, 40)
+            act = f"type {text!r}" + (f" → ({a.x},{a.y})" if a.x is not None else "")
+        elif a.name == "key":
+            act = f"key {a.key}"
+        elif a.name == "scroll":
+            act = f"scroll ({a.x},{a.y}) amt={a.amount}"
+        elif a.name == "wait":
+            act = f"wait {a.amount}s"
+        elif a.name == "reground":
+            tag = "ext" if a.external else "default"
+            act = f"reground[{tag}] {_shorten(a.target, 30)!r}"
+        elif a.name == "done":
+            act = c("done", GRN, BOLD) + " " + _shorten(a.reason, 60)
+        elif a.name == "fail":
+            act = c("fail", RED, BOLD) + " " + _shorten(a.reason, 60)
+        elif a.name == "verify_failed":
+            act = c("done rejected", YEL) + " — " + _shorten(a.reason, 60)
+        else:
+            act = a.name
+
+        # status indicator
+        result = (step.result or "").lower()
+        if "fail" in result or "error" in result:
+            mark = c("✗", RED)
+        elif a.name in ("done", "fail", "verify_failed"):
+            mark = ""
+        else:
+            mark = c("✓", GRN, DIM)
+
+        # thought, dimmed and truncated
+        thought = _shorten(a.thought, 70)
+        thought_str = c(thought, DIM) if thought else ""
+
+        # one-line render
+        if thought_str:
+            print(f"  {bullet} {thought_str}")
+            print(f"     {DIM}└{RESET} {act} {mark}")
+        else:
+            print(f"  {bullet} {act} {mark}")
+
+
+def _build_repl_callbacks() -> list[Callback]:
+    cbs = _default_callbacks(quiet=True)
+    cbs.append(_PrettyConsole())
+    return cbs
 
 
 HISTORY_FILE = Path.home() / ".openseer" / "repl-history"
@@ -65,7 +141,7 @@ def _cmd_help() -> None:
     print()
     print(c("Run options (suffix flags):", BOLD))
     print("  --dry            don't drive the UI, just predict")
-    print("  --steps N        cap at N steps (default 12)")
+    print("  --steps N        cap at N steps (default 20)")
     print("  --confirm        prompt y/s/q before each action")
 
 
@@ -102,7 +178,7 @@ def _parse_task_flags(line: str) -> tuple[str, dict]:
       "open Notes --steps 8"      → ("open Notes", {max_steps: 8})
     """
     parts = line.split()
-    opts = {"max_steps": 12, "dry_run": False, "confirm_each": False}
+    opts = {"max_steps": 20, "dry_run": False, "confirm_each": False}
     keep = []
     i = 0
     while i < len(parts):
@@ -123,10 +199,15 @@ def _parse_task_flags(line: str) -> tuple[str, dict]:
 # ─── one task run ──────────────────────────────────────────────────────────────
 
 def _run_task(task: str, opts: dict) -> None:
-    print(c(f"\n[task] {task}", DIM))
-    if opts["dry_run"]:
-        print(c("       (dry-run, no UI actions will execute)", DIM, YEL))
+    # one-line header, dimmed
+    flags = []
+    if opts["dry_run"]:    flags.append(c("dry", YEL))
+    if opts["confirm_each"]: flags.append(c("confirm", YEL))
+    if opts["max_steps"] != 20: flags.append(f"steps≤{opts['max_steps']}")
+    flag_str = ("  " + " ".join(flags)) if flags else ""
+    print(f"  {c('▸', BLU)} {c(task, BOLD)}{flag_str}")
     print()
+
     t0 = time.time()
     try:
         history = run(
@@ -135,21 +216,46 @@ def _run_task(task: str, opts: dict) -> None:
             dry_run=opts["dry_run"],
             confirm_each=opts["confirm_each"],
             sleep_between=0.0,
+            callbacks=_build_repl_callbacks(),
+            quiet=True,
         )
     except KeyboardInterrupt:
-        print(c("\n[interrupted]", YEL))
+        print(c("\n  ⏵ interrupted", YEL))
         return
     except Exception as e:
-        print(c(f"\n[error] {e}", RED))
+        print(c(f"\n  ✗ {e}", RED))
         return
+
     secs = time.time() - t0
     n = len(history)
     last = history[-1] if history else None
     status = last.action.name if last else "?"
-    color = GRN if status == "done" else (YEL if status in ("fail", "verify_failed") else RED)
-    print(c(f"\n[finished] {n} step(s) in {secs:.1f}s — last: {status}", color, BOLD))
+
+    # totals were stashed by TrajectoryCallback
+    totals = {}
+    # find the trajectory ctx via callbacks isn't easy; use the latest run dir
+    runs = sorted((Path.home() / "Desktop" / "openseer").glob("run-*"), reverse=True)
+    out_dir = runs[0] if runs else None
+
+    in_tok = sum((s.usage or {}).get("input_tokens", 0)  for s in history)
+    out_tok = sum((s.usage or {}).get("output_tokens", 0) for s in history)
+    cost = in_tok / 1e6 * 0.50 + out_tok / 1e6 * 4.00
+
+    print()
+    if status == "done":
+        head = c("✓ done", GRN, BOLD)
+    elif status in ("fail", "verify_failed"):
+        head = c("⚠ " + status, YEL, BOLD)
+    else:
+        head = c("• cap", DIM, BOLD)
+    summary = (f"  {head}  {n} step{'s' if n != 1 else ''} · {secs:.1f}s · "
+               f"{c(f'{in_tok:,} in / {out_tok:,} out', DIM)} · "
+               f"{c(f'~${cost:.3f}', DIM)}")
+    print(summary)
     if last and last.action.reason:
-        print(c(f"  → {last.action.reason}", DIM))
+        print(c(f"        → {_shorten(last.action.reason, 80)}", DIM))
+    if out_dir:
+        print(c(f"        ↳ {out_dir.name}", DIM))
 
 
 # ─── main loop ─────────────────────────────────────────────────────────────────

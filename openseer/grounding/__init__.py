@@ -7,12 +7,12 @@ back from one model to another when clicks misfire.
 """
 from .base import Grounder, GroundingResult
 from .gpt55 import GPT55Grounder
-from .haiku import HaikuGrounder
 
-# Registry for CLI / config-by-name selection.
+# Registry for CLI / config-by-name selection. More backends are planned:
+# Anthropic computer_20251124 (API key), OpenAI computer-use-preview
+# (Tier 3+), self-hosted UI-TARS.
 REGISTRY: dict[str, type[Grounder]] = {
-    "gpt55":  GPT55Grounder,
-    "haiku":  HaikuGrounder,
+    "gpt55": GPT55Grounder,
 }
 
 
@@ -22,5 +22,4 @@ def make(name: str) -> Grounder:
     return REGISTRY[name]()
 
 
-__all__ = ["Grounder", "GroundingResult", "GPT55Grounder", "HaikuGrounder",
-           "REGISTRY", "make"]
+__all__ = ["Grounder", "GroundingResult", "GPT55Grounder", "REGISTRY", "make"]

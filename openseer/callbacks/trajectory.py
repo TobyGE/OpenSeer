@@ -45,6 +45,9 @@ class TrajectoryCallback(Callback):
       out_dir/trace.md
     """
 
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+
     def on_run_start(self, ctx: dict[str, Any]) -> None:
         out_dir: Path = ctx["out_dir"]
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -130,6 +133,8 @@ class TrajectoryCallback(Callback):
         md.append(f"\n---\n**totals**: input={total_in}  output={total_out}\n")
         (out_dir / "trace.md").write_text("\n".join(md))
 
-        print(f"\n[agent] wrote {out_dir / 'transcript.json'}")
-        print(f"[agent] wrote {out_dir / 'trace.md'}")
-        print(f"[agent] tokens: input={total_in}  output={total_out}")
+        ctx["_totals"] = {"input_tokens": total_in, "output_tokens": total_out}
+        if self.verbose:
+            print(f"\n[agent] wrote {out_dir / 'transcript.json'}")
+            print(f"[agent] wrote {out_dir / 'trace.md'}")
+            print(f"[agent] tokens: input={total_in}  output={total_out}")

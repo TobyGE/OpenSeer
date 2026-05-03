@@ -17,23 +17,24 @@ import sys
 from . import auth as auth_mod
 from .agent import run
 from .repl import repl as run_repl
+from .setup_wizard import run_setup
 
 
 # ────────────────────────────  task subcommand  ──────────────────────────────
 
 def _add_task_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("task", help="Natural-language task description")
-    ap.add_argument("--max-steps", type=int, default=10)
+    ap.add_argument("--max-steps", type=int, default=20)
     ap.add_argument("--execute", action="store_true",
                     help="Actually execute pyautogui actions (default: dry-run)")
     ap.add_argument("--confirm-each", action="store_true",
                     help="Prompt y/s/q before each action")
     ap.add_argument("--sleep", type=float, default=0.0,
                     help="Seconds between turns (lets UI settle)")
-    ap.add_argument("--grounder", default="gpt55", choices=["gpt55", "haiku"],
+    ap.add_argument("--grounder", default="gpt55", choices=["gpt55"],
                     help="Default backend that resolves target descriptions to (x,y)")
     ap.add_argument("--external-grounder", default=None,
-                    choices=["gpt55", "haiku"],
+                    choices=["gpt55"],
                     help="Specialist grounder for reground[external:true]")
 
 
@@ -81,15 +82,22 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return run_repl()
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    return run_setup()
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="openseer",
         description="OpenSeer — chat-first, memory-aware macOS computer-use agent",
     )
-    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,auth}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,auth,setup}")
 
     p_chat = sub.add_parser("chat", help="Interactive REPL (default if no args)")
     p_chat.set_defaults(func=cmd_chat)
+
+    p_setup = sub.add_parser("setup", help="Guided one-time onboarding")
+    p_setup.set_defaults(func=cmd_setup)
 
     p_task = sub.add_parser("task", help="Run the agent on a one-off task")
     _add_task_args(p_task)
@@ -105,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "auth", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "auth", "setup", "-h", "--help"}
 
 
 def main() -> None:

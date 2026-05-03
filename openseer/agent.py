@@ -410,14 +410,15 @@ def _confirm(action: Action) -> str:
     return ans[:1] if ans else "q"
 
 
-def _default_callbacks() -> list[Callback]:
+def _default_callbacks(quiet: bool = False) -> list[Callback]:
     """Default callback stack: image retention (keep 4 most recent images,
     drop the rest with summary text) + per-step trajectory persistence +
-    a generous token budget."""
+    a generous token budget. `quiet` silences any print() from these."""
     return [
         ImageRetentionCallback(n=4, mode="summary"),
-        TrajectoryCallback(),
-        BudgetCallback(max_input_tokens=300_000, max_output_tokens=30_000),
+        TrajectoryCallback(verbose=not quiet),
+        BudgetCallback(max_input_tokens=300_000, max_output_tokens=30_000,
+                       verbose=not quiet),
     ]
 
 
@@ -465,19 +466,20 @@ def _handle_reground(action: Action, frame: Frame,
     )
 
 
-def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
+def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         confirm_each: bool = False,
         out_dir: Path | None = None, sleep_between: float = 0.0,
         callbacks: list[Callback] | None = None,
         grounder: Grounder | str = "gpt55",
-        external_grounder: Grounder | str | None = None) -> list[Step]:
+        external_grounder: Grounder | str | None = None,
+        quiet: bool = False) -> list[Step]:
     """Run the agent loop. Returns the list of steps."""
     if out_dir is None:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = Path.home() / "Desktop" / "openseer" / f"run-{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cbs = callbacks if callbacks is not None else _default_callbacks()
+    cbs = callbacks if callbacks is not None else _default_callbacks(quiet=quiet)
     if isinstance(grounder, str):
         grounder = make_grounder(grounder)
     # Default external grounder = same as default. User overrides this on the
@@ -487,10 +489,14 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
     elif isinstance(external_grounder, str):
         external_grounder = make_grounder(external_grounder)
 
-    print(f"[agent] task: {task}")
-    print(f"[agent] dry_run={dry_run}  max_steps={max_steps}  out_dir={out_dir}")
-    print(f"[agent] callbacks: {[c.label for c in cbs]}")
-    print(f"[agent] grounder:  default={grounder.name}  external={external_grounder.name}")
+    def say(*args, **kwargs):
+        if not quiet:
+            print(*args, **kwargs)
+
+    say(f"[agent] task: {task}")
+    say(f"[agent] dry_run={dry_run}  max_steps={max_steps}  out_dir={out_dir}")
+    say(f"[agent] callbacks: {[c.label for c in cbs]}")
+    say(f"[agent] grounder:  default={grounder.name}  external={external_grounder.name}")
 
     history: list[Step] = []
     ctx: dict = {
@@ -507,10 +513,10 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
 
         # budget / circuit-breakers can stop us before the next API call
         if not all(cb.on_should_continue(ctx) for cb in cbs):
-            print(f"\n[agent] stopped by callback before step {sn}")
+            say(f"\n[agent] stopped by callback before step {sn}")
             break
 
-        print(f"\n────── step {sn}/{max_steps} ──────")
+        say(f"\n────── step {sn}/{max_steps} ──────")
         frame = capture()
         frame_hash = _hash_frame(frame.image)
         raw_path = out_dir / f"step{sn:02d}-raw.png"
@@ -528,7 +534,7 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
         try:
             raw, events, usage = _ask_model(instructions, input_items)
         except Exception as e:
-            print(f"  model error: {repr(e)[:200]}")
+            say(f"  model error: {repr(e)[:200]}")
             (out_dir / f"step{sn:02d}-error.txt").write_text(repr(e))
             break
         elapsed_ms = int((time.time() - t0) * 1000)
@@ -537,11 +543,11 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
         try:
             actions = _parse_actions(raw)
         except Exception as e:
-            print(f"  parse error: {e}\n  raw: {raw[:300]!r}")
+            say(f"  parse error: {e}\n  raw: {raw[:300]!r}")
             break
 
         if len(actions) > 1:
-            print(f"  CHAIN of {len(actions)} actions")
+            say(f"  CHAIN of {len(actions)} actions")
 
         # Run each action in the chain. They share the same input frame /
         # raw screenshot, but each gets its own Step record and its own
@@ -561,8 +567,8 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
             # with the same line repeated.
             if chain_pos == 0:
                 tag = "chain-thought" if len(actions) > 1 else "thought"
-                print(f"  [{label}] {tag}: {action.thought}")
-            print(f"  [{label}] action:  {action.name}"
+                say(f"  [{label}] {tag}: {action.thought}")
+            say(f"  [{label}] action:  {action.name}"
                   + (f" target={action.target!r}" if action.target else "")
                   + (f" ({action.x},{action.y})" if action.x is not None else "")
                   + (f" text={action.text!r}" if action.text else "")
@@ -584,7 +590,7 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
                                   f"{label}: reground"))
                 ann_path = out_dir / f"{label.replace('.', '_')}-action.png"
                 (annotate(frame.image, marks) if marks else frame.image).save(ann_path)
-                print(f"  [{label}] result:  {result}")
+                say(f"  [{label}] result:  {result}")
                 step = Step(idx=sn_action, action=action, result=result,
                             raw_response=raw, usage=usage if chain_pos == 0 else None,
                             elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
@@ -606,7 +612,7 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
             if confirm_each and not dry_run and action.name not in ("done", "fail"):
                 ans = _confirm(action)
                 if ans == "q":
-                    print("  [aborted by user]")
+                    say("  [aborted by user]")
                     step = Step(idx=sn_action, action=action,
                                 result="aborted by user before execution",
                                 raw_response=raw, usage=usage if chain_pos == 0 else None,
@@ -633,7 +639,7 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
             if action.name == "done":
                 err = _validate_done(action, history)
                 if err:
-                    print(f"  [{label}] ⚠ done REJECTED: {err}")
+                    say(f"  [{label}] ⚠ done REJECTED: {err}")
                     rejected = Action(name="verify_failed",
                                       reason=err, thought=action.thought)
                     step = Step(idx=sn_action, action=rejected,
@@ -648,7 +654,7 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
                     continue
 
             result = execute(action, dry_run=dry_run)
-            print(f"  [{label}] result:  {result}{'  [DRY-RUN]' if dry_run else ''}")
+            say(f"  [{label}] result:  {result}{'  [DRY-RUN]' if dry_run else ''}")
 
             step = Step(idx=sn_action, action=action, result=result,
                         raw_response=raw,
@@ -660,7 +666,7 @@ def run(task: str, *, max_steps: int = 10, dry_run: bool = True,
             for cb in cbs: cb.on_step_recorded(ctx, step)
 
             if action.name in ("done", "fail"):
-                print(f"\n[agent] terminated: {action.name} — {action.reason}")
+                say(f"\n[agent] terminated: {action.name} — {action.reason}")
                 terminate = True
                 break
 

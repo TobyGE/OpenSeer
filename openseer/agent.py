@@ -125,6 +125,16 @@ Tool taxonomy (high level):
   - "what's on the clipboard" → `bash pbpaste`, not click+paste.
   - "save this to a file" → `bash echo … > file`, not opening TextEdit.
 
+**Ending the task — `terminate` example (memorise this exact shape):**
+```
+{{"action":"terminate", "status":"done",
+  "reason":"<one-line summary of result>",
+  "verified_by_steps":[<int list of producing steps>]}}
+```
+The `"action":"terminate"` field is REQUIRED — emitting just `"status"`
+without `"action"` will be rejected. `status:"fail"` is allowed and
+does not need verified_by_steps.
+
 Grounding contract:
   - For click/double_click/type/scroll, you give `(x, y)` DIRECTLY.
     Your own coordinate output is what gets clicked.
@@ -196,8 +206,14 @@ class Step:
 
 
 def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
+    # Tolerance: models sometimes emit `{"status":"done"/"fail",...}` without
+    # an explicit `action` field, treating `status` as the discriminator.
+    # Infer `terminate` in that case so the user-visible flow doesn't break.
+    name = obj.get("action") or ""
+    if not name and obj.get("status") in ("done", "fail"):
+        name = "terminate"
     return Action(
-        name=obj.get("action", ""),
+        name=name,
         x=obj.get("x"),
         y=obj.get("y"),
         text=obj.get("text"),

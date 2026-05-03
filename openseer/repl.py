@@ -66,23 +66,30 @@ class _PrettyConsole(Callback):
             act = f"scroll ({a.x},{a.y}) amt={a.amount}"
         elif a.name == "wait":
             act = f"wait {a.amount}s"
+        elif a.name == "bash":
+            cmd = _shorten(a.cmd, 60)
+            act = f"bash {cmd!r}"
         elif a.name == "reground":
             tag = "ext" if a.external else "default"
             act = f"reground[{tag}] {_shorten(a.target, 30)!r}"
-        elif a.name == "done":
+        elif a.name == "terminate":
+            st = (a.status or "done").lower()
+            color = GRN if st == "done" else YEL
+            act = c(f"terminate ({st})", color, BOLD) + " " + _shorten(a.reason, 60)
+        elif a.name == "done":         # legacy
             act = c("done", GRN, BOLD) + " " + _shorten(a.reason, 60)
-        elif a.name == "fail":
+        elif a.name == "fail":         # legacy
             act = c("fail", RED, BOLD) + " " + _shorten(a.reason, 60)
         elif a.name == "verify_failed":
             act = c("done rejected", YEL) + " — " + _shorten(a.reason, 60)
         else:
-            act = a.name
+            act = a.name or "<empty>"
 
         # status indicator
         result = (step.result or "").lower()
-        if "fail" in result or "error" in result:
+        if "fail" in result or "error" in result or "reject" in result or "block" in result:
             mark = c("✗", RED)
-        elif a.name in ("done", "fail", "verify_failed"):
+        elif a.name in ("done", "fail", "verify_failed", "terminate"):
             mark = ""
         else:
             mark = c("✓", GRN, DIM)
@@ -242,10 +249,13 @@ def _run_task(task: str, opts: dict) -> None:
     cost = in_tok / 1e6 * 0.50 + out_tok / 1e6 * 4.00
 
     print()
-    if status == "done":
+    # `terminate` is the new shape; `done`/`fail` are legacy aliases.
+    term_status = (last.action.status or "done").lower() if last and last.action.name == "terminate" else None
+    if status == "done" or (status == "terminate" and term_status == "done"):
         head = c("✓ done", GRN, BOLD)
-    elif status in ("fail", "verify_failed"):
-        head = c("⚠ " + status, YEL, BOLD)
+    elif status in ("fail", "verify_failed") or (status == "terminate" and term_status == "fail"):
+        lbl = term_status if status == "terminate" else status
+        head = c("⚠ " + lbl, YEL, BOLD)
     else:
         head = c("• cap", DIM, BOLD)
     summary = (f"  {head}  {n} step{'s' if n != 1 else ''} · {secs:.1f}s · "

@@ -120,6 +120,27 @@ class TelegramBot:
             params["parse_mode"] = parse_mode
         return self._call("sendMessage", params, timeout=15.0)
 
+    def edit(self, chat_id: int, message_id: int, text: str, *,
+             parse_mode: str | None = None) -> dict | None:
+        """Edit a previously-sent message in place. Returns None if
+        Telegram rejects the edit (commonly: identical content; the API
+        raises 'message is not modified' which we silently ignore so
+        the caller doesn't have to think about throttling)."""
+        params = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text[:4090],
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        try:
+            return self._call("editMessageText", params, timeout=15.0)
+        except TelegramError as e:
+            es = str(e)
+            if "not modified" in es or "message is not modified" in es:
+                return None
+            raise
+
     # ───── polling ──────────────────────────────────────────────────────
     def stop(self) -> None:
         self._stop.set()

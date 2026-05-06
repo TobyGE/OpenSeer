@@ -326,7 +326,10 @@ def run_daemon() -> int:
     if bot.allowed_chat_ids:
         print(f"        allowed chat_ids: {sorted(bot.allowed_chat_ids)}")
     else:
-        print(f"        ⚠ no allowed_chat_ids — anyone who finds the bot can issue tasks")
+        print(f"        ⚠ no allowed_chat_ids configured — daemon will REFUSE every "
+              f"message and log the chat_id, so you can copy it into config. "
+              f"Send a message from your phone, watch the log, then set "
+              f"`telegram.allowed_chat_ids: [<id>]` in ~/.openseer/config.json.")
     if bot.trigger_prefix:
         print(f"        trigger prefix: {bot.trigger_prefix!r}")
     print(f"        sessions persisted to ~/.openseer/inbox/sessions.json")

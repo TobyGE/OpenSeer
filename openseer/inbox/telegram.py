@@ -129,15 +129,33 @@ class TelegramBot:
 
     def __init__(self, token: str, *, allowed_chat_ids: list[int] | None = None,
                  trigger_prefix: str | None = None,
-                 poll_timeout: int = 30) -> None:
+                 poll_timeout: int = 30,
+                 offset_state_path: "Path | None" = None) -> None:
         self.token = token.strip()
         if not self.token:
             raise ValueError("telegram token is empty")
         self.allowed_chat_ids = set(allowed_chat_ids or [])
         self.trigger_prefix = (trigger_prefix or "").strip()
         self.poll_timeout = poll_timeout
-        self._offset = 0
         self._stop = threading.Event()
+        # Persist the update offset so a daemon restart doesn't re-deliver
+        # already-handled commands. Telegram retains undelivered updates
+        # for 24h; without persistence, a crash mid-task can cause the
+        # SAME Mac command to execute twice on the next start.
+        # Key the file by bot id (integer prefix before `:`) so swapping
+        # tokens doesn't shadow a fresh bot's updates with the old bot's
+        # offset.
+        from pathlib import Path
+        bot_id = self.token.split(":", 1)[0] or "unknown"
+        # `bot_id` is digits only by Telegram's spec, so it's safe in a
+        # filename; we still strip path separators defensively.
+        bot_id = "".join(c for c in bot_id if c.isalnum()) or "unknown"
+        self._offset_state_path = (
+            offset_state_path
+            or (Path.home() / ".openseer" / "inbox"
+                / f"telegram_offset_{bot_id}.json")
+        )
+        self._offset = self._load_offset()
 
     # ───── HTTP wrappers ────────────────────────────────────────────────
     def _call(self, method: str, params: dict, *, timeout: float | None = None) -> dict:
@@ -267,6 +285,22 @@ class TelegramBot:
                 return None
             raise
 
+    # ───── offset persistence ────────────────────────────────────────────
+    def _load_offset(self) -> int:
+        try:
+            return int(json.loads(self._offset_state_path.read_text())["offset"])
+        except Exception:
+            return 0
+
+    def _save_offset(self, offset: int) -> None:
+        try:
+            self._offset_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._offset_state_path.write_text(
+                json.dumps({"offset": int(offset)}), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"  [telegram] couldn't persist offset: {e}")
+
     # ───── polling ──────────────────────────────────────────────────────
     def stop(self) -> None:
         self._stop.set()
@@ -296,7 +330,14 @@ class TelegramBot:
                 continue
 
             for upd in updates:
-                self._offset = max(self._offset, int(upd["update_id"]) + 1)
+                # Persist the offset BEFORE dispatch so a crash during
+                # task execution can't replay the command on restart.
+                # Telegram considers an update acknowledged once we ask
+                # for an offset > update_id.
+                new_offset = int(upd["update_id"]) + 1
+                if new_offset > self._offset:
+                    self._offset = new_offset
+                    self._save_offset(self._offset)
                 msg_obj = upd.get("message")
                 if not msg_obj:
                     continue
@@ -307,7 +348,19 @@ class TelegramBot:
                 chat = msg_obj.get("chat") or {}
                 sender = msg_obj.get("from") or {}
                 chat_id = int(chat.get("id", 0))
-                if self.allowed_chat_ids and chat_id not in self.allowed_chat_ids:
+                # Fail CLOSED on missing allowlist: an empty set must NOT
+                # mean "allow everyone". The daemon executes real Mac
+                # actions (dry_run=False), so any chat that can find the
+                # bot would be able to drive the user's computer. We log
+                # the chat_id so the user can copy it into config, but
+                # do not dispatch the message as a task.
+                if not self.allowed_chat_ids:
+                    print(f"  [telegram] no allowed_chat_ids configured — "
+                          f"dropped message from chat_id={chat_id} "
+                          f"({sender.get('first_name', '?')}). "
+                          f"Add this id to config to enable.")
+                    continue
+                if chat_id not in self.allowed_chat_ids:
                     print(f"  [telegram] dropped msg from non-allowed "
                           f"chat_id={chat_id} ({sender.get('first_name', '?')})")
                     continue

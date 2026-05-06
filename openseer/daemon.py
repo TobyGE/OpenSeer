@@ -56,15 +56,21 @@ def _load_config() -> dict:
 
 _REMOTE_NOTICE = (
     "[OpenSeer is running in DAEMON mode, triggered remotely via Telegram chat. "
-    "The user is NOT looking at this Mac right now — they only see your final "
-    "terminate.reason text. So:\n"
-    "  - DON'T claim 'user can see X' / 'screenshot is attached'. The text channel "
-    "    can't transmit images yet; describe what's on screen IN your terminate.reason.\n"
-    "  - VERIFY the actual end state before terminate(done) — there is no human at the "
-    "    keyboard to catch a wrong claim.\n"
-    "  - Be aware your own Mac may have the user's other windows on top. Use "
-    "    open_app / get_app_state(app=...) to bring the target app forward; do not "
-    "    assume a window is frontmost just because you opened a URL.]"
+    "The user is NOT looking at this Mac right now — they only see what you send "
+    "back through the channel. So:\n"
+    "  - DON'T assume 'user can see X' just because something is on this Mac's "
+    "    screen. The user is on their phone.\n"
+    "  - DESCRIBE what's on screen in your terminate.reason — not 'see attached' "
+    "    unless you actually attach (see next bullet).\n"
+    "  - To send images back: take a screenshot to a file (e.g. "
+    "    `bash screencapture -x ~/Desktop/proof.png`), then on terminate include "
+    "    `\"attachments\":[\"/Users/.../proof.png\"]` — the daemon will sendPhoto "
+    "    each path to the user's chat. PNG/JPG/GIF, ≤10 MB each.\n"
+    "  - VERIFY the actual end state before terminate(done) — there is no human "
+    "    at the keyboard to catch a wrong claim.\n"
+    "  - The user's own windows may be on top of your target app. Use open_app / "
+    "    get_app_state(app=...) to force focus; do not assume a window is "
+    "    frontmost just because you opened a URL.]"
 )
 
 
@@ -245,6 +251,25 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                 bot.send_long(msg.chat_id, result, reply_to=msg.message_id)
         except Exception as e:
             print(f"  [telegram] reply send failed: {e}")
+
+        # If the terminate action declared attachments, ship them too.
+        # Lets the model send a screenshot back to the user's phone via
+        # `{"action":"terminate","status":"done","reason":"...",
+        #   "attachments":["/Users/.../proof.png"]}`. PNG/JPG/GIF only;
+        # missing or oversized files just log a warning.
+        last = history[-1] if history else None
+        attaches: list[str] = []
+        if last and last.action.name == "terminate":
+            attaches = list(last.action.attachments or [])
+        for path in attaches:
+            try:
+                if not Path(path).exists():
+                    print(f"  [telegram] attachment missing: {path}")
+                    continue
+                bot.send_photo(msg.chat_id, path,
+                               reply_to=ack_msg_id or msg.message_id)
+            except Exception as e:
+                print(f"  [telegram] sendPhoto failed for {path}: {e}")
 
         # Record into session memory for the next message in this chat
         status, result_text = _canonical_status(history)

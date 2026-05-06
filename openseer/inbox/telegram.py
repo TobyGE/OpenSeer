@@ -186,6 +186,66 @@ class TelegramBot:
                 pass
         return out
 
+    def send_photo(self, chat_id: int, image_path: str, *,
+                   caption: str | None = None,
+                   reply_to: int | None = None) -> dict:
+        """Upload an image file via multipart/form-data sendPhoto.
+        Telegram caps photo files at 10 MB; we don't auto-resize, just
+        let the API reject oversized."""
+        import os
+        url = f"{_API}/bot{self.token}/sendPhoto"
+        boundary = "----openseer-" + os.urandom(8).hex()
+        ct = "image/png"
+        if image_path.lower().endswith((".jpg", ".jpeg")):
+            ct = "image/jpeg"
+        elif image_path.lower().endswith(".gif"):
+            ct = "image/gif"
+        with open(image_path, "rb") as f:
+            file_bytes = f.read()
+        body = bytearray()
+
+        def _field(name: str, value: str) -> None:
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                        .encode())
+            body.extend(value.encode("utf-8"))
+            body.extend(b"\r\n")
+
+        _field("chat_id", str(chat_id))
+        if caption:
+            _field("caption", caption[:1024])      # Telegram caption limit
+        if reply_to is not None:
+            _field("reply_to_message_id", str(reply_to))
+        # photo file
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(
+            f'Content-Disposition: form-data; name="photo"; '
+            f'filename="{os.path.basename(image_path)}"\r\n'.encode()
+        )
+        body.extend(f"Content-Type: {ct}\r\n\r\n".encode())
+        body.extend(file_bytes)
+        body.extend(f"\r\n--{boundary}--\r\n".encode())
+
+        req = urllib.request.Request(
+            url, data=bytes(body), method="POST",
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body_text = ""
+            try:
+                body_text = e.read().decode("utf-8")
+            except Exception:
+                pass
+            raise TelegramError(f"sendPhoto HTTP {e.code}: {body_text[:300]}") from e
+        if not data.get("ok"):
+            raise TelegramError(f"sendPhoto: {data}")
+        return data["result"]
+
     def edit(self, chat_id: int, message_id: int, text: str, *,
              parse_mode: str | None = None) -> dict | None:
         """Edit a previously-sent message in place. Returns None if

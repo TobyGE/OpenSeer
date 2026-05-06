@@ -38,6 +38,7 @@ class Action:
     skill_name: str | None = None  # for read_skill / write_skill: skill identifier
     skill_body: str | None = None  # for write_skill: full SKILL.md contents
     index: int | None = None       # for click: AX element index (preferred over x/y)
+    attachments: list[str] | None = None  # for terminate: file paths to send back to user
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default

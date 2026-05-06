@@ -260,6 +260,7 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         thought=(obj.get("thought") or obj.get("thinking")
                  or fallback_thought),
         verified_by_steps=obj.get("verified_by_steps"),
+        attachments=obj.get("attachments"),
     )
 
 
@@ -342,25 +343,47 @@ def _validate_done(action: Action, history: list["Step"]) -> str | None:
     )
     if not is_done:
         return None
+    # Compute the producing-step suggestion ONCE so every error path
+    # can include it. This is the key actionable info the model was
+    # missing — it kept retrying done with the same omission because
+    # the rejection didn't tell it WHICH steps to cite.
+    producing_in_history = [
+        f"{s.idx}({s.action.name})"
+        for s in history
+        if s.action.name in _PRODUCING_ACTIONS
+    ]
+    suggestion = ""
+    if producing_in_history:
+        # Just the indices, ready to drop into verified_by_steps.
+        idxs = [int(p.split("(")[0]) for p in producing_in_history]
+        suggestion = (
+            f" SUGGESTION: re-emit your terminate with "
+            f'`"verified_by_steps": {idxs}` — those are the producing '
+            f"steps in this run ({', '.join(producing_in_history)})."
+        )
+    else:
+        suggestion = (
+            " There are no producing steps in this run yet — you cannot "
+            "claim done. Continue with click/type/key/bash/web_search/etc. "
+            "to actually drive the result, then terminate citing those steps."
+        )
+
     cited = action.verified_by_steps or []
     if not cited:
         return ("`done` requires `verified_by_steps` listing prior step indices "
-                "where you actively produced this result. You provided none. "
-                "Either continue the task and produce the result yourself, "
-                "or list the actual steps that produced it.")
+                "where you actively produced this result. You provided none."
+                + suggestion)
     by_idx = {s.idx: s for s in history}
     invalid = [i for i in cited if i not in by_idx]
     if invalid:
-        return f"verified_by_steps contains steps that don't exist: {invalid}"
+        return (f"verified_by_steps contains steps that don't exist: {invalid}."
+                + suggestion)
     producing = [i for i in cited
                  if by_idx[i].action.name in _PRODUCING_ACTIONS]
     if not producing:
         cited_kinds = [(i, by_idx[i].action.name) for i in cited]
         return (f"None of the cited verification steps are producing actions. "
-                f"Got: {cited_kinds}. You need at least one click/type/key/"
-                f"scroll step that actually drove the result. If the answer "
-                f"appeared without you doing the work, treat it as stale and "
-                f"re-do the computation yourself.")
+                f"Got: {cited_kinds}." + suggestion)
     return None
 
 

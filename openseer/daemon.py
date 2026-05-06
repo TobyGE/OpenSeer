@@ -230,18 +230,19 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
 
         dur = time.time() - t0
         result = _format_result(history, dur)
-        # Edit ack with summary; if reason is long, also send a follow-up.
+        # Edit ack with summary; if reason is long, send the rest as
+        # one or more chunked follow-up messages (Telegram caps at 4096
+        # chars per message — long terminate.reason values would be
+        # silently truncated otherwise).
         try:
             if ack_msg_id:
-                # Show short version in the edited ack (keeps the chat tidy)
                 short = result.split("\n\n", 1)[0]
                 bot.edit(msg.chat_id, ack_msg_id, short)
-                # Long reason → separate follow-up so it's not truncated
                 rest = result[len(short):].strip()
                 if rest:
-                    bot.send(msg.chat_id, rest, reply_to=ack_msg_id)
+                    bot.send_long(msg.chat_id, rest, reply_to=ack_msg_id)
             else:
-                bot.send(msg.chat_id, result, reply_to=msg.message_id)
+                bot.send_long(msg.chat_id, result, reply_to=msg.message_id)
         except Exception as e:
             print(f"  [telegram] reply send failed: {e}")
 

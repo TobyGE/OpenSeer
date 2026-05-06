@@ -40,6 +40,45 @@ from typing import Callable
 _API = "https://api.telegram.org"
 
 
+def _chunk_text(text: str, chunk_size: int) -> list[str]:
+    """Split `text` into ≤chunk_size pieces, preferring paragraph then
+    word boundaries. Preserves ALL whitespace — code blocks, indented
+    text, and trailing newlines around chunk boundaries are kept
+    intact. The only addition is the chunk-counter header that callers
+    prepend later (which is structural)."""
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while n - pos > chunk_size:
+        # Pick the latest boundary inside [pos, pos+chunk_size). Cut AFTER
+        # the boundary character so newlines / spaces stay with the
+        # previous chunk (they're whitespace the user wrote, not noise).
+        window_end = pos + chunk_size
+        # paragraph boundary: keep the second \n at end of prev chunk
+        cut = text.rfind("\n\n", pos, window_end)
+        if cut >= pos + chunk_size // 2:
+            cut += 2                      # split AFTER the \n\n
+        else:
+            cut = text.rfind("\n", pos, window_end)
+            if cut >= pos + chunk_size // 2:
+                cut += 1                  # AFTER the \n
+            else:
+                cut = text.rfind(" ", pos, window_end)
+                if cut >= pos + chunk_size // 2:
+                    cut += 1              # AFTER the space
+                else:
+                    cut = window_end      # hard cut, no good boundary
+        out.append(text[pos:cut])
+        pos = cut
+    if pos < n:
+        out.append(text[pos:])
+    return out
+
+
 @dataclass
 class TelegramMessage:
     """A subset of a Telegram Update→Message we actually care about."""
@@ -113,12 +152,39 @@ class TelegramBot:
     def send(self, chat_id: int, text: str, *,
              reply_to: int | None = None,
              parse_mode: str | None = None) -> dict:
+        """Single message (caller is responsible for length). Truncates
+        to 4090 if over. Use ``send_long`` for multi-chunk delivery."""
         params = {"chat_id": chat_id, "text": text[:4090]}
         if reply_to is not None:
             params["reply_to_message_id"] = reply_to
         if parse_mode:
             params["parse_mode"] = parse_mode
         return self._call("sendMessage", params, timeout=15.0)
+
+    def send_long(self, chat_id: int, text: str, *,
+                  reply_to: int | None = None,
+                  parse_mode: str | None = None,
+                  chunk_size: int = 3800) -> list[dict]:
+        """Send `text` across one or more messages, chunking on
+        paragraph then word boundaries so the user's content isn't
+        silently sliced. Each chunk replies to the previous one (so
+        Telegram threads them visually). Returns the list of API
+        responses, one per chunk."""
+        if not text:
+            return []
+        chunks = _chunk_text(text, chunk_size)
+        out: list[dict] = []
+        prev_reply = reply_to
+        for i, chunk in enumerate(chunks):
+            header = f"({i + 1}/{len(chunks)})\n" if len(chunks) > 1 else ""
+            r = self.send(chat_id, header + chunk,
+                          reply_to=prev_reply, parse_mode=parse_mode)
+            out.append(r)
+            try:
+                prev_reply = int(r.get("message_id", 0)) or prev_reply
+            except Exception:
+                pass
+        return out
 
     def edit(self, chat_id: int, message_id: int, text: str, *,
              parse_mode: str | None = None) -> dict | None:

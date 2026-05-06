@@ -364,10 +364,94 @@ def smoke_test(provider: str) -> bool:
 
 # ─── main ──────────────────────────────────────────────────────────────────────
 
+def configure_telegram() -> bool:
+    """Optional: configure Telegram inbound channel so the user can
+    drive OpenSeer from their phone. Skipped if user declines."""
+    cfg = _load_config()
+    existing = cfg.get("telegram") or {}
+    has_token = bool((existing.get("token") or "").strip())
+
+    if has_token and not _ask("Telegram already configured. Re-configure? [y/N]"):
+        _ok("Keeping existing Telegram config.")
+        return True
+
+    print("    OpenSeer can listen on a Telegram bot so you can issue tasks")
+    print("    from your phone. Setup takes ~2 minutes:")
+    print(f"      1. open Telegram, message {_c('@BotFather', CYN)}")
+    print(f"      2. send {_c('/newbot', CYN)}, follow prompts, copy the token it gives you")
+    print(f"      3. find your bot in Telegram, send it any message,")
+    print(f"         the daemon will print your chat_id on first message receive")
+    print()
+
+    if not _ask("Set up Telegram now? [y/N]"):
+        _warn("Skipped — re-run `openseer setup` later, or edit ~/.openseer/config.json directly.")
+        return True            # not a hard failure
+
+    try:
+        token = input(f"  {_c('?', MAG)} Bot token: ").strip()
+    except EOFError:
+        token = ""
+    if not token:
+        _fail("No token entered. Skipping.")
+        return True
+    if ":" not in token or len(token) < 30:
+        _warn(f"Token doesn't look right (expect 'NUMBER:LETTERS', got {token[:10]}…). "
+              "Saving anyway — daemon will validate on start.")
+
+    # Validate token live so the user gets immediate feedback.
+    print("    verifying token …")
+    try:
+        from .inbox.telegram import TelegramBot, TelegramError
+        probe = TelegramBot(token)
+        me = probe.get_me()
+        _ok(f"bot @{me.get('username')} ({me.get('first_name')}) reachable")
+    except TelegramError as e:
+        _fail(f"token rejected: {e}")
+        return False
+    except Exception as e:
+        _fail(f"could not reach Telegram API: {e}")
+        return False
+
+    # Optional allowed_chat_ids
+    print(f"  {_c('?', MAG)} Allowed chat_ids (comma-separated; leave blank to fill in later):")
+    try:
+        raw_ids = input("    > ").strip()
+    except EOFError:
+        raw_ids = ""
+    allowed: list[int] = []
+    if raw_ids:
+        for tok in raw_ids.replace(",", " ").split():
+            try:
+                allowed.append(int(tok))
+            except ValueError:
+                _warn(f"ignoring non-numeric chat_id: {tok!r}")
+    if not allowed:
+        _warn("No allowed_chat_ids set — daemon will print incoming chat_ids "
+              "to the console on first run; copy yours into config.json afterward.")
+
+    try:
+        prefix = input(f"  {_c('?', MAG)} Trigger prefix (blank = treat all messages as tasks): ").strip()
+    except EOFError:
+        prefix = ""
+
+    cfg["telegram"] = {
+        "enabled": True,
+        "token": token,
+        "allowed_chat_ids": allowed,
+        "trigger_prefix": prefix,
+        "max_steps": int(existing.get("max_steps") or 25),
+        "confirm_each": bool(existing.get("confirm_each", False)),
+    }
+    _save_config(cfg)
+    _ok(f"Telegram saved to {_CONFIG_PATH}")
+    print(f"    Start the daemon with: {_c('openseer daemon', CYN)}")
+    return True
+
+
 def run_setup() -> int:
     print(_c("\nOpenSeer setup", BOLD) + " " + _c("— let's get you running", DIM))
 
-    _step(1, 4, "Choose model provider")
+    _step(1, 5, "Choose model provider")
     provider = choose_provider()
     if provider is None:
         print(_c("\nSetup paused — no usable provider. Install Codex CLI "
@@ -377,23 +461,28 @@ def run_setup() -> int:
         print(f"    Claude: open Claude.app or run `claude` CLI to sign in")
         return 1
 
-    _step(2, 4, "macOS Accessibility permission")
+    _step(2, 5, "macOS Accessibility permission")
     if not check_accessibility():
         print(_c("\nSetup paused — fix Accessibility and re-run.", YEL))
         return 2
 
-    _step(3, 4, "macOS Screen Recording permission")
+    _step(3, 5, "macOS Screen Recording permission")
     if not check_screen_recording():
         print(_c("\nSetup paused — fix Screen Recording and re-run.", YEL))
         return 3
 
-    _step(4, 4, f"Smoke test ({provider} model ping)")
+    _step(4, 5, f"Smoke test ({provider} model ping)")
     if not smoke_test(provider):
         print(_c("\nSetup paused — model call failed; check network or token.",
                  YEL))
         return 4
 
+    _step(5, 5, "Telegram inbound (optional — phone → Mac control)")
+    configure_telegram()      # never blocks; returns even on skip
+
     print(_c("\nAll set.", GRN, BOLD) + " " + _c("Run", DIM) + " "
           + _c("openseer", CYN, BOLD) + " "
-          + _c(f"to enter the chat shell. Provider: {provider}\n", DIM))
+          + _c(f"to enter the chat shell. Provider: {provider}", DIM))
+    print(_c("Run", DIM) + " " + _c("openseer daemon", CYN, BOLD) + " "
+          + _c("to listen on Telegram (if configured).\n", DIM))
     return 0

@@ -86,12 +86,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return run_setup()
 
 
+def cmd_daemon(args: argparse.Namespace) -> int:
+    from .daemon import run_daemon
+    return run_daemon()
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="openseer",
         description="OpenSeer — chat-first, memory-aware macOS computer-use agent",
     )
-    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,auth,setup}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,daemon,auth,setup}")
 
     p_chat = sub.add_parser("chat", help="Interactive REPL (default if no args)")
     p_chat.set_defaults(func=cmd_chat)
@@ -103,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_task_args(p_task)
     p_task.set_defaults(func=cmd_task)
 
+    p_daemon = sub.add_parser(
+        "daemon",
+        help="Listen on inbound channels (Telegram) and run tasks remotely",
+    )
+    p_daemon.set_defaults(func=cmd_daemon)
+
     p_auth = sub.add_parser("auth", help="Manage ChatGPT OAuth login")
     sub_auth = p_auth.add_subparsers(dest="auth_cmd", metavar="{status,login,logout}")
     sub_auth.required = True
@@ -113,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "auth", "setup", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "auth", "setup", "-h", "--help"}
 
 
 def main() -> None:

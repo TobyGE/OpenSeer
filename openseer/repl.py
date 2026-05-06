@@ -13,7 +13,9 @@ from __future__ import annotations
 import os
 import readline
 import json
+import shlex
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,71 @@ def c(s: str, *codes: str) -> str:
 
 
 # ─── pretty per-step renderer (used as a Callback) ─────────────────────────────
+
+def _extract_thought_preview(stream_text: str) -> str:
+    """Walk a partially-streamed model response and return whatever we
+    have so far of the `thought` field's value — empty if we haven't
+    reached it yet. Tolerates prose / markdown-fence prefix, both
+    `thought` and `thinking` key names, and an unterminated string
+    (the JSON is mid-stream)."""
+    s = stream_text or ""
+    i = s.find('{')
+    if i < 0:
+        return ""
+    s = s[i:]
+    # Find the key (try both spellings)
+    ki = -1
+    for key in ('"thought"', '"thinking"'):
+        ki = s.find(key)
+        if ki >= 0:
+            s = s[ki + len(key):]
+            break
+    if ki < 0:
+        return ""
+    # Skip whitespace, expect `:`, skip whitespace, expect opening `"`
+    j = 0
+    while j < len(s) and s[j] in " \t\n\r":
+        j += 1
+    if j >= len(s) or s[j] != ":":
+        return ""
+    j += 1
+    while j < len(s) and s[j] in " \t\n\r":
+        j += 1
+    if j >= len(s) or s[j] != '"':
+        return ""
+    j += 1
+    # Read string body, handling JSON escapes
+    out: list[str] = []
+    while j < len(s):
+        c = s[j]
+        if c == "\\":
+            if j + 1 >= len(s):
+                break                # truncated mid-escape; show what we have
+            nxt = s[j + 1]
+            mapped = {'"': '"', "\\": "\\", "/": "/",
+                      "n": " ", "t": " ", "r": " ",
+                      "b": "", "f": ""}.get(nxt)
+            if mapped is not None:
+                out.append(mapped)
+                j += 2
+                continue
+            if nxt == "u" and j + 5 < len(s):
+                try:
+                    out.append(chr(int(s[j + 2:j + 6], 16)))
+                    j += 6
+                    continue
+                except ValueError:
+                    pass
+            # unknown escape — skip the backslash, keep next char
+            out.append(nxt)
+            j += 2
+            continue
+        if c == '"':
+            break                    # closing quote → field complete
+        out.append(c)
+        j += 1
+    return "".join(out)
+
 
 def _shorten(s: str | None, n: int) -> str:
     if not s:
@@ -58,9 +125,38 @@ class _PrettyConsole(Callback):
     def __init__(self) -> None:
         self._transient_active = False    # is a \r-style line currently on screen?
         self._model_t0: float | None = None
+        # Background ticker thread for the slow model-call window. Starts
+        # on MODEL_STARTED, stops on MODEL_FINISHED. Keeps the user from
+        # staring at a frozen "thinking …" with no elapsed time signal.
+        self._tick_stop: "threading.Event | None" = None
+        self._tick_thread: "threading.Thread | None" = None
+        self._last_ax: str = ""            # what we showed for ax phase
+        # Throttle for streaming-delta repaints — without this each
+        # delta (often 1-3 chars) triggers a redraw and the cumulative
+        # noise scrolls the user's terminal.
+        self._last_delta_repaint: float = 0.0
 
     # ─── transient status helpers ───────────────────────────────────────
     def _transient(self, text: str) -> None:
+        # Cap to terminal width so the line never wraps — wrapping breaks
+        # the \r overwrite trick and we'd accumulate stale visual lines.
+        try:
+            import shutil
+            cols = max(40, shutil.get_terminal_size((100, 24)).columns)
+        except Exception:
+            cols = 100
+        # Strip ANSI for length measurement so colored output isn't
+        # over-truncated. We only care about VISIBLE width.
+        import re as _re
+        visible = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+        budget = cols - 4                     # leave a small margin
+        if len(visible) > budget:
+            # Drop characters until visible length fits. Keep ANSI codes
+            # at the end intact by truncating the visible portion only.
+            # Simple approach: truncate visible, prefer head + ellipsis,
+            # then re-color-strip so we don't leave dangling escape codes.
+            trimmed = visible[: budget - 1] + "…"
+            text = trimmed
         sys.stdout.write("\r\033[2K  " + text)
         sys.stdout.flush()
         self._transient_active = True
@@ -72,16 +168,90 @@ class _PrettyConsole(Callback):
             sys.stdout.flush()
             self._transient_active = False
 
+    # ─── thinking-ticker (model-call countdown) ─────────────────────────
+    def _start_thinking_ticker(self) -> None:
+        """Spawn a daemon that updates 'thinking 3.2s …' once per second
+        while the LLM call is in flight. Idempotent: a previous ticker
+        is stopped before starting a new one."""
+        self._stop_thinking_ticker()
+        self._tick_stop = threading.Event()
+        stop = self._tick_stop
+        t0 = time.time()
+
+        def loop() -> None:
+            # Show first frame immediately so the user sees something
+            # in the < 1s window before the first wait expires.
+            self._transient(c("⏳ thinking 0.0s …", DIM))
+            while not stop.wait(0.5):
+                if stop.is_set():
+                    return
+                self._transient(
+                    c(f"⏳ thinking {time.time() - t0:.1f}s …", DIM))
+
+        self._tick_thread = threading.Thread(target=loop, daemon=True)
+        self._tick_thread.start()
+
+    def _stop_thinking_ticker(self) -> None:
+        if self._tick_stop is not None:
+            self._tick_stop.set()
+            self._tick_stop = None
+        # Don't join — daemon thread will exit on its own; joining here
+        # would race with the next event handler that wants to print.
+
     # ─── event router ───────────────────────────────────────────────────
     def on_event(self, ctx: dict, event) -> None:
         et = event.type
 
+        if et == EventType.PREP_PHASE:
+            phase = event.get("phase", "")
+            if phase == "capture":
+                self._transient(c("📷 reading screen …", DIM))
+            elif phase == "ax_tree":
+                self._transient(c("🌳 reading on-screen elements …", DIM))
+            elif phase == "ax_done":
+                n = event.get("n_elements", 0)
+                app = event.get("app") or ""
+                if n > 0:
+                    self._last_ax = f"🌳 {n} elements ({app})"
+                    self._transient(c(self._last_ax, DIM))
+                else:
+                    self._last_ax = (
+                        "🌳 0 ax elements "
+                        f"({'terminal' if not app else app + ' immersive'})"
+                    )
+                    self._transient(c(self._last_ax, DIM))
+            return
+
         if et == EventType.MODEL_STARTED:
             self._model_t0 = time.time()
-            self._transient(c("⏳ thinking …", DIM))
+            self._start_thinking_ticker()
+            return
+
+        if et == EventType.MODEL_DELTA:
+            # First text delta: kill the silent ticker, hand the
+            # transient line over to live model output. Throttle redraws
+            # to ~5/sec — without this, each tiny delta (1-3 chars)
+            # triggers a redraw and accumulates noise.
+            self._stop_thinking_ticker()
+            now = time.time()
+            if now - self._last_delta_repaint < 0.18:
+                return
+            self._last_delta_repaint = now
+            text = event.get("text") or ""
+            elapsed = (now - self._model_t0) if self._model_t0 else 0.0
+            preview = _extract_thought_preview(text)
+            if preview:
+                line = f"⏳ {elapsed:.1f}s  💭 {preview}"
+            else:
+                # Pre-thought streaming (model still emitting `{`,
+                # `"thought":` etc.) — fall back to a generic spinner
+                # rather than dump JSON syntax noise to the user.
+                line = f"⏳ thinking {elapsed:.1f}s …"
+            self._transient(c(line, DIM))
             return
 
         if et == EventType.MODEL_FINISHED:
+            self._stop_thinking_ticker()
             self._model_t0 = None
             usage = event.get("usage") or {}
             in_t = usage.get("input_tokens", 0)
@@ -155,8 +325,20 @@ class _PrettyConsole(Callback):
         else:
             act = a.name or "<empty>"
 
-        result = (s.result or "").lower()
-        if any(k in result for k in ("fail", "error", "reject", "block")):
+        # Only mark ✗ when the EXECUTOR/HANDLER reports failure — i.e.
+        # result starts with ERROR/FAIL/aborted/safety, or bash returned a
+        # non-zero exit. Don't substring-match "fail/error/block" globally:
+        # skill bodies, web_fetch'd docs, bash stdout legitimately contain
+        # those words and would produce false negatives.
+        result_raw = s.result or ""
+        rstrip = result_raw.lstrip()
+        is_failure = (
+            rstrip.startswith(("ERROR:", "ERROR ", "FAIL", "aborted",
+                               "safety blocked", "safety:", "skipped",
+                               "bash TIMEOUT", "bash exec error"))
+            or (rstrip.startswith("rc=") and not rstrip.startswith("rc=0"))
+        )
+        if is_failure:
             mark = c("✗", RED)
         elif a.name in ("done", "fail", "verify_failed", "terminate"):
             mark = ""
@@ -208,6 +390,8 @@ def _cmd_help() -> None:
     print("  /status               show login state")
     print("  /history [N]          list N most recent runs (default 10)")
     print("  /show [last|<id>|<n>] show details of a run (default: last)")
+    print("  /learn <app name>     research an app via web and write a")
+    print("                        SKILL.md cheat-sheet for future runs")
     print("  /open [last|<id>]     reveal the run dir in Finder")
     print("  /context              print current session memory the model sees")
     print("  /reset                clear session memory")
@@ -675,6 +859,131 @@ def repl() -> int:
                     _cmd_reset(session, variables)
                 elif cmd == "/clear":
                     _cmd_clear()
+                elif cmd == "/learn":
+                    rest = line[len(cmd):].strip()
+                    if not rest:
+                        print(c("usage: /learn <app name>", YEL))
+                        continue
+                    # If a prior skill exists for this app (best-effort
+                    # name-guess: <app>-mac, lowercased ASCII), surface it
+                    # to the model up-front so /learn is incremental by
+                    # default rather than incidentally overwriting.
+                    prior_skill = ""
+                    skills_root = Path.home() / ".openseer" / "skills"
+                    if skills_root.exists():
+                        for p in skills_root.rglob("SKILL.md"):
+                            txt = p.read_text(encoding="utf-8",
+                                              errors="ignore")
+                            if rest in txt:
+                                prior_skill = (
+                                    f"\n\nA prior skill for this app already "
+                                    f"exists at {p}. Its current content is "
+                                    f"reproduced below. Phase D MUST `read_"
+                                    f"skill` it first, then write_skill the "
+                                    f"MERGED body — keep every verified fact, "
+                                    f"add new findings, refine items now "
+                                    f"better understood. Don't shrink the "
+                                    f"skill.\n\n--- BEGIN PRIOR SKILL ---\n"
+                                    f"{txt}\n--- END PRIOR SKILL ---\n"
+                                )
+                                break
+                    learn_task = (
+                            f"Build a SKILL.md cheat-sheet for the macOS app "
+                            f"\"{rest}\" by REAL EXPLORATION. Don't copy from "
+                            f"the web. Don't speculate. The skill must "
+                            f"document what YOU observed when interacting "
+                            f"with the actual installed app.\n\n"
+                            f"Required phases:\n\n"
+                            f"PHASE A — Catalyst / port detection (1 step):\n"
+                            f"  `bash ls {shlex.quote(f'/Applications/{rest}.app/Wrapper/')} "
+                            f"2>/dev/null && echo CATALYST || echo NATIVE`. "
+                            f"If CATALYST: web/Windows shortcuts WILL NOT "
+                            f"apply, your skill must reflect that.\n\n"
+                            f"PHASE B — light web research (1–2 steps):\n"
+                            f"  ONE web_search to find general context (what "
+                            f"the app does, known macOS-specific quirks). "
+                            f"Optionally one web_fetch. Tag every claim you "
+                            f"extract with [WEB-UNVERIFIED] until you "
+                            f"confirm it on the real app.\n\n"
+                            f"PHASE C — actual exploration (10–20 steps, the "
+                            f"core of /learn):\n"
+                            f"  open_app, then:\n\n"
+                            f"  C0 — get to a NEUTRAL starting state. If the "
+                            f"app opens inside a document/song/conversation/"
+                            f"reader, navigate BACK to the home / library / "
+                            f"main screen first. Try (in order until one "
+                            f"works): a visible back arrow, ⋯ menu → close, "
+                            f"`key cmd+w` (window close), `key cmd+0`, or a "
+                            f"sidebar 'home/library' tab. Don't begin "
+                            f"exploration from a deep state — your skill "
+                            f"won't cover what users actually start from.\n\n"
+                            f"  C1 — coverage requirement: explore AT LEAST "
+                            f"3 distinct top-level views (e.g. for a reader: "
+                            f"library + categories + a single book reader; "
+                            f"for a media app: library + now-playing + "
+                            f"settings; for a chat app: chat list + an open "
+                            f"conversation + search). Pick the 3 that "
+                            f"matter most for likely tasks.\n\n"
+                            f"  C2 — for each view: screenshot, write what "
+                            f"you observe (panes, tabs, buttons), then click "
+                            f"each major nav element ONE AT A TIME. "
+                            f"Screenshot, observe, record. Note ineffective "
+                            f"clicks too.\n\n"
+                            f"  C3 — try 2–3 keyboard shortcuts you suspect "
+                            f"work (cmd+f, cmd+1, the [WEB-UNVERIFIED] ones "
+                            f"from Phase B). Mark each VERIFIED or "
+                            f"NOT-WORKING based on observed effect.\n\n"
+                            f"  C4 — try clicking a blank area in the main "
+                            f"content pane — many reader/media apps "
+                            f"auto-hide chrome and reveal it on click.\n\n"
+                            f"PHASE D — synthesize and write the skill:\n"
+                            f"  IF a prior skill exists for this app, FIRST "
+                            f"`read_skill` it. Your write_skill must MERGE "
+                            f"new observations with the existing content — "
+                            f"add new findings, refine items now better "
+                            f"understood, and don't drop existing verified "
+                            f"facts. /learn is incremental.\n\n"
+                            f"  Frontmatter (literal YAML, use INLINE list "
+                            f"for `apps` so the loader parses it):\n"
+                            f"    ---\n"
+                            f"    name: <app>-mac\n"
+                            f"    description: one-line summary\n"
+                            f"    family: cu\n"
+                            f"    requires:\n"
+                            f"      apps: [\"{rest}\"]\n"
+                            f"    ---\n"
+                            f"  Body sections (only what you OBSERVED or "
+                            f"VERIFIED):\n"
+                            f"  - Layout: what's actually on screen, named "
+                            f"by what you saw, with approximate pixel "
+                            f"regions if useful.\n"
+                            f"  - Verified shortcuts: ONLY shortcuts you "
+                            f"tested and saw work. List the test result.\n"
+                            f"  - Verified navigation: clicking X opens Y, "
+                            f"only what you actually clicked.\n"
+                            f"  - Footguns: things that didn't work, "
+                            f"Catalyst quirks (if applicable), encrypted "
+                            f"local data stores, surprising defaults.\n"
+                            f"  - Unknown / unverified: list things you "
+                            f"didn't test, so future runs know to test "
+                            f"on first use.\n\n"
+                            f"  Forbidden in the skill: speculative "
+                            f"shortcuts, generic Mac/browser keybindings "
+                            f"that you didn't verify on this app, content "
+                            f"copied from web docs about the WEB version "
+                            f"or other platforms.\n\n"
+                            f"Then write_skill, then terminate done. If you "
+                            f"got fewer than ~5 verified facts because the "
+                            f"app is locked down or unresponsive, that's "
+                            f"fine — write a SHORT honest skill, don't pad."
+                        )
+                    if prior_skill:
+                        learn_task = learn_task + prior_skill
+                    # /learn is a deliberate exploration; it needs more
+                    # turns than a regular task. Bump cap.
+                    opts = _parse_task_flags("")[1]
+                    opts["max_steps"] = 30
+                    _run_task(learn_task, opts, session, variables)
                 else:
                     print(c(f"unknown command: {cmd}", RED))
                 continue

@@ -56,25 +56,50 @@ def _parse_yaml_lite(text: str) -> dict[str, Any]:
     cur_key: str | None = None
     cur_indent = -1
     current_dict: dict | None = None
+    # When a key is opened with no scalar value, the next indented lines
+    # may be either nested `key: value` pairs OR a block list of `- item`.
+    # We accumulate block-list items into this list and attach back to the
+    # owning key when the indent drops or another key starts.
+    pending_list_owner: tuple[dict, str] | None = None
+    pending_list_items: list[str] = []
+
+    def _flush_pending_list() -> None:
+        nonlocal pending_list_owner, pending_list_items
+        if pending_list_owner is not None:
+            owner, key = pending_list_owner
+            owner[key] = list(pending_list_items)
+        pending_list_owner = None
+        pending_list_items = []
+
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         indent = len(line) - len(line.lstrip())
         s = line.strip()
+        # block-list item under a previously opened key (e.g. `apps:` then
+        # `  - WeChat`). The leading `- ` is the YAML list marker.
+        if s.startswith("- ") and pending_list_owner is not None:
+            pending_list_items.append(_strip_quotes(s[2:].strip()))
+            continue
         # nested dict mode
         if current_dict is not None and indent > cur_indent:
             if ":" in s:
+                _flush_pending_list()
                 k, _, v = s.partition(":")
+                k = k.strip()
                 v = v.strip()
                 if v == "":
-                    current_dict[k.strip()] = {}
+                    # could be nested dict OR block list — defer decision
+                    current_dict[k] = {}
+                    pending_list_owner = (current_dict, k)
                 elif v.startswith("[") and v.endswith("]"):
-                    current_dict[k.strip()] = _parse_inline_list(v)
+                    current_dict[k] = _parse_inline_list(v)
                 else:
-                    current_dict[k.strip()] = _strip_quotes(v)
+                    current_dict[k] = _strip_quotes(v)
             continue
         # back to top
+        _flush_pending_list()
         current_dict = None
         if ":" in s:
             k, _, v = s.partition(":")
@@ -90,6 +115,7 @@ def _parse_yaml_lite(text: str) -> dict[str, Any]:
                 out[k] = _parse_inline_list(v)
             else:
                 out[k] = _strip_quotes(v)
+    _flush_pending_list()
     return out
 
 
@@ -176,6 +202,52 @@ def _round_robin_by_family(skills: list[Skill]) -> list[Skill]:
             if by_family[f]:
                 out.append(by_family[f].pop(0))
     return out
+
+
+def find_skill(groups: list[list[Skill]] | list[Skill],
+               name: str) -> Skill | None:
+    """Look up a skill by name across priority groups (first match wins)."""
+    if not groups:
+        return None
+    if groups and isinstance(groups[0], Skill):
+        flat: list[Skill] = list(groups)            # type: ignore[arg-type]
+    else:
+        flat = [s for g in groups for s in g]       # type: ignore[union-attr]
+    nm = (name or "").strip().lower()
+    if not nm:
+        return None
+    for s in flat:
+        if s.name.lower() == nm:
+            return s
+    return None
+
+
+def render_skill_index(groups: list[list[Skill]] | list[Skill]) -> str:
+    """Render a one-line-per-skill INDEX (name + description only).
+
+    Used in the system prompt so the model knows what skills exist
+    without paying the body cost. Use `read_skill <name>` at runtime
+    to fetch a specific skill's full body when (and only when) the
+    task clearly calls for it.
+    """
+    if not groups:
+        return ""
+    if groups and isinstance(groups[0], Skill):
+        flat: list[Skill] = list(groups)            # type: ignore[arg-type]
+    else:
+        flat = [s for g in groups for s in g]       # type: ignore[union-attr]
+    if not flat:
+        return ""
+    lines = ["## Skills available (lazy)\n",
+             "Each entry below is a CHEAT-SHEET for one specific app or",
+             "CLI. The full body is NOT in this prompt. If exactly one",
+             "skill clearly applies to the task, fetch it with",
+             '`{"action":"read_skill","skill_name":"..."}` then act on it.',
+             "If none clearly apply, do NOT read any — use your tools",
+             "directly.\n"]
+    for s in flat:
+        lines.append(f"- **{s.name}** ({s.family or 'misc'}) — {s.description}")
+    return "\n".join(lines) + "\n"
 
 
 def render_for_prompt(groups: list[list[Skill]] | list[Skill],

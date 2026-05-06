@@ -31,7 +31,9 @@ from typing import Any
 class EventType:
     TASK_STARTED    = "task_started"
     STEP_STARTED    = "step_started"
+    PREP_PHASE      = "prep_phase"        # screen captured / AX dumped / etc.
     MODEL_STARTED   = "model_started"
+    MODEL_DELTA     = "model_delta"       # streaming output text chunk
     MODEL_FINISHED  = "model_finished"
     ACTION_PARSED   = "action_parsed"
     ACTION_STARTED  = "action_started"

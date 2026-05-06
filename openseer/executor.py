@@ -35,6 +35,9 @@ class Action:
     query: str | None = None       # for web_search
     url: str | None = None         # for web_fetch
     freshness: str | None = None   # for web_search: "day" | "week" | "month" | "year"
+    skill_name: str | None = None  # for read_skill / write_skill: skill identifier
+    skill_body: str | None = None  # for write_skill: full SKILL.md contents
+    index: int | None = None       # for click: AX element index (preferred over x/y)
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
@@ -48,6 +51,44 @@ class Action:
 
 def _clamp(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi - 1, x))
+
+
+def _paste_unicode_preserving_clipboard(text: str) -> None:
+    """Type non-ASCII text via cmd+V while saving and restoring the user's
+    full clipboard contents (text, image, files, rich text, AND multi-item
+    selections like several files copied from Finder). Requires AppKit
+    (PyObjC); raises RuntimeError if unavailable so we never silently
+    clobber the user's clipboard."""
+    try:
+        from AppKit import NSPasteboard, NSPasteboardItem  # type: ignore[import-untyped]
+    except Exception as e:
+        raise RuntimeError(
+            "non-ASCII typing requires AppKit / PyObjC. Install via "
+            "`pip install pyobjc-framework-Cocoa`."
+        ) from e
+    pb = NSPasteboard.generalPasteboard()
+    # Snapshot every item, copying each (type, data) into a fresh
+    # NSPasteboardItem so the snapshot survives `clearContents`.
+    saved: list = []
+    for item in (pb.pasteboardItems() or []):
+        copy = NSPasteboardItem.alloc().init()
+        for t in (item.types() or []):
+            data = item.dataForType_(t)
+            if data is not None:
+                copy.setData_forType_(data, t)
+        saved.append(copy)
+    try:
+        pb.clearContents()
+        pb.setString_forType_(text, "public.utf8-plain-text")
+        time.sleep(0.05)
+        pyautogui.hotkey("command", "v")
+        time.sleep(0.10)
+    finally:
+        # Restore. If the pasteboard was empty before, leave it empty
+        # rather than leaking the agent's text into it.
+        pb.clearContents()
+        if saved:
+            pb.writeObjects_(saved)
 
 
 def execute(action: Action, *, dry_run: bool = True) -> str:
@@ -71,7 +112,16 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
 
     # ─── computer-use primitives ──────────────────────────────────────────
     if name in ("click", "scroll"):
+        # If `index` is given on a click and no x,y, the agent loop has
+        # already resolved (x,y) from the AX tree (see _resolve_index in
+        # agent.py); here we only need to validate that we have coords.
         if action.x is None or action.y is None:
+            if action.index is not None:
+                return (f"ERROR: click(index={action.index}) but the AX-tree "
+                        "lookup did not produce coordinates. The agent loop "
+                        "resolves index→(x,y) — this means either the index "
+                        "is out of range, or AX returned no elements this "
+                        "turn (Catalyst app, no permission, or focus issue).")
             return "ERROR: missing x,y"
         x = _clamp(int(action.x), 0, w)
         y = _clamp(int(action.y), 0, h)
@@ -108,6 +158,32 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
             if r.returncode != 0:
                 stderr = (r.stderr or "").strip()
                 return f"open -a {app!r} failed (rc={r.returncode}): {stderr[:200]}"
+            # `open -a` brings the app's window forward in z-order but
+            # does NOT steal keyboard focus from whatever's currently
+            # frontmost (typically OpenSeer's own terminal). Without a
+            # real focus shift, NSWorkspace.frontmostApplication keeps
+            # returning the terminal and our AX dump runs against the
+            # wrong app. Force focus via AppleScript `activate` — it
+            # works on macOS 14+ where NSRunningApplication's
+            # programmatic activate is silently ignored.
+            try:
+                time.sleep(0.4)               # let the app finish launching
+                # AppleScript needs DOUBLE-quoted string literals with
+                # backslash escapes for `\` and `"`. shlex.quote uses
+                # shell-style SINGLE quotes which AppleScript parses as
+                # an identifier (so multi-word names like "Google Chrome"
+                # silently fail).
+                _esc = app.replace("\\", "\\\\").replace('"', '\\"')
+                subprocess.run(
+                    ["osascript", "-e",
+                     f'tell application "{_esc}" to activate'],
+                    capture_output=True, timeout=4,
+                )
+            except Exception:
+                # AppKit not available or activation refused — agent
+                # loop's settle delay still gives the user a chance to
+                # see the new window even if focus didn't transfer.
+                pass
         return f"opened app {app!r}"
 
     if name == "type":
@@ -126,10 +202,29 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
                 pyautogui.click(x, y)
                 time.sleep(0.15)  # let focus settle
             clicked_first = True
+        # pyautogui.typewrite only handles keys in its US-keyboard map and
+        # silently drops anything else (CJK, emoji, accented chars). For
+        # non-ASCII text, route through the clipboard + cmd+V instead so
+        # the field actually receives the user's payload.
+        text = action.text
+        non_ascii = any(ord(ch) > 127 for ch in text)
+        method = "typewrite"
         if not dry_run:
-            pyautogui.typewrite(action.text, interval=0.02)
+            if non_ascii:
+                method = "paste"
+                try:
+                    _paste_unicode_preserving_clipboard(text)
+                except Exception as e:
+                    # Don't crash the whole run — return the failure so the
+                    # model can switch strategy (e.g. type ASCII, or paste
+                    # via bash pbcopy + key cmd+v manually).
+                    return (f"ERROR: paste-typing non-ASCII failed: {e}. "
+                            f"Click step (if any) already happened. Try a "
+                            f"different approach.")
+            else:
+                pyautogui.typewrite(text, interval=0.02)
         prefix = f"clicked ({action.x},{action.y}) → " if clicked_first else ""
-        return f"{prefix}typed {action.text!r}"
+        return f"{prefix}typed[{method}] {text!r}"
 
     if name == "key":
         combo = action.key or ""
@@ -137,8 +232,15 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
             return "ERROR: missing key"
         # accept "cmd+space", "ctrl+a", "enter", "tab", ...
         keys = [k.strip().lower() for k in combo.split("+")]
-        # normalise mac modifiers
-        norm = {"cmd": "command", "opt": "option", "ctrl": "ctrl"}
+        # normalise mac modifiers + common keyname spellings (pyautogui uses
+        # `pageup`/`pagedown` without separators; models often emit
+        # `page_up`/`page-up`/`pgup` etc.)
+        norm = {
+            "cmd": "command", "opt": "option", "ctrl": "ctrl",
+            "page_up": "pageup", "page-up": "pageup", "pgup": "pageup",
+            "page_down": "pagedown", "page-down": "pagedown", "pgdn": "pagedown",
+            "esc": "escape",
+        }
         keys = [norm.get(k, k) for k in keys]
         if not dry_run:
             if len(keys) == 1:

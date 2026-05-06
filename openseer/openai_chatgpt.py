@@ -63,11 +63,17 @@ def _stream(payload: dict) -> str:
     return text
 
 
-def _stream_full(payload: dict, *, max_retries: int = 3) -> tuple[str, list[dict], dict]:
+def _stream_full(payload: dict, *, max_retries: int = 3,
+                 on_delta=None) -> tuple[str, list[dict], dict]:
     """Stream and return (text, events, usage).
 
     Retries on HTTP 429 (rate limit) and 5xx with exponential backoff
     1s / 2s / 4s. Other errors propagate.
+
+    `on_delta(text_so_far: str)` is called for each text delta as it
+    arrives, allowing live UI of the model's output as it forms (the
+    `thought` field is emitted first, so this surfaces the plan in
+    real time before the action runs).
     """
     import time as _time
 
@@ -96,6 +102,11 @@ def _stream_full(payload: dict, *, max_retries: int = 3) -> tuple[str, list[dict
                 t = d.get("type")
                 if t == "response.output_text.delta":
                     text += d.get("delta", "")
+                    if on_delta is not None:
+                        try:
+                            on_delta(text)
+                        except Exception:
+                            pass
                 elif t == "response.completed":
                     usage = (d.get("response") or {}).get("usage") or {}
                     break

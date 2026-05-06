@@ -109,13 +109,18 @@ def _detect_host_terminal() -> tuple[str, int] | None:
                 pass
             return (name, pid)
         pid = ppid
-    # Fallback: NSWorkspace's frontmost — best-effort, may misidentify.
+    # Fallback: NSWorkspace's frontmost — but ONLY if it actually looks
+    # like a terminal. If we mislabel a user's frontmost Safari/Finder/etc
+    # as the "host terminal", the prompt will instruct the model to never
+    # click into it, breaking subsequent tasks targeting that app. Better
+    # to return None and let the model see the un-augmented notice.
     try:
         from AppKit import NSWorkspace  # type: ignore[import-untyped]
         front = NSWorkspace.sharedWorkspace().frontmostApplication()
         if front is not None:
-            return (str(front.localizedName() or "Terminal"),
-                    int(front.processIdentifier()))
+            name = str(front.localizedName() or "")
+            if any(k in name.lower() for k in _TERMINAL_KEYWORDS):
+                return (name or "Terminal", int(front.processIdentifier()))
     except Exception:
         pass
     return None

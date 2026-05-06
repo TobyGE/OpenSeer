@@ -54,24 +54,115 @@ def _load_config() -> dict:
 
 # ─── remote-mode prompt context ─────────────────────────────────────────────
 
-_REMOTE_NOTICE = (
-    "[OpenSeer is running in DAEMON mode, triggered remotely via Telegram chat. "
-    "The user is NOT looking at this Mac right now — they only see what you send "
-    "back through the channel. So:\n"
-    "  - DON'T assume 'user can see X' just because something is on this Mac's "
-    "    screen. The user is on their phone.\n"
-    "  - DESCRIBE what's on screen in your terminate.reason — not 'see attached' "
-    "    unless you actually attach (see next bullet).\n"
-    "  - To send images back: take a screenshot to a file (e.g. "
-    "    `bash screencapture -x ~/Desktop/proof.png`), then on terminate include "
-    "    `\"attachments\":[\"/Users/.../proof.png\"]` — the daemon will sendPhoto "
-    "    each path to the user's chat. PNG/JPG/GIF, ≤10 MB each.\n"
-    "  - VERIFY the actual end state before terminate(done) — there is no human "
-    "    at the keyboard to catch a wrong claim.\n"
-    "  - The user's own windows may be on top of your target app. Use open_app / "
-    "    get_app_state(app=...) to force focus; do not assume a window is "
-    "    frontmost just because you opened a URL.]"
+_TERMINAL_KEYWORDS = (
+    "iterm", "terminal", "warp", "tabby", "alacritty",
+    "ghostty", "kitty", "wezterm", "hyper",
 )
+
+
+def _detect_host_terminal() -> tuple[str, int] | None:
+    """Identify the terminal app the daemon was launched from.
+
+    Strategy: walk our own process's parent chain until we find a process
+    whose command name matches a known terminal emulator. This is far more
+    reliable than NSWorkspace.frontmostApplication() (which depends on
+    whatever app happens to have focus at daemon startup, including a
+    Finder window the user just clicked into).
+
+    Returns (app_localized_name, pid) on success, or None.
+    """
+    import os
+    import subprocess
+
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            break
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2,
+            )
+        except Exception:
+            break
+        line = (r.stdout or "").strip()
+        if not line:
+            break
+        try:
+            ppid_s, comm = line.split(None, 1)
+            ppid = int(ppid_s)
+        except ValueError:
+            break
+        base = comm.rsplit("/", 1)[-1].lower()
+        if any(k in base for k in _TERMINAL_KEYWORDS):
+            # Resolve a friendly localized name when possible (so the
+            # prompt says 'iTerm2' not '/Applications/.../iTerm2').
+            name = comm.rsplit("/", 1)[-1].split(".")[0] or comm
+            try:
+                from AppKit import NSRunningApplication  # type: ignore[import-untyped]
+                ra = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+                if ra is not None:
+                    nm = ra.localizedName()
+                    if nm:
+                        name = str(nm)
+            except Exception:
+                pass
+            return (name, pid)
+        pid = ppid
+    # Fallback: NSWorkspace's frontmost — best-effort, may misidentify.
+    try:
+        from AppKit import NSWorkspace  # type: ignore[import-untyped]
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is not None:
+            return (str(front.localizedName() or "Terminal"),
+                    int(front.processIdentifier()))
+    except Exception:
+        pass
+    return None
+
+
+def _build_remote_notice(host_term: tuple[str, int] | None) -> str:
+    host_line = ""
+    if host_term:
+        name, pid = host_term
+        host_line = (
+            f"  - YOUR HOST TERMINAL is {name!r} (pid={pid}). The lines you see "
+            f"on screen prefixed with [telegram], [agent], [step…], [budget], "
+            f"[ax] ARE YOUR OWN LOG OUTPUT — not part of the task. NEVER click "
+            f"into {name!r}, NEVER type into it, NEVER switch its tabs. If "
+            f"{name!r} is frontmost and you can't see your target app, your "
+            f"first action MUST be open_app on the target — do NOT click around "
+            f"trying to surface a window.\n"
+        )
+    return (
+        "[OpenSeer is running in DAEMON mode, triggered remotely via Telegram chat. "
+        "The user is NOT looking at this Mac right now — they only see what you "
+        "send back through the channel. So:\n"
+        f"{host_line}"
+        "  - If the user's request is AMBIGUOUS or has no clear referent in this "
+        "    chat's prior tasks (e.g. '再跑一次' / 'do it again' with nothing in "
+        "    history), DO NOT guess from what's on screen. Immediately "
+        "    terminate(fail) with a reason asking the user to clarify.\n"
+        "  - DON'T assume 'user can see X' just because something is on this "
+        "    Mac's screen. The user is on their phone.\n"
+        "  - DESCRIBE what's on screen in your terminate.reason — not 'see "
+        "    attached' unless you actually attach (see next bullet).\n"
+        "  - To send images back: take a screenshot to a file (e.g. "
+        "    `bash screencapture -x ~/Desktop/proof.png`), then on terminate "
+        "    include `\"attachments\":[\"/Users/.../proof.png\"]` — the daemon "
+        "    will sendPhoto each path to the user's chat. PNG/JPG/GIF, ≤10 MB.\n"
+        "  - VERIFY the actual end state before terminate(done) — there is no "
+        "    human at the keyboard to catch a wrong claim.\n"
+        "  - AX may be empty for many turns (host terminal is blacklisted from "
+        "    AX). If AX is empty, your only signal is the screenshot — but "
+        "    don't act on what you see in the host terminal. open_app the "
+        "    target first; if open_app doesn't surface it, terminate(fail).]"
+    )
+
+
+# Built once per daemon process at module-import is too early (NSWorkspace
+# may not be initialised); we resolve in run_daemon() and cache here.
+_REMOTE_NOTICE: str = _build_remote_notice(None)
 
 
 # ─── live-progress callback ─────────────────────────────────────────────────
@@ -294,6 +385,16 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
 
 
 def run_daemon() -> int:
+    # Detect the terminal app the daemon is launched from BEFORE we print
+    # anything else — at this moment the user has just hit return in their
+    # terminal, so frontmostApplication() is reliably the host terminal
+    # itself (Terminal.app, iTerm2, Warp, …). We bake its name + pid into
+    # the remote-mode prompt so the model knows exactly which app NOT to
+    # drive when it sees [agent]/[step]/[telegram] log lines on screen.
+    global _REMOTE_NOTICE
+    host_term = _detect_host_terminal()
+    _REMOTE_NOTICE = _build_remote_notice(host_term)
+
     cfg = _load_config()
     tg_cfg = cfg.get("telegram") or {}
     if not tg_cfg.get("enabled"):
@@ -323,6 +424,9 @@ def run_daemon() -> int:
 
     print(f"daemon: telegram bot @{me.get('username')} ({me.get('first_name')}) ready")
     print(f"        provider={OAI_MODEL}")
+    if host_term:
+        print(f"        host terminal: {host_term[0]!r} (pid={host_term[1]}) — "
+              f"prompt warns the model to never drive it")
     if bot.allowed_chat_ids:
         print(f"        allowed chat_ids: {sorted(bot.allowed_chat_ids)}")
     else:
@@ -335,9 +439,28 @@ def run_daemon() -> int:
     print(f"        sessions persisted to ~/.openseer/inbox/sessions.json")
     print("        (Ctrl+C to stop)")
 
+    # Ctrl+C handling. The default SIGINT handler raises KeyboardInterrupt,
+    # which agent_run() catches and the daemon's outer try also catches —
+    # that's the clean exit path. Our previous "polite" handler just
+    # printed and set bot._stop, which SWALLOWED SIGINT entirely (the
+    # agent loop's blocking model call never saw KeyboardInterrupt and
+    # the user had to keep mashing Ctrl+C with no effect).
+    #
+    # New behaviour:
+    #   1st Ctrl+C: print, request bot stop, then raise KeyboardInterrupt
+    #               so any in-flight agent run actually unwinds.
+    #   2nd Ctrl+C: hard exit (the user was clearly serious).
+    _caught = {"once": False}
+    import os as _os
+
     def _on_sigint(signum, frame):
-        print("\ndaemon: stop signal — finishing current poll cycle …")
+        if _caught["once"]:
+            print("\ndaemon: hard exit (2nd Ctrl+C).")
+            _os.kill(_os.getpid(), signal.SIGKILL)
+        _caught["once"] = True
+        print("\ndaemon: stop signal — interrupting current task …")
         bot.stop()
+        raise KeyboardInterrupt
     signal.signal(signal.SIGINT, _on_sigint)
     signal.signal(signal.SIGTERM, _on_sigint)
 

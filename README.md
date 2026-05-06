@@ -61,6 +61,7 @@ One-off (no REPL):
 ```bash
 openseer "Open Calculator and compute 999 * 123"
 openseer task --execute --confirm-each "..."   # step-by-step confirm
+openseer daemon                                # listen for Telegram tasks
 ```
 
 Suffix flags inside the REPL: `Open Notes --dry`, `Find foo --steps 8`.
@@ -114,6 +115,20 @@ multi-turn input, raw response, SSE events, `transcript.json`,
 `trace.md`. Streaming `thought` field rendered live in the REPL while
 the model thinks.
 
+**Phone → Mac via Telegram** (`openseer daemon`):
+- Send a task from your phone, OpenSeer drives your Mac, replies with the result
+- Per-chat session memory (multi-turn: "screenshot it" picks up the prior task)
+- Live progress: the ack message edits in place every ~2.5s with the
+  current step + reflection so you see what's happening, not 30s of silence
+- Image attachments: `terminate(attachments=["/path/to/proof.png"])`
+  ships screenshots back via `sendPhoto`
+- Fail-closed allowlist (empty = refuses every chat, logs the id so
+  you can opt it in) and per-bot offset persistence (no command replay
+  on restart)
+- Configure via `~/.openseer/config.json` `telegram` block; the prompt
+  names your host terminal so the model knows not to drive the daemon's
+  own log window
+
 **Safety & guards**:
 - Per-action confirmation mode (`--confirm-each`)
 - Risky-action awareness in prompt (CC-style reversibility framing)
@@ -145,7 +160,7 @@ agent loop is provider-agnostic.
   what you've actually been doing on your Mac
 - Macro / shortcut evolution from repeated trajectories (AppAgentX-style)
 - Skill marketplace
-- Multi-channel input (CLI today; web + iMessage planned)
+- Multi-channel input (CLI + Telegram today; web planned)
 - More grounders — Claude `computer_20251124`, OpenAI
   `computer-use-preview`, self-hosted UI-TARS
 

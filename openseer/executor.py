@@ -95,27 +95,51 @@ def _paste_unicode_preserving_clipboard(text: str) -> None:
 
 # Browsers we know how to talk to via AppleScript.
 # Chromium-family apps share Chrome's `execute ... javascript` syntax.
+# Includes pre-release channels (Beta/Canary/Dev/Nightly) — these are
+# distinct apps with their own AppleScript-resolvable names; treating
+# them as the stable channel would silently drive the wrong browser.
 _CHROMIUM_BROWSERS = {
     "Google Chrome", "Google Chrome Canary", "Google Chrome Beta",
-    "Arc", "Microsoft Edge", "Brave Browser", "Vivaldi", "Opera",
+    "Google Chrome Dev",
+    "Microsoft Edge", "Microsoft Edge Beta", "Microsoft Edge Canary",
+    "Microsoft Edge Dev",
+    "Brave Browser", "Brave Browser Beta", "Brave Browser Nightly",
+    "Arc", "Vivaldi", "Opera",
 }
 
 
 _BROWSER_ALIASES = (
     # (substring lower-cased, canonical AppleScript app name)
-    ("chrome canary", "Google Chrome Canary"),
-    ("chrome beta", "Google Chrome Beta"),
-    ("google chrome", "Google Chrome"),
-    ("chrome", "Google Chrome"),
-    ("microsoft edge", "Microsoft Edge"),
-    ("edge", "Microsoft Edge"),
-    ("brave browser", "Brave Browser"),
-    ("brave", "Brave Browser"),
-    ("safari", "Safari"),
-    ("arc", "Arc"),
-    ("vivaldi", "Vivaldi"),
-    ("opera", "Opera"),
-    ("firefox", "Firefox"),
+    # ORDER MATTERS — longer / more specific variants must come first
+    # so e.g. "Microsoft Edge Beta" maps to Edge Beta, not stable Edge.
+    # First match wins (substring search; we return immediately).
+    ("google chrome canary",   "Google Chrome Canary"),
+    ("chrome canary",          "Google Chrome Canary"),
+    ("google chrome beta",     "Google Chrome Beta"),
+    ("chrome beta",            "Google Chrome Beta"),
+    ("google chrome dev",      "Google Chrome Dev"),
+    ("chrome dev",             "Google Chrome Dev"),
+    ("google chrome",          "Google Chrome"),
+    ("chrome",                 "Google Chrome"),
+    ("microsoft edge canary",  "Microsoft Edge Canary"),
+    ("edge canary",            "Microsoft Edge Canary"),
+    ("microsoft edge beta",    "Microsoft Edge Beta"),
+    ("edge beta",              "Microsoft Edge Beta"),
+    ("microsoft edge dev",     "Microsoft Edge Dev"),
+    ("edge dev",               "Microsoft Edge Dev"),
+    ("microsoft edge",         "Microsoft Edge"),
+    ("edge",                   "Microsoft Edge"),
+    ("brave browser nightly",  "Brave Browser Nightly"),
+    ("brave nightly",          "Brave Browser Nightly"),
+    ("brave browser beta",     "Brave Browser Beta"),
+    ("brave beta",             "Brave Browser Beta"),
+    ("brave browser",          "Brave Browser"),
+    ("brave",                  "Brave Browser"),
+    ("safari",                 "Safari"),
+    ("arc",                    "Arc"),
+    ("vivaldi",                "Vivaldi"),
+    ("opera",                  "Opera"),
+    ("firefox",                "Firefox"),
 )
 
 

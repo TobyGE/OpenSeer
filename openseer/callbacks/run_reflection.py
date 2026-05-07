@@ -166,12 +166,11 @@ def _domain_from_host(host: str) -> str:
 
 
 def _site_slug_from_domain(domain: str) -> str:
-    parts = [p for p in _domain_from_host(domain).split(".") if p]
-    if len(parts) >= 3 and parts[-2] in {"co", "com", "net", "org"}:
-        parts = parts[:-2]
-    elif len(parts) >= 2:
-        parts = parts[:-1]
-    return slugify_app(" ".join(parts) or domain)
+    # Keep the full normalized domain in the skill name so the same site
+    # always maps to one durable skill. We cannot use dots because skill
+    # ids are validated as [a-z0-9_-], so dots become hyphens:
+    # sameday.costco.com -> sameday-costco-com-web.
+    return slugify_app(_domain_from_host(domain))
 
 
 def canonical_site_skill_name(domain: str) -> str:

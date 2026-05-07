@@ -192,11 +192,18 @@ def validate_skill_body(skill_name: str, body: str) -> SkillWriteResult:
         return SkillWriteResult(False, error=(
             f"frontmatter name {parsed.name!r} doesn't match skill_name {nm!r}"
         ))
-    family = parsed.family or "cu"
+    if not parsed.description.strip():
+        return SkillWriteResult(False, error="frontmatter description is required")
+    if not parsed.family.strip():
+        return SkillWriteResult(False, error="frontmatter family is required")
+    family = parsed.family
     if not _ID_RE.match(family):
         return SkillWriteResult(False, error=(
             f"family {family!r} must match [a-z0-9][a-z0-9_-]{{0,63}}"
         ))
+    apps = (parsed.requires or {}).get("apps") or []
+    if family == "cu" and not apps:
+        return SkillWriteResult(False, error="cu skills must declare requires.apps")
     return SkillWriteResult(True, skill=parsed)
 
 

@@ -288,6 +288,9 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
         # Live-progress callback (only if we got an ack message_id back).
         from .agent import _default_callbacks  # local import: callbacks
         callbacks = _default_callbacks(quiet=False)
+        for cb in callbacks:
+            if getattr(cb, "label", "") == "RunReflection":
+                cb.mode = "trace-only"
         if ack_msg_id:
             callbacks.append(_TelegramProgress(bot, msg.chat_id, ack_msg_id,
                                                msg.text))

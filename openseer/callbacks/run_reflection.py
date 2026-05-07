@@ -49,6 +49,8 @@ Rules:
 - If proposing a skill update, output one full merged SKILL.md body in a
   ```skill-md fenced block. Preserve existing verified facts and add only
   evidence-backed new facts.
+- The skill body MUST have frontmatter with name, description, family, and
+  requires.apps. For macOS UI skills use `family: cu`.
 
 Output exactly this markdown shape:
 

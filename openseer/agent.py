@@ -229,6 +229,24 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
     # Tolerance: models sometimes emit `{"status":"done"/"fail",...}` without
     # an explicit `action` field, treating `status` as the discriminator.
     # Infer `terminate` in that case so the user-visible flow doesn't break.
+    def _verified_steps(v) -> list[int] | None:
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return [v]
+        if isinstance(v, str):
+            nums = [int(n) for n in re.findall(r"\d+", v)]
+            return nums or None
+        if isinstance(v, list):
+            out: list[int] = []
+            for it in v:
+                if isinstance(it, int):
+                    out.append(it)
+                elif isinstance(it, str):
+                    out.extend(int(n) for n in re.findall(r"\d+", it))
+            return out or None
+        return v
+
     name = obj.get("action") or ""
     if not name and obj.get("status") in ("done", "fail"):
         name = "terminate"
@@ -261,7 +279,7 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         # parser strictness.
         thought=(obj.get("thought") or obj.get("thinking")
                  or fallback_thought),
-        verified_by_steps=obj.get("verified_by_steps"),
+        verified_by_steps=_verified_steps(obj.get("verified_by_steps")),
         attachments=obj.get("attachments"),
         selector=obj.get("selector"),
     )

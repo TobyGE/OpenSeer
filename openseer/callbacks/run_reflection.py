@@ -25,6 +25,7 @@ from ..skills import (
 
 _SKILL_BLOCK_RE = re.compile(r"```skill-md\s*\n(.*?)\n```", re.DOTALL)
 _APP_FROM_AX_RE = re.compile(r"accessibility tree\)\s+—\s+(.+)")
+_OPENED_APP_RE = re.compile(r"opened app ['\"](.+?)['\"]")
 _URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?:[/:?#]|$)")
 _MAX_RESULT = 500
 _BROWSER_APPS = {"google chrome", "chrome", "safari", "firefox", "arc", "microsoft edge"}
@@ -47,6 +48,11 @@ Rules:
 - If the failure was only network/API/SSL, do not propose a skill update for
   that cause.
 - Prefer `Skill update: none` unless the run taught reusable app behavior.
+- If a concrete website skill target is provided and the run discovered
+  avoidable, reusable site behavior such as a wrong URL route, a search
+  submission footgun, an overlay/suggestion requirement, or a product-card
+  navigation workaround, propose that website skill update. Do not leave it
+  as `none` when the same lesson would clearly save future steps.
 - If an existing skill target is provided, update that exact skill name.
 - Do not create task-specific skills such as wechat-message or wechat-group.
 - One macOS app should usually have one CU skill named <app-slug>-mac.
@@ -137,6 +143,13 @@ def _infer_app_name(history: list[Any], target_skill: Any | None) -> str:
     # Fall back to AX text returned by get_app_state.
     for s in reversed(history):
         m = _APP_FROM_AX_RE.search(s.result or "")
+        if m:
+            return m.group(1).strip()
+
+    # `open_app` results are stored as text in the trajectory; older
+    # transcript rows did not persist `action.app`, so recover it here.
+    for s in reversed(history):
+        m = _OPENED_APP_RE.search(s.result or "")
         if m:
             return m.group(1).strip()
 

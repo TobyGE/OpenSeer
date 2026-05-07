@@ -219,14 +219,78 @@ def _browser_current_url(app: str) -> str | None:
     return out or None
 
 
-def read_page_auto(app: str) -> str | None:
-    """Auto-perception variant used by the agent loop. Returns the
-    page-text block on success, None on any failure (including the
-    "Allow JS from Apple Events" gate not being enabled). Failures
-    are intentionally silent — the agent loop has the screenshot +
-    AX as fallback signal and we don't want to clutter the user
-    prompt with auto-perception errors.
+def _browser_innertext_length(app: str) -> int | None:
+    """Lightweight load-stability probe: returns just the byte length
+    of document.body.innerText, not the text itself. ~30 ms per call
+    over AppleScript IPC, so we can poll it 3-4 times before doing a
+    full read_page fetch. Returns None on any failure (JS gated, app
+    closed, mid-navigation race)."""
+    js = "(document.body && document.body.innerText.length) || 0"
+    js_esc = js.replace("\\", "\\\\").replace('"', '\\"')
+    app_esc = app.replace("\\", "\\\\").replace('"', '\\"')
+    if app == "Safari":
+        script = (f'tell application "{app_esc}" to '
+                  f'do JavaScript "{js_esc}" in front document')
+    elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
+        script = (f'tell application "{app_esc}" to execute front window\'s '
+                  f'active tab javascript "{js_esc}"')
+    else:
+        return None
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    try:
+        return int(out)
+    except (ValueError, TypeError):
+        return None
+
+
+def read_page_auto(app: str, *,
+                   settle_timeout: float = 3.5,
+                   substantial_threshold: int = 6000,
+                   stable_threshold: int = 2000,
+                   growth_tolerance: float = 0.05,
+                   poll_interval: float = 0.8) -> str | None:
+    """Auto-perception variant. Polls innerText.length until the page
+    looks loaded, then does a full read_page fetch. Returns the
+    page-text block, or None on any failure (silent: the agent loop
+    has screenshot + AX as fallback).
+
+    Stability rules (any one of these stops the poll):
+      - first sample is already ≥ substantial_threshold chars (fast
+        path: page is clearly loaded, don't waste time waiting)
+      - latest sample is ≥ stable_threshold AND grew less than
+        growth_tolerance over the previous sample
+      - settle_timeout elapsed (give up waiting; fetch what's there)
+      - probe failed (JS gated, page error) → return None
+
+    Defaults are tuned for SPAs (X / LinkedIn): typical render time
+    is 2-3s, so 3.5s cap covers the common case while still bailing
+    on truly stuck pages.
     """
+    deadline = time.monotonic() + settle_timeout
+    last_len = -1
+    while time.monotonic() < deadline:
+        cur = _browser_innertext_length(app)
+        if cur is None:
+            return None                           # JS gated / app gone
+        if last_len < 0 and cur >= substantial_threshold:
+            break                                 # fast path
+        if last_len > 0 and cur >= stable_threshold:
+            growth = abs(cur - last_len) / max(last_len, 1)
+            if growth < growth_tolerance:
+                break                             # converged
+        last_len = cur
+        # Don't sleep past the deadline; just exit and use what we have.
+        if time.monotonic() + poll_interval >= deadline:
+            break
+        time.sleep(poll_interval)
+
     a = Action(name="read_page", app=app)
     try:
         result = _read_page(a, dry_run=False)

@@ -842,28 +842,52 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                 # trigger a fresh fetch even when the URL string matches.
                 last_key = ctx.get("_browser_last_key")
                 cur_key = (canon_app, cur_url) if cur_url else None
-                if cur_key and cur_key != last_key:
-                    page_text = read_page_auto(canon_app)
-                    if page_text:
+                cached_text = ctx.get("_browser_cached_text", "")
+                turns_since = ctx.get("_browser_turns_since_fetch", 99)
+
+                # Re-fetch via JS when ANY of:
+                #   - URL or app changed (key mismatch)
+                #   - last fetch was thin (< 2 kB → page was mid-load,
+                #     SPA hadn't rendered, or content arrived after)
+                #   - 3+ turns since last fetch (catches SPA infinite-
+                #     scroll content that loads without a URL change)
+                stale = (turns_since >= 3
+                         or (cached_text and len(cached_text) < 2000))
+                refetch = bool(cur_key and (cur_key != last_key or stale))
+
+                page_text = cached_text
+                if refetch:
+                    fresh = read_page_auto(canon_app)
+                    if fresh:
+                        page_text = fresh
                         ctx["_browser_last_key"] = cur_key
-                        # Tag with the URL so the model can tell
-                        # "this is the page I'm currently looking at"
-                        # vs. an older read_page call from history.
-                        ax_block = (ax_block.rstrip()
-                                    + ("\n\n" if ax_block else "")
-                                    + "## Page content (auto-fetched "
-                                      "via read_page)\n"
-                                    + page_text + "\n")
+                        ctx["_browser_cached_text"] = fresh
+                        ctx["_browser_turns_since_fetch"] = 0
                         say(f"  [page] {canon_app} {cur_url[:80]}"
-                            f"{'…' if len(cur_url)>80 else ''} "
-                            f"({len(page_text)} chars)")
+                            f"{'…' if cur_url and len(cur_url)>80 else ''} "
+                            f"({len(fresh)} chars, fresh fetch)")
                     else:
+                        # Don't update last_key — next turn will retry.
                         say(f"  [page] {canon_app}: read_page failed "
                             f"(JS perm off, or page mid-load) — "
                             f"falling back to AX/screenshot")
-                elif cur_url:
-                    say(f"  [page] {canon_app}: same URL as last turn, "
-                        f"reusing cached page-text from history")
+                else:
+                    ctx["_browser_turns_since_fetch"] = turns_since + 1
+                    if page_text:
+                        say(f"  [page] {canon_app}: reusing cached page-text "
+                            f"({len(page_text)} chars, "
+                            f"{turns_since + 1} turns since refresh)")
+
+                # Always attach when we have content — re-injecting on
+                # every turn keeps it salient even after image-retention
+                # pruning and long action chains. The cache avoids paying
+                # the JS cost when nothing's changed.
+                if page_text:
+                    ax_block = (ax_block.rstrip()
+                                + ("\n\n" if ax_block else "")
+                                + "## Page content (auto-fetched "
+                                  "via read_page)\n"
+                                + page_text + "\n")
         except Exception as e:
             say(f"  [page] auto-fetch error: {e}")
 

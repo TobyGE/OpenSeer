@@ -312,12 +312,26 @@ def read_page_auto(app: str, *,
     cap = 5.0 if expect_change else settle_timeout
     deadline = time.monotonic() + cap
     last_len = -1
+    initial_len = -1
     samples = 0
+    saw_change = False
+    # On SPAs the OLD DOM can stay completely unchanged for the first
+    # 1-3 seconds after pushState (length the same across multiple
+    # samples), then suddenly get replaced. We must observe that
+    # CHANGE happened before we accept the page as stable — otherwise
+    # we just capture the old content under the new URL.
+    change_threshold = 0.20  # 20% length delta from initial = real swap
     while time.monotonic() < deadline:
         cur = _browser_innertext_length(app)
         if cur is None:
             return None                           # JS gated / app gone
         samples += 1
+        if initial_len < 0:
+            initial_len = cur
+        elif not saw_change:
+            delta = abs(cur - initial_len) / max(initial_len, 1)
+            if delta >= change_threshold:
+                saw_change = True
         # Fast-path is unsafe right after navigation (stale DOM still
         # has the old content's length). Only honour it when the URL
         # is unchanged.
@@ -326,7 +340,12 @@ def read_page_auto(app: str, *,
         if samples >= 2 and cur >= stable_threshold and last_len > 0:
             growth = abs(cur - last_len) / max(last_len, 1)
             if growth < growth_tolerance:
-                break
+                # When expect_change=True, also require we've actually
+                # observed the SPA replacement (length deviated from
+                # initial). Otherwise the OLD DOM that hasn't been
+                # swapped yet looks identical between samples.
+                if not expect_change or saw_change:
+                    break
         last_len = cur
         # Don't sleep past the deadline; just exit and use what we have.
         if time.monotonic() + poll_interval >= deadline:

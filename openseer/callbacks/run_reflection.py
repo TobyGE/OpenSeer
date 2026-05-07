@@ -29,6 +29,11 @@ _OPENED_APP_RE = re.compile(r"opened app ['\"](.+?)['\"]")
 _URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?:[/:?#]|$)")
 _MAX_RESULT = 500
 _BROWSER_APPS = {"google chrome", "chrome", "safari", "firefox", "arc", "microsoft edge"}
+_SITE_ALIASES = (
+    (re.compile(r"\bcostco\s+same[- ]day\b", re.IGNORECASE), "sameday.costco.com"),
+    (re.compile(r"\binstacart\b", re.IGNORECASE), "instacart.com"),
+)
+_IGNORED_INFERENCE_DOMAINS = {"support.google.com"}
 
 
 REFLECTION_PROMPT = """You are OpenSeer's post-run reflection pass.
@@ -190,9 +195,13 @@ def canonical_site_skill_name(domain: str) -> str:
     return f"{_site_slug_from_domain(domain)}-web"
 
 
-def _infer_site_domain(history: list[Any], app_name: str) -> str:
+def _infer_site_domain(history: list[Any], app_name: str, task_text: str = "") -> str:
     if (app_name or "").strip().lower() not in _BROWSER_APPS:
         return ""
+    for pat, domain in _SITE_ALIASES:
+        if pat.search(task_text or ""):
+            return domain
+    text_blobs = [task_text or ""]
     counts: dict[str, int] = {}
     for s in history:
         a = s.action
@@ -202,14 +211,20 @@ def _infer_site_domain(history: list[Any], app_name: str) -> str:
             getattr(a, "cmd", None),
             getattr(a, "thought", None),
             s.result or "",
+            getattr(s, "user_text", "") or "",
         ]
         for value in fields:
+            text_blobs.append(str(value or ""))
             for m in _URL_RE.finditer(str(value or "")):
                 domain = _domain_from_host(m.group(1))
-                if not domain:
+                if not domain or domain in _IGNORED_INFERENCE_DOMAINS:
                     continue
                 counts[domain] = counts.get(domain, 0) + 1
     if not counts:
+        combined = "\n".join(text_blobs)
+        for pat, domain in _SITE_ALIASES:
+            if pat.search(combined):
+                return domain
         return ""
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
@@ -299,7 +314,7 @@ class RunReflectionCallback(Callback):
         read_names = _read_skill_names(history)
         target_skill = None
         app_name = _infer_app_name(history, None)
-        site_domain = _infer_site_domain(history, app_name)
+        site_domain = _infer_site_domain(history, app_name, str(ctx.get("task", "")))
         site_skill = None
         if site_domain:
             site_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))
@@ -311,7 +326,7 @@ class RunReflectionCallback(Callback):
         elif read_names:
             target_skill = find_skill_for_app(skill_groups, "", preferred_names=read_names)
             app_name = _infer_app_name(history, target_skill)
-            site_domain = _infer_site_domain(history, app_name)
+            site_domain = _infer_site_domain(history, app_name, str(ctx.get("task", "")))
 
         ui_actions = sum(
             1 for s in history
@@ -414,7 +429,7 @@ class RunReflectionCallback(Callback):
         skill_groups = ctx.get("skill_groups") or []
         read_names = _read_skill_names(history)
         app_name = _infer_app_name(history, None)
-        site_domain = _infer_site_domain(history, app_name)
+        site_domain = _infer_site_domain(history, app_name, str(ctx.get("task", "")))
         target_skill = None
         if site_domain:
             target_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))

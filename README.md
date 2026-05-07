@@ -5,7 +5,7 @@
 
 Open-source, local-first personal assistant for macOS. Sees your
 screen, drives your apps, remembers what you've done — using GPT-5.5
-or Claude Haiku 4.5 via your existing subscription. No API key.
+or Claude Haiku 4.5.
 
 > **Status: pre-alpha.** Working internals, reckless edges. It will
 > literally take over your mouse and keyboard.

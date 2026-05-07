@@ -2,6 +2,8 @@
 
 Subcommands:
     openseer task "<task>" [options]    drive the agent loop
+    openseer daemon                     run Telegram daemon in this process
+    openseer daemon-launcher            launch Terminal-hosted daemon
     openseer auth status                 show ChatGPT OAuth login state
     openseer auth login                  log in via Codex CLI's OAuth flow
     openseer auth logout                 wipe local tokens
@@ -91,12 +93,17 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     return run_daemon()
 
 
+def cmd_daemon_launcher(args: argparse.Namespace) -> int:
+    from .daemon_launcher import main as launcher_main
+    return launcher_main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="openseer",
         description="OpenSeer — chat-first, memory-aware macOS computer-use agent",
     )
-    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,daemon,auth,setup}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,daemon,daemon-launcher,auth,setup}")
 
     p_chat = sub.add_parser("chat", help="Interactive REPL (default if no args)")
     p_chat.set_defaults(func=cmd_chat)
@@ -114,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_daemon.set_defaults(func=cmd_daemon)
 
+    p_daemon_launcher = sub.add_parser(
+        "daemon-launcher",
+        help="Launch a Terminal-hosted daemon from launchd/watchdogs",
+    )
+    p_daemon_launcher.set_defaults(func=cmd_daemon_launcher)
+
     p_auth = sub.add_parser("auth", help="Manage ChatGPT OAuth login")
     sub_auth = p_auth.add_subparsers(dest="auth_cmd", metavar="{status,login,logout}")
     sub_auth.required = True
@@ -124,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "auth", "setup", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "-h", "--help"}
 
 
 def main() -> None:

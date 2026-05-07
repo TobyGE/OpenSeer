@@ -46,6 +46,7 @@ except Exception:
     _CG_AVAILABLE = False
 
 
+
 # AX roles that are worth surfacing to the model. AXGroup et al. are
 # layout-only and contribute noise without leaf labels.
 _INTERACTIVE_ROLES = frozenset({
@@ -190,77 +191,117 @@ def app_pid_by_name(name: str) -> int | None:
     return None
 
 
-# Terminal bundle IDs — these host OpenSeer itself, so AX of them is
-# useless and confusing for the model. When frontmost is one of these
-# we look for the next-most-recently-active app instead.
-_TERMINAL_BUNDLES = frozenset({
-    "com.googlecode.iterm2",
-    "com.apple.Terminal",
-    "io.alacritty",
-    "net.kovidgoyal.kitty",
-    "dev.warp.Warp-Stable",
-    "com.github.wez.wezterm",
-    "co.zeit.hyper",
-    "com.tabby.Tabby",
-})
-
-
-def app_has_visible_window(pid: int) -> bool:
-    """Cheap check: does this pid own at least one normal (layer 0)
-    on-screen window with non-trivial size? Used to decide whether
-    falling back to a tracked target app is safe — if the target's
-    window is occluded or minimized, clicking its AX bboxes would
-    punch through to whatever is actually on top."""
-    if not _CG_AVAILABLE or not pid:
-        return False
-    try:
-        infos = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
-        ) or []
-    except Exception:
-        return False
-    for w in infos:
-        try:
-            if int(w.get("kCGWindowOwnerPID", -1)) != pid:
-                continue
-            if int(w.get("kCGWindowLayer", 1)) != 0:
-                continue            # 0 = normal app window
-            b = w.get("kCGWindowBounds") or {}
-            wd = float(b.get("Width", 0))
-            ht = float(b.get("Height", 0))
-            if wd >= 100 and ht >= 100:
-                return True
-        except Exception:
-            continue
-    return False
+# When OpenSeer is running in daemon mode, daemon.py populates this
+# set with every pid that should be treated as "the daemon's host
+# terminal" — typically the terminal GUI app's pid PLUS its session
+# helper(s) (e.g. iTermServer is parented by launchd, not by the GUI).
+# We don't *block* AX of these pids — sometimes the user legitimately
+# wants to drive iTerm — we just annotate the rendered AX block so
+# the model knows it's looking at its own log window and can decide
+# whether to act on it or pivot to `get_app_state app="<target>"`.
+HOST_TERMINAL_PIDS: set[int] = set()
 
 
 def active_app_pid(target_pid: int | None = None) -> int | None:
-    """Pick the pid whose AX tree should be exposed to the model.
+    """Return the system-frontmost app's pid, or None if unavailable.
 
-    Strict rule: only return a pid when that app is genuinely the
-    system frontmost. Any "fallback to a previously-targeted app
-    whose window is on-screen" path is unsafe — `click(index=...)`
-    resolves to an absolute screen coordinate, and if the target is
-    covered by another window (e.g. OpenSeer's terminal) the click
-    will hit the covering window, not the intended UI.
+    Uses Quartz's ``CGWindowListCopyWindowInfo`` (live z-order from the
+    window server) rather than ``NSWorkspace.frontmostApplication()``.
 
-    To target an app that's currently background, the model must call
-    `get_app_state(app="...")` which explicitly activates it first.
+    Why: NSWorkspace updates via NSDistributedNotificationCenter, which
+    only fires when CFRunLoop is pumped. Our daemon (and the REPL too)
+    runs as a CLI Python process with no Cocoa runloop, so NSWorkspace
+    silently caches whatever app was frontmost at process startup
+    (typically the host terminal). Even after the agent ``open_app``s
+    Chrome and Chrome IS visually on top (proven by screenshots),
+    NSWorkspace keeps reporting the terminal — so the AX dump targets
+    the wrong app and the model is operating blind on web pages.
 
-    `target_pid` is accepted for API stability but ignored — kept so
-    the agent loop's call site doesn't have to branch.
+    Quartz returns the live, runloop-independent z-order, so this
+    works correctly under daemon mode.
+
+    Falls back to NSWorkspace if Quartz isn't available (non-Mac /
+    sandboxed environments). ``target_pid`` is accepted for
+    backwards compatibility and ignored.
     """
-    if not _AX_AVAILABLE:
-        return None
-    ws = NSWorkspace.sharedWorkspace()
-    front = ws.frontmostApplication()
-    if front is None:
-        return None
-    bid = front.bundleIdentifier() or ""
-    if bid in _TERMINAL_BUNDLES:
-        return None
-    return int(front.processIdentifier())
+    if _CG_AVAILABLE:
+        try:
+            infos = CGWindowListCopyWindowInfo(
+                kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
+            ) or []
+        except Exception:
+            infos = []
+        for w in infos:
+            try:
+                # Layer 0 = normal app windows. Higher layers are menubar,
+                # dock, status items, screensaver, etc — never our target.
+                if int(w.get("kCGWindowLayer", 1)) != 0:
+                    continue
+                b = w.get("kCGWindowBounds") or {}
+                # Skip tiny/offscreen windows so a 1×1 helper or a
+                # collapsed window doesn't shadow the real frontmost.
+                if (float(b.get("Width", 0)) < 100
+                    or float(b.get("Height", 0)) < 100):
+                    continue
+                pid = int(w.get("kCGWindowOwnerPID", 0)) or None
+                if pid:
+                    return pid
+            except Exception:
+                continue
+    if _AX_AVAILABLE:
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is not None:
+            return int(front.processIdentifier())
+    return None
+
+
+def _terminal_app_pids_in_ancestry() -> set[int]:
+    """Return the set of pids in our parent chain that NSWorkspace /
+    AX would also recognise as terminal-emulator GUI apps.
+
+    Why a set rather than a single pid: iTerm's session lives in a
+    helper process (iTermServer-3) that's *parented by launchd*, while
+    the iTerm GUI app's pid is a sibling — we need both to flag AX
+    dumps that hit either. We also include any running Cocoa app whose
+    pid happens to be in our ancestry chain.
+    """
+    import os
+    import subprocess
+
+    chain: set[int] = set()
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            break
+        chain.add(pid)
+        try:
+            r = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2,
+            )
+            ppid = int((r.stdout or "0").strip() or 0)
+        except Exception:
+            break
+        if ppid == pid:
+            break
+        pid = ppid
+
+    pids: set[int] = set(chain)
+    # Cross-reference with NSWorkspace's running apps: iTerm's GUI pid
+    # may not be in our parent chain (because iTermServer is parented by
+    # launchd) but it'll be a running Cocoa app. Match by name family.
+    if _AX_AVAILABLE:
+        try:
+            for app in NSWorkspace.sharedWorkspace().runningApplications():
+                name = str(app.localizedName() or "").lower()
+                if any(k in name for k in (
+                    "iterm", "terminal", "warp", "tabby",
+                    "alacritty", "ghostty", "kitty", "wezterm", "hyper",
+                )):
+                    pids.add(int(app.processIdentifier()))
+        except Exception:
+            pass
+    return pids
 
 
 def dump_ax_tree(pid: int | None = None,
@@ -361,19 +402,35 @@ def dump_ax_tree(pid: int | None = None,
 def render_ax_for_prompt(elems: list[AXElem],
                          *,
                          max_lines: int = 80,
-                         app_name: str | None = None) -> str:
+                         app_name: str | None = None,
+                         pid: int | None = None) -> str:
     """Render an AX dump as a compact reference table for the prompt.
 
     Format (one line per element):
         idx=27  button   "人物传记,分组"   [781,240 106x193]
 
     Truncates at `max_lines` so a giant menu bar can't blow the prompt.
+
+    If ``pid`` is in ``HOST_TERMINAL_PIDS`` (daemon mode), the header
+    flags this as the daemon's own host terminal so the model can
+    pivot via ``get_app_state(app="<target>")`` instead of acting on
+    its own log output.
     """
     if not elems:
         return ""
     head = "## On-screen elements (accessibility tree)"
     if app_name:
         head += f" — {app_name}"
+    if pid is not None and pid in HOST_TERMINAL_PIDS:
+        head += (
+            "\n[NOTE] This IS the terminal hosting OpenSeer's daemon — "
+            "the [telegram]/[agent]/[step…] lines you may see in this "
+            "tree are the daemon's own log output, not part of the "
+            "task. Don't act on it unless the task explicitly involves "
+            "this terminal. To work on a different app, call "
+            '`get_app_state app="<name>"` to activate that app and dump '
+            "its AX tree directly."
+        )
     head += ("\nClick by index when present (more reliable than pixels). "
              "Static text rows are read-only.\n")
 

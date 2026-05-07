@@ -42,6 +42,7 @@ class Action:
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
+    selector: str | None = None    # for read_page: optional CSS selector to extract a specific element instead of full body
     status: str | None = None      # for terminate: "done" | "fail"
     reason: str | None = None
     thought: str | None = None
@@ -90,6 +91,153 @@ def _paste_unicode_preserving_clipboard(text: str) -> None:
         pb.clearContents()
         if saved:
             pb.writeObjects_(saved)
+
+
+# Browsers we know how to talk to via AppleScript.
+# Chromium-family apps share Chrome's `execute ... javascript` syntax.
+_CHROMIUM_BROWSERS = {
+    "Google Chrome", "Google Chrome Canary", "Google Chrome Beta",
+    "Arc", "Microsoft Edge", "Brave Browser", "Vivaldi", "Opera",
+}
+
+
+def _detect_frontmost_browser() -> str | None:
+    """Return the localized name of the frontmost browser app, or None."""
+    try:
+        from AppKit import NSWorkspace  # type: ignore[import-untyped]
+        front = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is None:
+            return None
+        name = str(front.localizedName() or "")
+        lower = name.lower()
+        if "safari" in lower:
+            return "Safari"
+        if name in _CHROMIUM_BROWSERS or any(
+            k in lower for k in ("chrome", "arc", "edge", "brave",
+                                  "vivaldi", "opera")):
+            return name if name in _CHROMIUM_BROWSERS else "Google Chrome"
+    except Exception:
+        return None
+    return None
+
+
+def _read_page(action: "Action", *, dry_run: bool) -> str:
+    """Extract page text from the active tab of a browser via AppleScript
+    JavaScript injection. Lets the agent consume a webpage's content in
+    one turn instead of scroll-and-screenshot loops.
+
+    Optional fields on the Action:
+      - ``url``: navigate the active tab to this URL first
+      - ``app``: target a specific browser (default: detect frontmost
+        browser, fall back to "Google Chrome")
+      - ``selector``: a CSS selector — if given, extract that element's
+        innerText instead of the full body
+
+    Requires the user to have enabled "Allow JavaScript from Apple
+    Events" once in the browser (Safari: Develop menu → Allow JS from
+    Apple Events; Chrome: View → Developer → Allow JavaScript from
+    Apple Events; Arc: same path as Chrome). Without that, AppleScript
+    refuses to run JS and we surface a clear error telling the user
+    where to enable it.
+    """
+    import json
+    app = (action.app or "").strip() or _detect_frontmost_browser() \
+        or "Google Chrome"
+    url = (action.url or "").strip()
+    selector = (action.selector or "").strip()
+
+    if dry_run:
+        return f"would read_page in {app!r}" + (f" after navigate {url}" if url else "")
+
+    # Step 1: optional navigation
+    if url:
+        if app == "Safari":
+            nav = f'tell application "Safari" to set URL of front document to "{url}"'
+        elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
+            nav = (f'tell application "{app}" to set URL of active tab '
+                   f'of front window to "{url}"')
+        else:
+            return (f"ERROR: read_page can't navigate {app!r}. Open the URL "
+                    f"first via `bash open '{url}'`, then call read_page.")
+        try:
+            r = subprocess.run(["osascript", "-e", nav],
+                               capture_output=True, text=True, timeout=8)
+        except subprocess.TimeoutExpired:
+            return f"ERROR: navigation to {url} timed out in {app}"
+        if r.returncode != 0:
+            err = (r.stderr or "").strip()
+            if "isn't running" in err.lower() or "not running" in err.lower():
+                return (f"ERROR: {app} isn't running. Use open_app or "
+                        f"`bash open -a \"{app}\"` first.")
+            return f"ERROR: navigation failed in {app}: {err[:300]}"
+        time.sleep(2.5)               # let the page load before we read
+
+    # Step 2: build JS to extract content
+    if selector:
+        js = ("(function(){"
+              f"var el=document.querySelector({json.dumps(selector)});"
+              "var txt=el?el.innerText:'(selector matched no element)';"
+              "return JSON.stringify({title:document.title,url:location.href,"
+              "content:txt.slice(0,8000)});})()")
+    else:
+        js = ("JSON.stringify({title:document.title,url:location.href,"
+              "content:(document.body?document.body.innerText:'').slice(0,8000)})")
+
+    js_for_as = js.replace("\\", "\\\\").replace('"', '\\"')
+    if app == "Safari":
+        applescript = (f'tell application "Safari" to do JavaScript '
+                       f'"{js_for_as}" in front document')
+    elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
+        applescript = (f'tell application "{app}" to execute front window\'s '
+                       f'active tab javascript "{js_for_as}"')
+    elif "firefox" in app.lower():
+        return ("ERROR: Firefox doesn't support AppleScript JS injection. "
+                "Use a Chromium browser (Chrome/Arc/Edge/Brave) or Safari, "
+                "or fall back to `bash + curl` for static content.")
+    else:
+        return f"ERROR: read_page doesn't know how to talk to {app!r}."
+
+    try:
+        r = subprocess.run(["osascript", "-e", applescript],
+                           capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return f"ERROR: {app} JS execution timed out (page may be stuck loading)"
+
+    if r.returncode != 0:
+        err = (r.stderr or "").strip()
+        # Surface the most common gotcha — the "Allow JavaScript from
+        # Apple Events" toggle isn't on by default — with explicit
+        # one-shot instructions so the model can tell the user.
+        low = err.lower()
+        if ("doesn't understand" in low and "execute" in low) \
+                or "javascript" in low and "allow" in low \
+                or "1743" in err:
+            menu = ("View → Developer → 'Allow JavaScript from Apple Events'"
+                    if app != "Safari"
+                    else "Develop → 'Allow JavaScript from Apple Events' "
+                         "(enable Develop menu first in Safari Settings → "
+                         "Advanced)")
+            return (f"ERROR: {app} refused JS injection. Enable it once via "
+                    f"the app's menu: {menu}. Then retry.")
+        if "isn't running" in low or "not running" in low:
+            return (f"ERROR: {app} isn't running. Use open_app or "
+                    f"`bash open -a \"{app}\"` first.")
+        return f"ERROR: AppleScript failed in {app}: {err[:300]}"
+
+    raw = (r.stdout or "").strip()
+    if not raw:
+        return f"(no content returned from {app})"
+    try:
+        data = json.loads(raw)
+        title = (data.get("title") or "").strip()
+        page_url = (data.get("url") or "").strip()
+        content = (data.get("content") or "").strip()
+        head = f"# {title}" if title else "# (untitled)"
+        return f"{head}\n{page_url}\n\n{content}"
+    except Exception:
+        # JSON parse failed — return raw text. Could happen if the page's
+        # JSON.stringify hit non-UTF-8 or the AppleScript truncated.
+        return raw[:8500]
 
 
 def execute(action: Action, *, dry_run: bool = True) -> str:
@@ -260,6 +408,9 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
             return f"would search: {q!r}"
         return web_search(q, count=int(action.amount or 5),
                           freshness=action.freshness)
+
+    if name == "read_page":
+        return _read_page(action, dry_run=dry_run)
 
     if name == "web_fetch":
         from .web import web_fetch

@@ -131,37 +131,27 @@ def _build_remote_notice(host_term: tuple[str, int] | None) -> str:
     if host_term:
         name, pid = host_term
         host_line = (
-            f"  - YOUR HOST TERMINAL is {name!r} (pid={pid}). The lines you see "
-            f"on screen prefixed with [telegram], [agent], [step…], [budget], "
-            f"[ax] ARE YOUR OWN LOG OUTPUT — not part of the task. NEVER click "
-            f"into {name!r}, NEVER type into it, NEVER switch its tabs. If "
-            f"{name!r} is frontmost and you can't see your target app, your "
-            f"first action MUST be open_app on the target — do NOT click around "
-            f"trying to surface a window.\n"
+            f"  - The terminal hosting this daemon is {name!r} (pid={pid}). "
+            f"Its AX tree will be flagged in the on-screen-elements block "
+            f"with a [NOTE] line. Don't act on the daemon's own log output. "
+            f"To work on a different app call "
+            f"`get_app_state app=\"<target>\"` to bring it forward and dump "
+            f"its AX directly.\n"
         )
     return (
-        "[OpenSeer is running in DAEMON mode, triggered remotely via Telegram chat. "
-        "The user is NOT looking at this Mac right now — they only see what you "
-        "send back through the channel. So:\n"
+        "[OpenSeer is running in DAEMON mode, triggered remotely via "
+        "Telegram chat. The user is NOT at this Mac right now — they only "
+        "see what you send back. So:\n"
         f"{host_line}"
-        "  - If the user's request is AMBIGUOUS or has no clear referent in this "
-        "    chat's prior tasks (e.g. '再跑一次' / 'do it again' with nothing in "
-        "    history), DO NOT guess from what's on screen. Immediately "
-        "    terminate(fail) with a reason asking the user to clarify.\n"
-        "  - DON'T assume 'user can see X' just because something is on this "
-        "    Mac's screen. The user is on their phone.\n"
-        "  - DESCRIBE what's on screen in your terminate.reason — not 'see "
-        "    attached' unless you actually attach (see next bullet).\n"
-        "  - To send images back: take a screenshot to a file (e.g. "
-        "    `bash screencapture -x ~/Desktop/proof.png`), then on terminate "
-        "    include `\"attachments\":[\"/Users/.../proof.png\"]` — the daemon "
-        "    will sendPhoto each path to the user's chat. PNG/JPG/GIF, ≤10 MB.\n"
-        "  - VERIFY the actual end state before terminate(done) — there is no "
-        "    human at the keyboard to catch a wrong claim.\n"
-        "  - AX may be empty for many turns (host terminal is blacklisted from "
-        "    AX). If AX is empty, your only signal is the screenshot — but "
-        "    don't act on what you see in the host terminal. open_app the "
-        "    target first; if open_app doesn't surface it, terminate(fail).]"
+        "  - If the request is AMBIGUOUS with no referent in this chat's "
+        "    prior tasks (e.g. 'do it again' with nothing in history), "
+        "    terminate(fail) and ask for clarification — don't guess.\n"
+        "  - DESCRIBE what's on screen in terminate.reason. To attach an "
+        "    image, take a screenshot to a file and include "
+        "    `\"attachments\":[\"/path.png\"]` on terminate "
+        "    (PNG/JPG/GIF, ≤10 MB).\n"
+        "  - VERIFY the actual end state before terminate(done) — no human "
+        "    will catch a wrong claim.]"
     )
 
 
@@ -399,6 +389,14 @@ def run_daemon() -> int:
     global _REMOTE_NOTICE
     host_term = _detect_host_terminal()
     _REMOTE_NOTICE = _build_remote_notice(host_term)
+    # Tell the AX layer which pids belong to the daemon's host
+    # terminal (GUI app pid + any session-helper pids in our parent
+    # chain — iTermServer is parented by launchd, so we need both).
+    # render_ax_for_prompt then flags the AX block with a [NOTE]
+    # whenever it's dumping any of these. We don't block — sometimes
+    # a task legitimately drives the terminal — we just annotate.
+    from . import ax as _ax_mod
+    _ax_mod.HOST_TERMINAL_PIDS = _ax_mod._terminal_app_pids_in_ancestry()
 
     cfg = _load_config()
     tg_cfg = cfg.get("telegram") or {}

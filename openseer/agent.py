@@ -103,7 +103,8 @@ Then a colon, why, and `Next: <plan>`. Be honest — fake SUCCESS labels compoun
 
   bash           run shell command. `cmd`, optional `cwd`, `timeout` (≤120s).
   web_search     `query`, optional `amount`, `freshness` ∈ day|week|month|year.
-  web_fetch      `url` → page text.
+  web_fetch      `url` → page text. Best for static pages; SPAs (X / LinkedIn / etc.) need read_page instead.
+  read_page      Extract the active browser tab's text via JavaScript. Optional `url` (navigate first), `app` (Safari/Chrome/Arc/etc. — default detects frontmost), `selector` (CSS, e.g. `"article"`, to grab a single element instead of the whole body). One call replaces 5+ scroll-and-screenshot turns on long web pages. Requires the user to enable "Allow JavaScript from Apple Events" once in their browser; the action returns a clear error with menu instructions if not.
   click          `index` (AX-tree, preferred when present) OR `x`, `y`. Optional `count`.
   type           `text` + one of: `index`, `x,y`, or NEITHER (use currently-focused field).
   key            `key` combo like `"cmd+a"`, `"enter"`, `"pageup"`, `"esc"`.
@@ -124,8 +125,8 @@ When the next decision needs to observe a new state, emit ONE action and stop.
 
   ✓ chainable: cmd+a → type → enter (focus stays put); two read-only bash commands.
   ✗ break after: click, open_app, scroll, navigating/closing key, bash that opens a file.
-  ✗ break after: read_skill, get_app_state, screenshot, web_search, web_fetch, reground —
-    each returns data the next decision depends on.
+  ✗ break after: read_skill, get_app_state, screenshot, web_search, web_fetch, read_page,
+    reground — each returns data the next decision depends on.
 
 Multiple separate `{{...}}{{...}}` JSON objects are FORBIDDEN — that is not chaining,
 that is scripting unobserved state. When in doubt, stay single.
@@ -261,6 +262,7 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
                  or fallback_thought),
         verified_by_steps=obj.get("verified_by_steps"),
         attachments=obj.get("attachments"),
+        selector=obj.get("selector"),
     )
 
 
@@ -312,7 +314,7 @@ def _parse_actions(raw: str) -> list[Action]:
 # `screenshot` do NOT count as evidence of having done the work.
 _PRODUCING_ACTIONS = {"click", "double_click", "type", "key", "scroll",
                       "open_app", "bash", "web_search", "web_fetch",
-                      "write_skill"}
+                      "read_page", "write_skill"}
 # `screenshot`, `get_app_state`, and `reground` are passive observers —
 # they do NOT produce or change the requested result. Citing only them
 # in `verified_by_steps` would let a run terminate done after merely
@@ -781,13 +783,15 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         if _AX_AVAILABLE:
             try:
                 emit(EventType.PREP_PHASE, phase="ax_tree")
-                # When OpenSeer's terminal is frontmost (the common
-                # REPL case), fall back to the most-recently-targeted
-                # app — the one the agent just `open_app`'d or
-                # `get_app_state`'d — so AX still reaches the actual
-                # task target instead of giving up.
-                ax_pid = active_app_pid(target_pid=ctx.get("target_pid"))
-                # Resolve app name from the queried pid (not "frontmost")
+                # Always dump AX of whatever app is frontmost — no
+                # blacklist. If the user is driving iTerm itself
+                # (legitimate task), the model gets iTerm's tree. In
+                # daemon mode the host-terminal pid is set on the ax
+                # module, and render_ax_for_prompt annotates the
+                # block so the model knows when it's looking at the
+                # daemon's own log window and can pivot to
+                # `get_app_state app="<target>"` for the real task.
+                ax_pid = active_app_pid()
                 ax_app_name = None
                 if ax_pid:
                     from AppKit import NSRunningApplication
@@ -795,14 +799,15 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                     ax_app_name = a.localizedName() if a else None
                 ax_elems = dump_ax_tree(ax_pid) if ax_pid else []
                 ax_block = render_ax_for_prompt(ax_elems,
-                                                app_name=ax_app_name)
+                                                app_name=ax_app_name,
+                                                pid=ax_pid)
                 emit(EventType.PREP_PHASE, phase="ax_done",
                      n_elements=len(ax_elems),
                      app=ax_app_name)
                 # Telemetry — make AX state visible in the trace so we
                 # can tell when a turn is running blind vs grounded.
                 if ax_pid is None:
-                    say(f"  [ax] pid=None (frontmost is terminal/blacklisted)")
+                    say(f"  [ax] pid=None (AX unavailable)")
                 elif not ax_elems:
                     say(f"  [ax] pid={ax_pid} app={ax_app_name!r} → "
                         "0 elements (app may be in immersive mode or AX-poor)")
@@ -973,15 +978,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                                 pass
                         elems = dump_ax_tree(target_pid)
                         result = render_ax_for_prompt(
-                            elems, app_name=target,
+                            elems, app_name=target, pid=target_pid,
                             max_lines=120,
                         ) or f"(AX returned 0 elements for {target!r})"
                 else:
                     pid = active_app_pid()
                     if pid is None:
-                        result = ("AX skipped — frontmost is OpenSeer's host "
-                                  "terminal. Pass `app: \"<name>\"` to query "
-                                  "a specific app explicitly.")
+                        result = ("AX unavailable on this system. Pass "
+                                  "`app: \"<name>\"` to query a specific "
+                                  "app explicitly, or grant Accessibility "
+                                  "permission in System Settings.")
                     else:
                         elems = dump_ax_tree(pid)
                         # Resolve app label from pid for the prompt.
@@ -989,7 +995,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                         a = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
                         app_label = a.localizedName() if a else None
                         result = render_ax_for_prompt(
-                            elems, app_name=app_label,
+                            elems, app_name=app_label, pid=pid,
                             max_lines=120,
                         ) or "(AX returned 0 elements — app may be in immersive mode)"
                 ann_path = out_dir / f"{label.replace('.', '_')}-action.png"

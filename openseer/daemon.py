@@ -35,9 +35,11 @@ from pathlib import Path
 
 from .agent import OAI_MODEL, run as agent_run
 from .callbacks.base import Callback
+from .callbacks.run_reflection import extract_skill_block
 from .events import EventType, TaskEvent
 from .inbox.sessions import ChatSessions, TaskSummary
-from .inbox.telegram import TelegramBot, TelegramMessage
+from .inbox.telegram import TelegramBot, TelegramCallback, TelegramMessage
+from .skills import parse_skill_text, write_user_skill
 
 
 _CONFIG_PATH = Path.home() / ".openseer" / "config.json"
@@ -260,6 +262,150 @@ def _canonical_status(history: list) -> tuple[str, str]:
     return "cap", result
 
 
+def _latest_trace_id() -> str | None:
+    """Return the newest trajectory id written by TrajectoryCallback."""
+    try:
+        latest = Path.home() / ".openseer" / "runs" / "latest"
+        if latest.is_symlink():
+            return latest.resolve().name
+    except Exception:
+        pass
+    return None
+
+
+def _trace_path_for_id(trace_id: str) -> Path | None:
+    safe = trace_id.replace("-", "").replace("_", "")
+    if not trace_id or not safe.isalnum():
+        return None
+    path = Path.home() / ".openseer" / "runs" / trace_id / "trace.md"
+    return path if path.exists() else None
+
+
+def _skill_body_from_trace(trace_id: str) -> str | None:
+    path = _trace_path_for_id(trace_id)
+    if path is None:
+        return None
+    try:
+        return extract_skill_block(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _skill_update_markup(trace_id: str) -> dict:
+    return {
+        "inline_keyboard": [[
+            {"text": "Apply skill update", "callback_data": f"skill_apply:{trace_id}"},
+            {"text": "Skip", "callback_data": f"skill_skip:{trace_id}"},
+        ]]
+    }
+
+
+def _maybe_send_skill_update_prompt(bot: TelegramBot, chat_id: int,
+                                    trace_id: str | None,
+                                    reply_to: int | None) -> None:
+    """Offer a Telegram button when reflection proposed a valid skill."""
+    if not trace_id:
+        return
+    skill_body = _skill_body_from_trace(trace_id)
+    if not skill_body:
+        return
+    parsed = parse_skill_text(skill_body)
+    if parsed is None:
+        print(f"  [telegram] skill proposal in trace {trace_id} has invalid frontmatter")
+        return
+    dry = write_user_skill(parsed.name, skill_body, dry_run=True)
+    if not dry.ok:
+        print(f"  [telegram] skill proposal in trace {trace_id} failed validation: {dry.error}")
+        return
+    text = (
+        "OpenSeer found a reusable skill update.\n\n"
+        f"Skill: {parsed.name}\n"
+        f"Trace: {trace_id}\n\n"
+        "Apply it now?"
+    )
+    try:
+        bot.send(chat_id, text, reply_to=reply_to,
+                 reply_markup=_skill_update_markup(trace_id))
+    except Exception as e:
+        print(f"  [telegram] skill update prompt failed: {e}")
+
+
+def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
+    data = cb.data or ""
+    print(f"\n[telegram] callback {cb.sender_name} ({cb.chat_id}) → {data!r}")
+    if not (data.startswith("skill_apply:") or data.startswith("skill_skip:")):
+        try:
+            bot.answer_callback(cb.callback_id, text="Unknown button", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    action, trace_id = data.split(":", 1)
+    if action == "skill_skip":
+        try:
+            bot.answer_callback(cb.callback_id, text="Skipped")
+        except Exception:
+            pass
+        try:
+            bot.edit(cb.chat_id, cb.message_id,
+                     f"Skipped skill update for trace {trace_id}.")
+        except Exception as e:
+            print(f"  [telegram] skill skip edit failed: {e}")
+        else:
+            print(f"  [telegram] skipped skill update from trace {trace_id}")
+        return
+
+    skill_body = _skill_body_from_trace(trace_id)
+    if not skill_body:
+        msg = f"No skill proposal found for trace {trace_id}."
+        try:
+            bot.answer_callback(cb.callback_id, text=msg, show_alert=True)
+        except Exception:
+            pass
+        try:
+            bot.edit(cb.chat_id, cb.message_id, msg)
+        except Exception as e:
+            print(f"  [telegram] skill apply missing trace failed: {e}")
+        return
+
+    parsed = parse_skill_text(skill_body)
+    if parsed is None:
+        msg = f"Skill proposal in trace {trace_id} has invalid frontmatter."
+        try:
+            bot.answer_callback(cb.callback_id, text="Invalid skill proposal", show_alert=True)
+        except Exception:
+            pass
+        try:
+            bot.edit(cb.chat_id, cb.message_id, msg)
+        except Exception as e:
+            print(f"  [telegram] invalid skill proposal edit failed: {e}")
+        return
+
+    res = write_user_skill(parsed.name, skill_body, dry_run=False)
+    if res.ok:
+        msg = f"Applied skill update: {parsed.name}\n{res.path}"
+        try:
+            bot.answer_callback(cb.callback_id, text="Applied")
+        except Exception:
+            pass
+        try:
+            bot.edit(cb.chat_id, cb.message_id, msg)
+        except Exception as e:
+            print(f"  [telegram] skill apply confirmation failed: {e}")
+        print(f"  [telegram] applied skill {parsed.name} from trace {trace_id}")
+        return
+
+    msg = f"Skill update was rejected by validation:\n{res.error}"
+    try:
+        bot.answer_callback(cb.callback_id, text="Skill rejected", show_alert=True)
+    except Exception:
+        pass
+    try:
+        bot.edit(cb.chat_id, cb.message_id, msg)
+    except Exception as e:
+        print(f"  [telegram] skill rejection edit failed: {e}")
+
+
 def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                      max_steps: int, confirm_each: bool):
     """Returns the on_message callback. Captures bot + session store."""
@@ -325,6 +471,7 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
 
         dur = time.time() - t0
         result = _format_result(history, dur)
+        trace_id = _latest_trace_id()
         # Edit ack with summary; if reason is long, send the rest as
         # one or more chunked follow-up messages (Telegram caps at 4096
         # chars per message — long terminate.reason values would be
@@ -360,16 +507,12 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
             except Exception as e:
                 print(f"  [telegram] sendPhoto failed for {path}: {e}")
 
+        _maybe_send_skill_update_prompt(
+            bot, msg.chat_id, trace_id, ack_msg_id or msg.message_id,
+        )
+
         # Record into session memory for the next message in this chat
         status, result_text = _canonical_status(history)
-        # Find trace_id from latest run (TrajectoryCallback wrote ~/.openseer/runs/<id>)
-        trace_id: str | None = None
-        try:
-            latest = Path.home() / ".openseer" / "runs" / "latest"
-            if latest.is_symlink():
-                trace_id = latest.resolve().name
-        except Exception:
-            pass
         sessions.append(msg.chat_id, TaskSummary(
             task=msg.text,
             status=status,
@@ -476,7 +619,7 @@ def run_daemon() -> int:
         confirm_each=bool(tg_cfg.get("confirm_each", False)),
     )
     try:
-        bot.poll(on_msg)
+        bot.poll(on_msg, on_callback=lambda cb: _handle_skill_callback(bot, cb))
     except KeyboardInterrupt:
         pass
     print("daemon: stopped.")

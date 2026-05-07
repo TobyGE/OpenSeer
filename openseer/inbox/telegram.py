@@ -92,6 +92,18 @@ class TelegramMessage:
     date: int                # unix seconds
 
 
+@dataclass
+class TelegramCallback:
+    """A Telegram inline-button callback_query."""
+    update_id: int
+    callback_id: str
+    chat_id: int
+    message_id: int
+    sender_id: int
+    sender_name: str
+    data: str
+
+
 class TelegramError(RuntimeError):
     pass
 
@@ -169,7 +181,8 @@ class TelegramBot:
 
     def send(self, chat_id: int, text: str, *,
              reply_to: int | None = None,
-             parse_mode: str | None = None) -> dict:
+             parse_mode: str | None = None,
+             reply_markup: dict | None = None) -> dict:
         """Single message (caller is responsible for length). Truncates
         to 4090 if over. Use ``send_long`` for multi-chunk delivery."""
         params = {"chat_id": chat_id, "text": text[:4090]}
@@ -177,6 +190,8 @@ class TelegramBot:
             params["reply_to_message_id"] = reply_to
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup:
+            params["reply_markup"] = json.dumps(reply_markup)
         return self._call("sendMessage", params, timeout=15.0)
 
     def send_long(self, chat_id: int, text: str, *,
@@ -265,7 +280,8 @@ class TelegramBot:
         return data["result"]
 
     def edit(self, chat_id: int, message_id: int, text: str, *,
-             parse_mode: str | None = None) -> dict | None:
+             parse_mode: str | None = None,
+             reply_markup: dict | None = None) -> dict | None:
         """Edit a previously-sent message in place. Returns None if
         Telegram rejects the edit (commonly: identical content; the API
         raises 'message is not modified' which we silently ignore so
@@ -277,6 +293,8 @@ class TelegramBot:
         }
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup:
+            params["reply_markup"] = json.dumps(reply_markup)
         try:
             return self._call("editMessageText", params, timeout=15.0)
         except TelegramError as e:
@@ -284,6 +302,17 @@ class TelegramBot:
             if "not modified" in es or "message is not modified" in es:
                 return None
             raise
+
+    def answer_callback(self, callback_query_id: str, *,
+                        text: str | None = None,
+                        show_alert: bool = False) -> dict:
+        params = {
+            "callback_query_id": callback_query_id,
+            "show_alert": json.dumps(bool(show_alert)),
+        }
+        if text:
+            params["text"] = text[:200]
+        return self._call("answerCallbackQuery", params, timeout=10.0)
 
     # ───── offset persistence ────────────────────────────────────────────
     def _load_offset(self) -> int:
@@ -305,13 +334,16 @@ class TelegramBot:
     def stop(self) -> None:
         self._stop.set()
 
-    def poll(self, on_message: Callable[[TelegramMessage], None]) -> None:
+    def poll(self, on_message: Callable[[TelegramMessage], None],
+             on_callback: Callable[[TelegramCallback], None] | None = None) -> None:
         """Long-poll forever. Blocks until stop() is called or process dies.
 
         Calls `on_message(msg)` for each NEW message that:
           - has text (we ignore stickers, voice, photos for now)
           - comes from an allowed chat_id (if allowlist set)
           - starts with trigger_prefix (if set)
+        Also dispatches inline-button callback_query updates to
+        ``on_callback`` when provided.
 
         on_message exceptions are caught and logged so one bad task
         doesn't kill the whole daemon.
@@ -321,7 +353,7 @@ class TelegramBot:
                 updates = self._call("getUpdates", {
                     "offset": self._offset,
                     "timeout": self.poll_timeout,
-                    "allowed_updates": json.dumps(["message"]),
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
                 }, timeout=self.poll_timeout + 10.0)
             except TelegramError as e:
                 # Transient — back off and retry
@@ -338,6 +370,39 @@ class TelegramBot:
                 if new_offset > self._offset:
                     self._offset = new_offset
                     self._save_offset(self._offset)
+                cb_obj = upd.get("callback_query")
+                if cb_obj:
+                    if on_callback is None:
+                        continue
+                    msg_for_cb = cb_obj.get("message") or {}
+                    chat = msg_for_cb.get("chat") or {}
+                    sender = cb_obj.get("from") or {}
+                    chat_id = int(chat.get("id", 0))
+                    if not self.allowed_chat_ids:
+                        print(f"  [telegram] no allowed_chat_ids configured — "
+                              f"dropped callback from chat_id={chat_id} "
+                              f"({sender.get('first_name', '?')}).")
+                        continue
+                    if chat_id not in self.allowed_chat_ids:
+                        print(f"  [telegram] dropped callback from non-allowed "
+                              f"chat_id={chat_id} ({sender.get('first_name', '?')})")
+                        continue
+                    cb = TelegramCallback(
+                        update_id=int(upd["update_id"]),
+                        callback_id=str(cb_obj.get("id", "")),
+                        chat_id=chat_id,
+                        message_id=int(msg_for_cb.get("message_id", 0)),
+                        sender_id=int(sender.get("id", 0)),
+                        sender_name=(sender.get("first_name") or sender.get("username")
+                                     or str(sender.get("id", 0))),
+                        data=str(cb_obj.get("data") or ""),
+                    )
+                    try:
+                        on_callback(cb)
+                    except Exception as e:
+                        print(f"  [telegram] on_callback raised: {e!r}")
+                    continue
+
                 msg_obj = upd.get("message")
                 if not msg_obj:
                     continue

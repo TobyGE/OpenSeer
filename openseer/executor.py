@@ -243,13 +243,18 @@ def _browser_current_url(app: str) -> str | None:
     return out or None
 
 
-def _browser_innertext_length(app: str) -> int | None:
-    """Lightweight load-stability probe: returns just the byte length
-    of document.body.innerText, not the text itself. ~30 ms per call
-    over AppleScript IPC, so we can poll it 3-4 times before doing a
-    full read_page fetch. Returns None on any failure (JS gated, app
-    closed, mid-navigation race)."""
-    js = "(document.body && document.body.innerText.length) || 0"
+def _browser_state_probe(app: str) -> dict | None:
+    """Lightweight load-stability probe. Single JS call returns both
+    ``document.title`` and ``document.body.innerText.length`` so the
+    poll loop has TWO signals: title change confirms the SPA has
+    actually navigated to a different page (DOM swapped, not just
+    location.href), and length tells us whether the new content has
+    finished rendering. ~30-50 ms per call.
+
+    Returns None on any failure (JS gated, app gone, page in transition).
+    """
+    js = ('JSON.stringify({title:document.title,'
+          'len:(document.body && document.body.innerText.length) || 0})')
     js_esc = js.replace("\\", "\\\\").replace('"', '\\"')
     app_esc = app.replace("\\", "\\\\").replace('"', '\\"')
     if app == "Safari":
@@ -269,14 +274,24 @@ def _browser_innertext_length(app: str) -> int | None:
         return None
     out = (r.stdout or "").strip()
     try:
-        return int(out)
-    except (ValueError, TypeError):
+        import json as _json
+        d = _json.loads(out)
+        return {"title": str(d.get("title") or ""),
+                "len": int(d.get("len") or 0)}
+    except Exception:
         return None
+
+
+def _browser_innertext_length(app: str) -> int | None:
+    """Backwards-compat wrapper around _browser_state_probe; returns
+    just the length component."""
+    s = _browser_state_probe(app)
+    return s["len"] if s else None
 
 
 def read_page_auto(app: str, *,
                    expect_change: bool = False,
-                   previous_length: int | None = None,
+                   previous_title: str | None = None,
                    settle_timeout: float = 3.5,
                    substantial_threshold: int = 6000,
                    stable_threshold: int = 2000,
@@ -313,48 +328,38 @@ def read_page_auto(app: str, *,
     cap = 5.0 if expect_change else settle_timeout
     deadline = time.monotonic() + cap
     last_len = -1
-    initial_len = -1
     samples = 0
-    saw_change = False
-    # Distinguishing "stale OLD DOM" from "already-rendered NEW DOM"
-    # purely by length samples is impossible — both look stable. We
-    # need external signal. When expect_change=True the agent loop
-    # passes `previous_length` (innerText size of the page we had
-    # cached BEFORE this navigation): if the current sample length
-    # diverges from that meaningfully, we know the SPA has already
-    # swapped; if it stays close, the swap hasn't happened yet.
-    # When previous_length isn't available, fall back to "deviated
-    # from FIRST sample" — less precise but still better than nothing.
-    change_threshold = 0.20
+    # `document.title` is the right signal for "did the SPA actually
+    # navigate to a new page?". location.href flips synchronously on
+    # pushState (so URL change alone says nothing about DOM swap), but
+    # most SPAs update the title only after the new page's data is
+    # ready. innerText length is unreliable: similar pages (e.g. two
+    # X searches) can have nearly identical lengths, and our cached
+    # text is truncated, so a length comparison would fire false
+    # positives on long pages. When previous_title is provided and
+    # the current title still equals it, we know the swap hasn't
+    # happened yet — keep waiting. When it differs, treat that as
+    # confirmation and let the stability/fast-path checks proceed.
+    saw_change = (not expect_change) or (previous_title in (None, ""))
     while time.monotonic() < deadline:
-        cur = _browser_innertext_length(app)
-        if cur is None:
+        s = _browser_state_probe(app)
+        if s is None:
             return None                           # JS gated / app gone
+        cur_title, cur_len = s["title"], s["len"]
         samples += 1
-        if initial_len < 0:
-            initial_len = cur
-        if not saw_change:
-            ref = previous_length if previous_length is not None else initial_len
-            if ref > 0:
-                delta = abs(cur - ref) / ref
-                if delta >= change_threshold:
-                    saw_change = True
-        # Fast-path is unsafe right after navigation (stale DOM still
-        # has the old content's length). Only honour it when the URL
-        # is unchanged OR we already see this is a different page from
-        # the cache (saw_change via previous_length).
-        if (samples == 1 and cur >= substantial_threshold
-                and (not expect_change or saw_change)):
+        if not saw_change and cur_title and cur_title != previous_title:
+            saw_change = True
+        # Fast path: first sample is already substantial AND we know
+        # this is the new page (saw_change True via title diff, or we
+        # weren't expecting a change at all). Otherwise we have to
+        # wait for the SPA to swap.
+        if (samples == 1 and cur_len >= substantial_threshold and saw_change):
             break
-        if samples >= 2 and cur >= stable_threshold and last_len > 0:
-            growth = abs(cur - last_len) / max(last_len, 1)
-            if growth < growth_tolerance:
-                # When expect_change=True, also require we've actually
-                # observed the SPA replacement (length deviated from
-                # the cached previous page or the first sample).
-                if not expect_change or saw_change:
-                    break
-        last_len = cur
+        if samples >= 2 and cur_len >= stable_threshold and last_len > 0:
+            growth = abs(cur_len - last_len) / max(last_len, 1)
+            if growth < growth_tolerance and saw_change:
+                break
+        last_len = cur_len
         # Don't sleep past the deadline; just exit and use what we have.
         if time.monotonic() + poll_interval >= deadline:
             break

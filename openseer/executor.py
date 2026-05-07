@@ -101,6 +101,42 @@ _CHROMIUM_BROWSERS = {
 }
 
 
+_BROWSER_ALIASES = (
+    # (substring lower-cased, canonical AppleScript app name)
+    ("chrome canary", "Google Chrome Canary"),
+    ("chrome beta", "Google Chrome Beta"),
+    ("google chrome", "Google Chrome"),
+    ("chrome", "Google Chrome"),
+    ("microsoft edge", "Microsoft Edge"),
+    ("edge", "Microsoft Edge"),
+    ("brave browser", "Brave Browser"),
+    ("brave", "Brave Browser"),
+    ("safari", "Safari"),
+    ("arc", "Arc"),
+    ("vivaldi", "Vivaldi"),
+    ("opera", "Opera"),
+    ("firefox", "Firefox"),
+)
+
+
+def _canonicalize_browser(name: str) -> str:
+    """Map common aliases ("Chrome", "Edge", "Brave") to the exact app
+    names AppleScript's `tell application "..."` expects ("Google
+    Chrome", "Microsoft Edge", "Brave Browser"). Returns ``name``
+    unchanged if no alias matches — that lets unknown values flow
+    through to the executor's existing error path.
+    """
+    if not name:
+        return name
+    if name in _CHROMIUM_BROWSERS or name == "Safari":
+        return name
+    lower = name.strip().lower()
+    for substr, canonical in _BROWSER_ALIASES:
+        if substr in lower:
+            return canonical
+    return name
+
+
 def _detect_frontmost_browser() -> str | None:
     """Return the localized name of the frontmost browser app, or None.
 
@@ -122,25 +158,13 @@ def _detect_frontmost_browser() -> str | None:
         name = str(ra.localizedName() or "") if ra is not None else ""
     except Exception:
         return None
-    lower = name.lower()
-    if "safari" in lower:
-        return "Safari"
-    if name in _CHROMIUM_BROWSERS:
-        return name
-    # Common Chromium-family aliases — map to their canonical app name
-    # so AppleScript's `tell application "..."` resolves correctly.
-    for keyword, canonical in (
-        ("chrome canary", "Google Chrome Canary"),
-        ("chrome beta", "Google Chrome Beta"),
-        ("chrome", "Google Chrome"),
-        ("arc", "Arc"),
-        ("brave", "Brave Browser"),
-        ("edge", "Microsoft Edge"),
-        ("vivaldi", "Vivaldi"),
-        ("opera", "Opera"),
-    ):
-        if keyword in lower:
-            return canonical
+    canonical = _canonicalize_browser(name)
+    # Only return when the canonicalized result is actually a known
+    # browser — otherwise (e.g. frontmost is Notes / Mail / Slack)
+    # we want None so the caller falls back to the default.
+    if canonical == "Safari" or canonical in _CHROMIUM_BROWSERS \
+            or canonical == "Firefox":
+        return canonical
     return None
 
 
@@ -164,8 +188,9 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
     where to enable it.
     """
     import json
-    app = (action.app or "").strip() or _detect_frontmost_browser() \
-        or "Google Chrome"
+    app_arg = (action.app or "").strip()
+    app = _canonicalize_browser(app_arg) if app_arg \
+        else (_detect_frontmost_browser() or "Google Chrome")
     url = (action.url or "").strip()
     selector = (action.selector or "").strip()
 

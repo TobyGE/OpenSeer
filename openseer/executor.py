@@ -325,10 +325,6 @@ def read_page_auto(app: str, *,
     Defaults: 3.5s timeout for steady pages, bumped to 5s when
     expect_change=True to cover slower SPA renders.
     """
-    cap = 5.0 if expect_change else settle_timeout
-    deadline = time.monotonic() + cap
-    last_len = -1
-    samples = 0
     # `document.title` is the right signal for "did the SPA actually
     # navigate to a new page?". location.href flips synchronously on
     # pushState (so URL change alone says nothing about DOM swap), but
@@ -336,11 +332,21 @@ def read_page_auto(app: str, *,
     # ready. innerText length is unreliable: similar pages (e.g. two
     # X searches) can have nearly identical lengths, and our cached
     # text is truncated, so a length comparison would fire false
-    # positives on long pages. When previous_title is provided and
-    # the current title still equals it, we know the swap hasn't
-    # happened yet — keep waiting. When it differs, treat that as
-    # confirmation and let the stability/fast-path checks proceed.
-    saw_change = (not expect_change) or (previous_title in (None, ""))
+    # positives on long pages.
+    #
+    # `expect_change` is only meaningful when we have something to
+    # compare against (previous_title). Without a previous_title, we
+    # have no concrete way to verify the swap happened — and there's
+    # also no cached old content for the model to be misled by, so
+    # the stale-protection isn't needed. Degrade to the non-navigation
+    # path (length-only stability sampling) in that case.
+    if expect_change and not previous_title:
+        expect_change = False
+    cap = 5.0 if expect_change else settle_timeout
+    deadline = time.monotonic() + cap
+    last_len = -1
+    samples = 0
+    saw_change = not expect_change
     while time.monotonic() < deadline:
         s = _browser_state_probe(app)
         if s is None:

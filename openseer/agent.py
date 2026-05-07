@@ -835,11 +835,17 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             if is_browser:
                 emit(EventType.PREP_PHASE, phase="page_probe", app=canon_app)
                 cur_url = _browser_current_url(canon_app)
-                last_url = ctx.get("_browser_last_url")
-                if cur_url and cur_url != last_url:
+                # Cache key includes the app, not just the URL. Two
+                # browsers showing the same URL (e.g. Chrome and Safari
+                # both on x.com) are different sessions with different
+                # cookies / DOM state, so a frontmost-app change must
+                # trigger a fresh fetch even when the URL string matches.
+                last_key = ctx.get("_browser_last_key")
+                cur_key = (canon_app, cur_url) if cur_url else None
+                if cur_key and cur_key != last_key:
                     page_text = read_page_auto(canon_app)
                     if page_text:
-                        ctx["_browser_last_url"] = cur_url
+                        ctx["_browser_last_key"] = cur_key
                         # Tag with the URL so the model can tell
                         # "this is the page I'm currently looking at"
                         # vs. an older read_page call from history.

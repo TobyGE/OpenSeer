@@ -1,14 +1,11 @@
 # OpenSeer
 
-> **Sees. Remembers. Acts.**
-> Computer-use, but it actually knows you.
+Open-source, local-first computer-use agent for macOS. Sees your
+screen, drives your apps, remembers what you've done — powered by
+GPT-5.5 or Claude Haiku 4.5.
 
-Open-source, local-first personal assistant for macOS. Sees your
-screen, drives your apps, remembers what you've done — using GPT-5.5
-or Claude Haiku 4.5.
-
-> **Status: pre-alpha.** Working internals, reckless edges. It will
-> literally take over your mouse and keyboard.
+**Pre-alpha.** Working internals, reckless edges. It will literally
+take over your mouse and keyboard.
 
 ## Quick start
 

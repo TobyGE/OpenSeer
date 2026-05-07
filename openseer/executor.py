@@ -325,28 +325,33 @@ def read_page_auto(app: str, *,
     Defaults: 3.5s timeout for steady pages, bumped to 5s when
     expect_change=True to cover slower SPA renders.
     """
-    # `document.title` is the right signal for "did the SPA actually
-    # navigate to a new page?". location.href flips synchronously on
-    # pushState (so URL change alone says nothing about DOM swap), but
-    # most SPAs update the title only after the new page's data is
-    # ready. innerText length is unreliable: similar pages (e.g. two
-    # X searches) can have nearly identical lengths, and our cached
-    # text is truncated, so a length comparison would fire false
-    # positives on long pages.
+    # Two independent concerns:
     #
-    # `expect_change` is only meaningful when we have something to
-    # compare against (previous_title). Without a previous_title, we
-    # have no concrete way to verify the swap happened — and there's
-    # also no cached old content for the model to be misled by, so
-    # the stale-protection isn't needed. Degrade to the non-navigation
-    # path (length-only stability sampling) in that case.
-    if expect_change and not previous_title:
-        expect_change = False
+    # 1. How long to wait? `expect_change=True` keeps a longer 5s cap
+    #    so slow first-time navigations and retries after a failed
+    #    fetch get enough time to render. The steady-page case uses
+    #    settle_timeout (3.5s default).
+    #
+    # 2. Stale-DOM protection? Only meaningful when we have a previous
+    #    cached page that the model could be misled by — represented
+    #    here by `previous_title` (the title from the last cache).
+    #    `document.title` is the right swap signal for SPAs: most
+    #    update the title only after the new page-data is rendered,
+    #    while location.href flips synchronously on pushState.
+    #    innerText.length is unreliable (similar pages can have
+    #    near-identical lengths; cached_text is truncated, so length
+    #    comparisons false-positive on long pages).
+    #
+    # When previous_title is missing (first nav in session or after a
+    # prior fetch failed), there's no cache to be stale against — keep
+    # the longer timeout but allow the fast-path to fire on the first
+    # substantial sample.
     cap = 5.0 if expect_change else settle_timeout
     deadline = time.monotonic() + cap
     last_len = -1
     samples = 0
-    saw_change = not expect_change
+    needs_swap_signal = bool(expect_change and previous_title)
+    saw_change = not needs_swap_signal
     while time.monotonic() < deadline:
         s = _browser_state_probe(app)
         if s is None:

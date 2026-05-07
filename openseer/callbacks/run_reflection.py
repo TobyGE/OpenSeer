@@ -15,15 +15,19 @@ from typing import Any
 from .base import Callback
 from ..skills import (
     canonical_skill_name,
+    find_skill,
     find_skill_for_app,
     parse_skill_text,
+    slugify_app,
     write_user_skill,
 )
 
 
 _SKILL_BLOCK_RE = re.compile(r"```skill-md\s*\n(.*?)\n```", re.DOTALL)
 _APP_FROM_AX_RE = re.compile(r"accessibility tree\)\s+—\s+(.+)")
+_URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?:[/:?#]|$)")
 _MAX_RESULT = 500
+_BROWSER_APPS = {"google chrome", "chrome", "safari", "firefox", "arc", "microsoft edge"}
 
 
 REFLECTION_PROMPT = """You are OpenSeer's post-run reflection pass.
@@ -46,6 +50,10 @@ Rules:
 - If an existing skill target is provided, update that exact skill name.
 - Do not create task-specific skills such as wechat-message or wechat-group.
 - One macOS app should usually have one CU skill named <app-slug>-mac.
+- For browser-hosted websites, do not put site-specific facts into a generic
+  browser skill such as google-chrome-mac. If a site target is provided, update
+  or create that exact <site>-web skill and keep `requires.apps` set to the
+  browser app used.
 - If proposing a skill update, output one full merged SKILL.md body in a
   ```skill-md fenced block. Preserve existing verified facts and add only
   evidence-backed new facts.
@@ -150,6 +158,50 @@ def _read_skill_names(history: list[Any]) -> list[str]:
     return out
 
 
+def _domain_from_host(host: str) -> str:
+    host = (host or "").strip().lower().lstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _site_slug_from_domain(domain: str) -> str:
+    parts = [p for p in _domain_from_host(domain).split(".") if p]
+    if len(parts) >= 3 and parts[-2] in {"co", "com", "net", "org"}:
+        parts = parts[:-2]
+    elif len(parts) >= 2:
+        parts = parts[:-1]
+    return slugify_app(" ".join(parts) or domain)
+
+
+def canonical_site_skill_name(domain: str) -> str:
+    return f"{_site_slug_from_domain(domain)}-web"
+
+
+def _infer_site_domain(history: list[Any], app_name: str) -> str:
+    if (app_name or "").strip().lower() not in _BROWSER_APPS:
+        return ""
+    counts: dict[str, int] = {}
+    for s in history:
+        a = s.action
+        fields = [
+            getattr(a, "url", None),
+            getattr(a, "text", None),
+            getattr(a, "cmd", None),
+            getattr(a, "thought", None),
+            s.result or "",
+        ]
+        for value in fields:
+            for m in _URL_RE.finditer(str(value or "")):
+                domain = _domain_from_host(m.group(1))
+                if not domain:
+                    continue
+                counts[domain] = counts.get(domain, 0) + 1
+    if not counts:
+        return ""
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
 def _build_step_digest(history: list[Any]) -> str:
     lines: list[str] = []
     for s in history:
@@ -235,11 +287,19 @@ class RunReflectionCallback(Callback):
         read_names = _read_skill_names(history)
         target_skill = None
         app_name = _infer_app_name(history, None)
-        if app_name:
+        site_domain = _infer_site_domain(history, app_name)
+        site_skill = None
+        if site_domain:
+            site_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))
+
+        if site_skill is not None:
+            target_skill = site_skill
+        elif app_name:
             target_skill = find_skill_for_app(skill_groups, app_name, preferred_names=read_names)
         elif read_names:
             target_skill = find_skill_for_app(skill_groups, "", preferred_names=read_names)
             app_name = _infer_app_name(history, target_skill)
+            site_domain = _infer_site_domain(history, app_name)
 
         ui_actions = sum(
             1 for s in history
@@ -251,20 +311,25 @@ class RunReflectionCallback(Callback):
             expected_skill_name = target_skill.name
             if ui_actions >= 4 or read_names:
                 existing_body = target_skill.path.read_text(encoding="utf-8")
+        elif site_domain and ui_actions >= 4:
+            expected_skill_name = canonical_site_skill_name(site_domain)
         elif app_name and ui_actions >= 4:
             expected_skill_name = canonical_skill_name(app_name)
 
         skill_target = "none"
         if expected_skill_name:
+            target_kind = "website" if site_domain and expected_skill_name.endswith("-web") else "app"
             skill_target = (
                 f"{'update existing' if target_skill else 'create new'} `{expected_skill_name}` "
-                f"for app {app_name!r}. If you propose a skill, the frontmatter "
-                f"name MUST be exactly {expected_skill_name!r}."
+                f"for {target_kind} {site_domain or app_name!r} using app {app_name!r}. "
+                f"If you propose a skill, the frontmatter name MUST be exactly "
+                f"{expected_skill_name!r}."
             )
         user_text = (
             f"TASK:\n{ctx.get('task', '')}\n\n"
             f"FINAL STATUS:\n{json.dumps(final, ensure_ascii=False)}\n\n"
             f"PRIMARY APP:\n{app_name or '(unknown)'}\n\n"
+            f"PRIMARY WEBSITE:\n{site_domain or '(none)'}\n\n"
             f"SKILL TARGET:\n{skill_target}\n\n"
             f"STEPS:\n{_build_step_digest(history)}\n"
         )
@@ -337,9 +402,16 @@ class RunReflectionCallback(Callback):
         skill_groups = ctx.get("skill_groups") or []
         read_names = _read_skill_names(history)
         app_name = _infer_app_name(history, None)
-        target_skill = find_skill_for_app(skill_groups, app_name, preferred_names=read_names) if app_name or read_names else None
+        site_domain = _infer_site_domain(history, app_name)
+        target_skill = None
+        if site_domain:
+            target_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))
+        if target_skill is None and (app_name or read_names):
+            target_skill = find_skill_for_app(skill_groups, app_name, preferred_names=read_names)
         if target_skill is not None:
             return target_skill.name
+        if site_domain:
+            return canonical_site_skill_name(site_domain)
         if app_name:
             return canonical_skill_name(app_name)
         return proposed_name

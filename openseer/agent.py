@@ -152,7 +152,7 @@ that is scripting unobserved state. When in doubt, stay single.
  - Manage the screen state you create. Close dead-ends (`key cmd+w`) before the next candidate; zoom in (`key cmd+=`, scroll, open at full size) when content is too small to identify confidently — don't guess at thumbnails.
  - Tools compose: `bash` enumerates/renders → CU clicks/zooms inspect → `bash open` the chosen target. If your thought says "zoom"/"scroll"/"select", the next action is a CU key/click, not another bash.
  - Driving an unfamiliar app? `web_search` its shortcuts/layout BEFORE clicking around — one search turn saves five guess-clicks.
- - **Reading a webpage's content** (posts, articles, search results, threads, "what does this page say"): `read_page` is the default — ONE call dumps the active tab's full innerText. Do NOT scroll-and-screenshot through long pages turn after turn. `read_page` works on SPAs (X / LinkedIn / Substack / etc.) where `web_fetch`/curl get empty shells. If you need only one section, pass `selector="article"` / `"main"`. Combine with `url=...` to navigate first in the same call. Reserve scroll-and-screenshot for tasks that need *visual* layout (charts, images, video) — for *text*, use `read_page`.
+ - **Reading a webpage's content** (posts, articles, search results, threads, "what does this page say"): the agent loop AUTO-FETCHES the active browser tab's innerText every turn the URL changes — look for the `## Page content (auto-fetched via read_page)` block in the on-screen-elements section, and READ THAT instead of scrolling. It's the same data the explicit `read_page` action returns, just delivered without you having to ask. If you need a fresh fetch on the same URL (SPA loaded more content via JS without a URL change), call `read_page` explicitly. Reserve scroll-and-screenshot for tasks that need *visual* layout (charts, images, video).
 
 ## Persist what you just learned
 
@@ -818,6 +818,48 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             except Exception as e:
                 say(f"  [ax] dump failed: {e}")
         ctx["ax_elems"] = ax_elems
+
+        # ── Auto-fetched browser page text ────────────────────────────
+        # Prompt-only nudges to use `read_page` keep failing — models
+        # default to scroll-and-screenshot. Treat the active browser
+        # tab's innerText as another perception channel (peer of AX):
+        # auto-fetch on every turn whose frontmost is a browser, but
+        # only re-attach when the URL changed since last turn (the
+        # cached text is already in conversation history).
+        try:
+            from .executor import (_canonicalize_browser, _CHROMIUM_BROWSERS,
+                                   _browser_current_url, read_page_auto)
+            canon_app = _canonicalize_browser(ax_app_name) if ax_app_name else ""
+            is_browser = (canon_app == "Safari"
+                          or canon_app in _CHROMIUM_BROWSERS)
+            if is_browser:
+                emit(EventType.PREP_PHASE, phase="page_probe", app=canon_app)
+                cur_url = _browser_current_url(canon_app)
+                last_url = ctx.get("_browser_last_url")
+                if cur_url and cur_url != last_url:
+                    page_text = read_page_auto(canon_app)
+                    if page_text:
+                        ctx["_browser_last_url"] = cur_url
+                        # Tag with the URL so the model can tell
+                        # "this is the page I'm currently looking at"
+                        # vs. an older read_page call from history.
+                        ax_block = (ax_block.rstrip()
+                                    + ("\n\n" if ax_block else "")
+                                    + "## Page content (auto-fetched "
+                                      "via read_page)\n"
+                                    + page_text + "\n")
+                        say(f"  [page] {canon_app} {cur_url[:80]}"
+                            f"{'…' if len(cur_url)>80 else ''} "
+                            f"({len(page_text)} chars)")
+                    else:
+                        say(f"  [page] {canon_app}: read_page failed "
+                            f"(JS perm off, or page mid-load) — "
+                            f"falling back to AX/screenshot")
+                elif cur_url:
+                    say(f"  [page] {canon_app}: same URL as last turn, "
+                        f"reusing cached page-text from history")
+        except Exception as e:
+            say(f"  [page] auto-fetch error: {e}")
 
         # build the multi-turn input, then let callbacks mutate it
         # (image retention dropping old screenshots happens here)

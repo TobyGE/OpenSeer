@@ -192,6 +192,51 @@ def _detect_frontmost_browser() -> str | None:
     return None
 
 
+def _browser_current_url(app: str) -> str | None:
+    """Cheap AppleScript probe for the active tab's URL. Doesn't
+    require "Allow JavaScript from Apple Events" — uses each
+    browser's native AppleScript dictionary, so it works even when
+    full read_page is gated by user permission. ~30–80 ms per call.
+
+    Returns None on any failure.
+    """
+    app_esc = app.replace("\\", "\\\\").replace('"', '\\"')
+    if app == "Safari":
+        script = f'tell application "{app_esc}" to URL of front document'
+    elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
+        script = (f'tell application "{app_esc}" to URL of active tab '
+                  f'of front window')
+    else:
+        return None
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    return out or None
+
+
+def read_page_auto(app: str) -> str | None:
+    """Auto-perception variant used by the agent loop. Returns the
+    page-text block on success, None on any failure (including the
+    "Allow JS from Apple Events" gate not being enabled). Failures
+    are intentionally silent — the agent loop has the screenshot +
+    AX as fallback signal and we don't want to clutter the user
+    prompt with auto-perception errors.
+    """
+    a = Action(name="read_page", app=app)
+    try:
+        result = _read_page(a, dry_run=False)
+    except Exception:
+        return None
+    if not result or result.startswith("ERROR") or result.startswith("("):
+        return None
+    return result
+
+
 def _read_page(action: "Action", *, dry_run: bool) -> str:
     """Extract page text from the active tab of a browser via AppleScript
     JavaScript injection. Lets the agent consume a webpage's content in

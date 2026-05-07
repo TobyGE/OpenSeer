@@ -57,7 +57,7 @@ OAuth for whichever you're missing. Provider choice persists to
   actually been doing on your Mac
 - Macro / shortcut evolution from repeated trajectories
 - Skill marketplace
-- Web channel (CLI + Telegram today)
+- Web channel
 - More grounders — Claude `computer_20251124`, OpenAI
   `computer-use-preview`, self-hosted UI-TARS
 

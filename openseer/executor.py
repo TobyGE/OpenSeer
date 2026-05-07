@@ -276,6 +276,7 @@ def _browser_innertext_length(app: str) -> int | None:
 
 def read_page_auto(app: str, *,
                    expect_change: bool = False,
+                   previous_length: int | None = None,
                    settle_timeout: float = 3.5,
                    substantial_threshold: int = 6000,
                    stable_threshold: int = 2000,
@@ -315,12 +316,16 @@ def read_page_auto(app: str, *,
     initial_len = -1
     samples = 0
     saw_change = False
-    # On SPAs the OLD DOM can stay completely unchanged for the first
-    # 1-3 seconds after pushState (length the same across multiple
-    # samples), then suddenly get replaced. We must observe that
-    # CHANGE happened before we accept the page as stable — otherwise
-    # we just capture the old content under the new URL.
-    change_threshold = 0.20  # 20% length delta from initial = real swap
+    # Distinguishing "stale OLD DOM" from "already-rendered NEW DOM"
+    # purely by length samples is impossible — both look stable. We
+    # need external signal. When expect_change=True the agent loop
+    # passes `previous_length` (innerText size of the page we had
+    # cached BEFORE this navigation): if the current sample length
+    # diverges from that meaningfully, we know the SPA has already
+    # swapped; if it stays close, the swap hasn't happened yet.
+    # When previous_length isn't available, fall back to "deviated
+    # from FIRST sample" — less precise but still better than nothing.
+    change_threshold = 0.20
     while time.monotonic() < deadline:
         cur = _browser_innertext_length(app)
         if cur is None:
@@ -328,22 +333,25 @@ def read_page_auto(app: str, *,
         samples += 1
         if initial_len < 0:
             initial_len = cur
-        elif not saw_change:
-            delta = abs(cur - initial_len) / max(initial_len, 1)
-            if delta >= change_threshold:
-                saw_change = True
+        if not saw_change:
+            ref = previous_length if previous_length is not None else initial_len
+            if ref > 0:
+                delta = abs(cur - ref) / ref
+                if delta >= change_threshold:
+                    saw_change = True
         # Fast-path is unsafe right after navigation (stale DOM still
         # has the old content's length). Only honour it when the URL
-        # is unchanged.
-        if not expect_change and samples == 1 and cur >= substantial_threshold:
+        # is unchanged OR we already see this is a different page from
+        # the cache (saw_change via previous_length).
+        if (samples == 1 and cur >= substantial_threshold
+                and (not expect_change or saw_change)):
             break
         if samples >= 2 and cur >= stable_threshold and last_len > 0:
             growth = abs(cur - last_len) / max(last_len, 1)
             if growth < growth_tolerance:
                 # When expect_change=True, also require we've actually
                 # observed the SPA replacement (length deviated from
-                # initial). Otherwise the OLD DOM that hasn't been
-                # swapped yet looks identical between samples.
+                # the cached previous page or the first sample).
                 if not expect_change or saw_change:
                     break
         last_len = cur

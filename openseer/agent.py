@@ -865,7 +865,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                 # page block and let the agent rely on AX + screenshot.
                 page_text = cached_text if not key_changed else ""
                 if refetch:
-                    fresh = read_page_auto(canon_app, expect_change=key_changed)
+                    # Hand the OLD page's length to read_page_auto so
+                    # it can tell "DOM hasn't been swapped yet" (current
+                    # length matches old) from "new content already
+                    # rendered" (current length differs). Without this
+                    # signal, both look like a stable plateau.
+                    prev_len = (len(cached_text) if key_changed and cached_text
+                                else None)
+                    fresh = read_page_auto(canon_app,
+                                           expect_change=key_changed,
+                                           previous_length=prev_len)
                     if fresh:
                         page_text = fresh
                         ctx["_browser_last_key"] = cur_key

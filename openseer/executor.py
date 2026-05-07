@@ -193,28 +193,52 @@ def _detect_frontmost_browser() -> str | None:
 
 
 def _browser_current_url(app: str) -> str | None:
-    """Cheap AppleScript probe for the active tab's URL. Doesn't
-    require "Allow JavaScript from Apple Events" — uses each
-    browser's native AppleScript dictionary, so it works even when
-    full read_page is gated by user permission. ~30–80 ms per call.
+    """Probe the active tab's URL via JavaScript ``location.href``.
+
+    Why JS over AppleScript ``URL of active tab``: Chrome's
+    AppleScript URL property lags reality by 1-3 seconds during
+    navigation (verified in trace 08ebeeac — `cmd+L`+type+enter
+    fired at step3, but the AS URL property kept returning the
+    PRIOR page's URL through step 5). Running JS via "execute
+    javascript" / "do JavaScript" reads ``location.href`` in the
+    actual page context, so it reflects the current page as soon
+    as Chrome has navigated.
+
+    Requires the user to enable "Allow JavaScript from Apple
+    Events" in their browser (same gate as full read_page). Falls
+    back to AppleScript URL property if JS is gated.
 
     Returns None on any failure.
     """
+    js = "location.href"
+    js_esc = js.replace("\\", "\\\\").replace('"', '\\"')
     app_esc = app.replace("\\", "\\\\").replace('"', '\\"')
     if app == "Safari":
-        script = f'tell application "{app_esc}" to URL of front document'
+        script = (f'tell application "{app_esc}" to '
+                  f'do JavaScript "{js_esc}" in front document')
+        as_fallback = f'tell application "{app_esc}" to URL of front document'
     elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
-        script = (f'tell application "{app_esc}" to URL of active tab '
-                  f'of front window')
+        script = (f'tell application "{app_esc}" to execute front window\'s '
+                  f'active tab javascript "{js_esc}"')
+        as_fallback = (f'tell application "{app_esc}" to URL of active tab '
+                       f'of front window')
     else:
         return None
     try:
         r = subprocess.run(["osascript", "-e", script],
                            capture_output=True, text=True, timeout=3)
     except Exception:
-        return None
-    if r.returncode != 0:
-        return None
+        r = None
+    if r is None or r.returncode != 0:
+        # JS gated or page mid-transition — use the AppleScript
+        # property as a less-accurate fallback rather than failing.
+        try:
+            r = subprocess.run(["osascript", "-e", as_fallback],
+                               capture_output=True, text=True, timeout=3)
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None
     out = (r.stdout or "").strip()
     return out or None
 

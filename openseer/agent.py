@@ -1484,6 +1484,16 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             for a in actions:
                 if a.name == "open_app":
                     settle = max(settle, 1.5)
+                elif a.name == "key" and (a.key or "").lower() in (
+                        "enter", "return"):
+                    # `enter` after typing in a URL bar / search box
+                    # often kicks off a page load. The next prep_phase
+                    # captures the screenshot, AX, AND auto-fetches
+                    # browser page text — all of which read stale
+                    # state if we move on too fast. 1.5s gives the
+                    # navigation time to start so probes hit the new
+                    # page, not the old one.
+                    settle = max(settle, 1.5)
                 elif a.name in ("click", "type", "key", "scroll"):
                     settle = max(settle, 0.4)
             if settle > 0:

@@ -229,13 +229,26 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
     # Tolerance: models sometimes emit `{"status":"done"/"fail",...}` without
     # an explicit `action` field, treating `status` as the discriminator.
     # Infer `terminate` in that case so the user-visible flow doesn't break.
+    def _numbers_from_step_text(text: str) -> list[int]:
+        # Prefer explicit step references inside descriptive strings. This
+        # accepts "step 17 ..." but avoids accidentally treating product
+        # prices/weights in the same sentence as verification step ids.
+        step_refs = [int(n) for n in re.findall(r"\bstep\s*#?\s*(\d+)\b",
+                                                text, flags=re.IGNORECASE)]
+        if step_refs:
+            return step_refs
+        stripped = text.strip()
+        if re.fullmatch(r"\d+", stripped):
+            return [int(stripped)]
+        return [int(n) for n in re.findall(r"\d+", stripped)]
+
     def _verified_steps(v) -> list[int] | None:
         if v is None:
             return None
         if isinstance(v, int):
             return [v]
         if isinstance(v, str):
-            nums = [int(n) for n in re.findall(r"\d+", v)]
+            nums = _numbers_from_step_text(v)
             return nums or None
         if isinstance(v, list):
             out: list[int] = []
@@ -243,7 +256,7 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
                 if isinstance(it, int):
                     out.append(it)
                 elif isinstance(it, str):
-                    out.extend(int(n) for n in re.findall(r"\d+", it))
+                    out.extend(_numbers_from_step_text(it))
             return out or None
         return v
 

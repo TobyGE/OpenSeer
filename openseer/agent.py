@@ -865,7 +865,7 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                 # page block and let the agent rely on AX + screenshot.
                 page_text = cached_text if not key_changed else ""
                 if refetch:
-                    fresh = read_page_auto(canon_app)
+                    fresh = read_page_auto(canon_app, expect_change=key_changed)
                     if fresh:
                         page_text = fresh
                         ctx["_browser_last_key"] = cur_key

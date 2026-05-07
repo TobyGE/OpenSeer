@@ -275,6 +275,7 @@ def _browser_innertext_length(app: str) -> int | None:
 
 
 def read_page_auto(app: str, *,
+                   expect_change: bool = False,
                    settle_timeout: float = 3.5,
                    substantial_threshold: int = 6000,
                    stable_threshold: int = 2000,
@@ -285,30 +286,47 @@ def read_page_auto(app: str, *,
     page-text block, or None on any failure (silent: the agent loop
     has screenshot + AX as fallback).
 
-    Stability rules (any one of these stops the poll):
-      - first sample is already ≥ substantial_threshold chars (fast
-        path: page is clearly loaded, don't waste time waiting)
+    ``expect_change=True`` is set by the agent loop when the URL just
+    changed. SPAs (X / LinkedIn / Reddit / etc) use ``pushState``:
+    ``location.href`` flips synchronously, but the DOM's ``innerText``
+    keeps showing the OLD content for 1–3 s while the SPA fetches
+    and re-renders. With ``expect_change=False`` we'd hit the
+    fast-path on the very first sample (stale content >= 6000 chars
+    looks "loaded"), capture the old page under the new URL, and
+    confuse the model. With ``expect_change=True`` we skip the
+    fast-path and require a stability streak of at least two samples
+    so the new content has time to replace the old.
+
+    Stability rules (any one stops the poll):
+      - (only when expect_change=False) first sample is already
+        ≥ substantial_threshold chars → page is clearly loaded
       - latest sample is ≥ stable_threshold AND grew less than
-        growth_tolerance over the previous sample
-      - settle_timeout elapsed (give up waiting; fetch what's there)
+        growth_tolerance over the previous sample (need ≥ 2 samples
+        when expect_change=True so we observe the SPA replacement)
+      - settle_timeout elapsed → give up waiting; fetch what's there
       - probe failed (JS gated, page error) → return None
 
-    Defaults are tuned for SPAs (X / LinkedIn): typical render time
-    is 2-3s, so 3.5s cap covers the common case while still bailing
-    on truly stuck pages.
+    Defaults: 3.5s timeout for steady pages, bumped to 5s when
+    expect_change=True to cover slower SPA renders.
     """
-    deadline = time.monotonic() + settle_timeout
+    cap = 5.0 if expect_change else settle_timeout
+    deadline = time.monotonic() + cap
     last_len = -1
+    samples = 0
     while time.monotonic() < deadline:
         cur = _browser_innertext_length(app)
         if cur is None:
             return None                           # JS gated / app gone
-        if last_len < 0 and cur >= substantial_threshold:
-            break                                 # fast path
-        if last_len > 0 and cur >= stable_threshold:
+        samples += 1
+        # Fast-path is unsafe right after navigation (stale DOM still
+        # has the old content's length). Only honour it when the URL
+        # is unchanged.
+        if not expect_change and samples == 1 and cur >= substantial_threshold:
+            break
+        if samples >= 2 and cur >= stable_threshold and last_len > 0:
             growth = abs(cur - last_len) / max(last_len, 1)
             if growth < growth_tolerance:
-                break                             # converged
+                break
         last_len = cur
         # Don't sleep past the deadline; just exit and use what we have.
         if time.monotonic() + poll_interval >= deadline:

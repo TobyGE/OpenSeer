@@ -25,17 +25,6 @@ openseer              # drop into the chat shell
 OAuth for whichever you're missing. Provider choice persists to
 `~/.openseer/config.json`; override with `OPENSEER_PROVIDER=…`.
 
-```bash
-openseer "Open Calculator and compute 999 * 123"   # one-off
-openseer task --execute --confirm-each "..."       # step-by-step
-openseer daemon                                    # listen on Telegram
-```
-
-In the REPL: `/learn <app>` to research+save a SKILL.md, `/show`,
-`/history`, `/context`, `/reset`, `/help`. Suffix flags: `... --dry`,
-`... --steps 8`. Abort: corner-slam (pyautogui FAILSAFE) or `Ctrl+C`.
-Each run dumps a full trajectory to `~/.openseer/runs/<id>/`.
-
 ## What's in
 
 - **Two providers** — GPT-5.5 (Codex OAuth) and Haiku 4.5 (Claude

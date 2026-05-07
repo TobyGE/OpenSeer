@@ -18,8 +18,9 @@ step_idx (current 1-indexed during a step).
 from .base import Callback
 from .budget import BudgetCallback
 from .image_retention import ImageRetentionCallback
+from .run_reflection import RunReflectionCallback
 from .safety import SafetyCallback
 from .trajectory import TrajectoryCallback
 
 __all__ = ["Callback", "BudgetCallback", "ImageRetentionCallback",
-           "SafetyCallback", "TrajectoryCallback"]
+           "RunReflectionCallback", "SafetyCallback", "TrajectoryCallback"]

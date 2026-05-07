@@ -19,8 +19,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .callbacks import (
-    BudgetCallback, Callback, ImageRetentionCallback, SafetyCallback,
-    TrajectoryCallback,
+    BudgetCallback, Callback, ImageRetentionCallback, RunReflectionCallback,
+    SafetyCallback, TrajectoryCallback,
 )
 from .draw import annotate
 from .events import EventType, TaskEvent
@@ -63,7 +63,7 @@ else:
     OAI_MODEL = _OAI_MODEL
     _stream_full = _oai_stream
 from .screen import Frame, capture
-from .skills import find_skill, load_available, render_skill_index
+from .skills import find_skill, load_available, render_skill_index, write_user_skill
 
 
 SYSTEM_PROMPT = """You are OpenSeer, an autonomous macOS computer-use agent. \
@@ -591,6 +591,7 @@ def _default_callbacks(quiet: bool = False) -> list[Callback]:
     return [
         ImageRetentionCallback(n=4, mode="summary"),
         TrajectoryCallback(verbose=not quiet),
+        RunReflectionCallback(verbose=not quiet),
         BudgetCallback(max_input_tokens=300_000, max_output_tokens=30_000,
                        verbose=not quiet),
         SafetyCallback(mode="confirm"),
@@ -731,6 +732,10 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
         "history": history, "trace_id": trace_id,
         "started_at": time.time(),
         "session_context": session_context,    # prefix for first user msg, NOT stored as task
+        "skill_groups": skill_groups,
+        "all_skills": all_skills,
+        "skills_read_this_run": skills_read_this_run,
+        "stream_full": _stream_full,
     }
     def emit(t: str, **data) -> None:
         """Broadcast a typed event to every callback subscribed via on_event."""
@@ -1206,19 +1211,10 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                                     frame_hash=frame_hash)
                         record_step(step)
                         continue
-                import re as _re
-                from .skills import parse_skill as _parse
                 nm = (action.skill_name or "").strip()
                 body = action.skill_body or ""
-                # Strict allowlist for any value that ends up in a
-                # filesystem path. Rejects `..`, `/`, absolute paths,
-                # and weird unicode — see codex P1 (path traversal).
-                _ID_RE = _re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
                 if not nm or not body.strip():
                     result = "ERROR: write_skill needs `skill_name` and `skill_body`"
-                elif not _ID_RE.match(nm):
-                    result = (f"ERROR: skill_name {nm!r} must match "
-                              "[a-z0-9][a-z0-9_-]{0,63}")
                 elif (find_skill(skill_groups, nm) is not None
                       and nm not in skills_read_this_run):
                     # Skill exists and model hasn't loaded it this run —
@@ -1232,60 +1228,21 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                               f"(keep all prior verified facts, add new "
                               f"observations).")
                 else:
-                    # Parse-validate via a contained tmp dir under our
-                    # OWN skill root (we control the path; nm is already
-                    # validated above so no traversal here).
-                    tmp_dir = _USER_SKILLS_ROOT / "_tmp" / nm
-                    tmp = tmp_dir / "SKILL.md"
-                    if not dry_run:
-                        tmp_dir.mkdir(parents=True, exist_ok=True)
-                        tmp.write_text(body, encoding="utf-8")
+                    wr = write_user_skill(nm, body, dry_run=dry_run)
+                    if not wr.ok:
+                        result = f"ERROR: {wr.error}"
+                    elif dry_run:
+                        result = (f"would write skill {nm!r} "
+                                  f"({(wr.skill.family if wr.skill else 'cu') or 'cu'}) → "
+                                  f"{wr.path} [DRY-RUN]")
                     else:
-                        # In dry-run, parse from a real temp file outside
-                        # the skills tree so we don't leak partial state.
-                        import tempfile as _tf
-                        scratch = Path(_tf.mkdtemp())
-                        tmp_dir = scratch / nm
-                        tmp = tmp_dir / "SKILL.md"
-                        tmp_dir.mkdir(parents=True, exist_ok=True)
-                        tmp.write_text(body, encoding="utf-8")
-                    parsed = _parse(tmp)
-                    # Cleanup tmp.
-                    try:
-                        tmp.unlink()
-                        tmp_dir.rmdir()
-                        if not dry_run:
-                            (_USER_SKILLS_ROOT / "_tmp").rmdir()
-                        else:
-                            scratch.rmdir()
-                    except OSError:
-                        pass
-                    if parsed is None:
-                        result = ("ERROR: skill body has no valid frontmatter. "
-                                  "Must start with `---\\n...---\\n` containing "
-                                  "name/description/family.")
-                    elif parsed.name != nm:
-                        result = (f"ERROR: frontmatter name {parsed.name!r} "
-                                  f"doesn't match skill_name {nm!r}")
-                    else:
-                        family = parsed.family or "cu"
-                        if not _ID_RE.match(family):
-                            result = (f"ERROR: family {family!r} must match "
-                                      "[a-z0-9][a-z0-9_-]{0,63}")
-                        elif dry_run:
-                            result = (f"would write skill {nm!r} ({family}) → "
-                                      f"~/.openseer/skills/{family}/{nm}/SKILL.md "
-                                      "[DRY-RUN]")
-                        else:
-                            dest = _USER_SKILLS_ROOT / family / nm / "SKILL.md"
-                            dest.parent.mkdir(parents=True, exist_ok=True)
-                            dest.write_text(body, encoding="utf-8")
-                            # Refresh user-group skills (group 0) so the
-                            # new entry is visible to subsequent
-                            # read_skill / index renders within this run.
-                            skill_groups[0] = load_available(_USER_SKILLS_ROOT)
-                            all_skills[:] = [s for g in skill_groups for s in g]
-                            result = f"wrote skill {nm!r} ({family}) → {dest}"
+                        # Refresh user-group skills (group 0) so the
+                        # new entry is visible to subsequent
+                        # read_skill / index renders within this run.
+                        skill_groups[0] = load_available(_USER_SKILLS_ROOT)
+                        all_skills[:] = [s for g in skill_groups for s in g]
+                        result = (f"wrote skill {nm!r} "
+                                  f"({(wr.skill.family if wr.skill else 'cu') or 'cu'}) → {wr.path}")
                 ann_path = out_dir / f"{label.replace('.', '_')}-action.png"
                 frame.image.save(ann_path)
                 say(f"  [{label}] result:  {result}")

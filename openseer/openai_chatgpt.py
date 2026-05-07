@@ -131,7 +131,7 @@ def _stream_full(payload: dict, *, max_retries: int = 3,
                 _time.sleep(wait)
                 continue
             raise RuntimeError(f"HTTP {e.code}: {err_body}") from e
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt < max_retries:
                 wait = 2 ** attempt
                 print(f"  [retry] {type(e).__name__} attempt {attempt+1}/{max_retries+1}; "

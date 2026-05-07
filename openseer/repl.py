@@ -282,6 +282,7 @@ class _PrettyConsole(Callback):
             return
 
         if et == EventType.TASK_FAILED:
+            self._stop_thinking_ticker()
             self._commit()
             print(f"  {c('✗', RED)} task failed: {event.get('error', '')}")
             return
@@ -357,6 +358,16 @@ def _build_repl_callbacks() -> list[Callback]:
     cbs = _default_callbacks(quiet=True)
     cbs.append(_PrettyConsole())
     return cbs
+
+
+def _cleanup_repl_callbacks(cbs: list[Callback]) -> None:
+    for cb in cbs:
+        stop = getattr(cb, "_stop_thinking_ticker", None)
+        if callable(stop):
+            stop()
+        commit = getattr(cb, "_commit", None)
+        if callable(commit):
+            commit()
 
 
 HISTORY_FILE = Path.home() / ".openseer" / "repl-history"
@@ -654,6 +665,7 @@ def _run_task(task: str, opts: dict,
     # clean task (not the augmented one) — fixes a /history mismatch
     # where the displayed task was the prefixed context block.
     ctx_block = _build_session_context(session, variables)
+    callbacks = _build_repl_callbacks()
 
     t0 = time.time()
     try:
@@ -663,11 +675,12 @@ def _run_task(task: str, opts: dict,
             dry_run=opts["dry_run"],
             confirm_each=opts["confirm_each"],
             sleep_between=0.0,
-            callbacks=_build_repl_callbacks(),
+            callbacks=callbacks,
             session_context=ctx_block,
             quiet=True,
         )
     except KeyboardInterrupt:
+        _cleanup_repl_callbacks(callbacks)
         print(c("\n  ⏵ interrupted", YEL))
         # Still record the attempt so the next task's session context
         # reflects what the user was last working on. Without this, a
@@ -680,6 +693,7 @@ def _run_task(task: str, opts: dict,
         ))
         return
     except Exception as e:
+        _cleanup_repl_callbacks(callbacks)
         print(c(f"\n  ✗ {e}", RED))
         session.append(TaskSummary(
             task=task, status="error",
@@ -828,7 +842,7 @@ def repl() -> int:
         while True:
             try:
                 line = input(c("openseer ❯ ", BOLD, MAG))
-            except EOFError:
+            except (EOFError, KeyboardInterrupt):
                 print()
                 break
             line = line.strip()

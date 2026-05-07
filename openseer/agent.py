@@ -104,7 +104,7 @@ Then a colon, why, and `Next: <plan>`. Be honest — fake SUCCESS labels compoun
   bash           run shell command. `cmd`, optional `cwd`, `timeout` (≤120s).
   web_search     `query`, optional `amount`, `freshness` ∈ day|week|month|year.
   web_fetch      `url` → page text. Best for static pages; SPAs (X / LinkedIn / etc.) need read_page instead.
-  read_page      Extract the active browser tab's text via JavaScript. Optional `url` (navigate first), `app` (Safari/Chrome/Arc/etc. — default detects frontmost), `selector` (CSS, e.g. `"article"`, to grab a single element instead of the whole body). One call replaces 5+ scroll-and-screenshot turns on long web pages. Requires the user to enable "Allow JavaScript from Apple Events" once in their browser; the action returns a clear error with menu instructions if not.
+  read_page      READ a webpage's content (posts/articles/search results/threads). Returns the active browser tab's full innerText in one call — replaces 5+ scroll-and-screenshot turns and handles SPAs (X / LinkedIn / Substack / Reddit) where `web_fetch` returns empty shells. Optional `url` (navigate first, in the same call), `app` (Safari/Chrome/Arc/Brave/Edge — default = whatever's frontmost), `selector` (CSS like `"article"`/`"main"` for one section only). Use this for ANY task that says "summarize / read / browse / find X in posts / what does this page say". One-time setup: user enables "Allow JavaScript from Apple Events" in the browser's menu — the action returns a clear error with the menu path if not.
   click          `index` (AX-tree, preferred when present) OR `x`, `y`. Optional `count`.
   type           `text` + one of: `index`, `x,y`, or NEITHER (use currently-focused field).
   key            `key` combo like `"cmd+a"`, `"enter"`, `"pageup"`, `"esc"`.
@@ -152,6 +152,7 @@ that is scripting unobserved state. When in doubt, stay single.
  - Manage the screen state you create. Close dead-ends (`key cmd+w`) before the next candidate; zoom in (`key cmd+=`, scroll, open at full size) when content is too small to identify confidently — don't guess at thumbnails.
  - Tools compose: `bash` enumerates/renders → CU clicks/zooms inspect → `bash open` the chosen target. If your thought says "zoom"/"scroll"/"select", the next action is a CU key/click, not another bash.
  - Driving an unfamiliar app? `web_search` its shortcuts/layout BEFORE clicking around — one search turn saves five guess-clicks.
+ - **Reading a webpage's content** (posts, articles, search results, threads, "what does this page say"): `read_page` is the default — ONE call dumps the active tab's full innerText. Do NOT scroll-and-screenshot through long pages turn after turn. `read_page` works on SPAs (X / LinkedIn / Substack / etc.) where `web_fetch`/curl get empty shells. If you need only one section, pass `selector="article"` / `"main"`. Combine with `url=...` to navigate first in the same call. Reserve scroll-and-screenshot for tasks that need *visual* layout (charts, images, video) — for *text*, use `read_page`.
 
 ## Persist what you just learned
 

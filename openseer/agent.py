@@ -853,9 +853,17 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
                 #     scroll content that loads without a URL change)
                 stale = (turns_since >= 3
                          or (cached_text and len(cached_text) < 2000))
-                refetch = bool(cur_key and (cur_key != last_key or stale))
+                key_changed = bool(cur_key and cur_key != last_key)
+                refetch = bool(cur_key and (key_changed or stale))
 
-                page_text = cached_text
+                # Only reuse the cached text when the browser+URL still
+                # matches the cache. After navigation we MUST get fresh
+                # content; a failed refetch must NOT silently attach the
+                # previous page's text under a screenshot of the new
+                # page (would mislead the model into acting on stale
+                # data). When the new fetch fails, fall through with no
+                # page block and let the agent rely on AX + screenshot.
+                page_text = cached_text if not key_changed else ""
                 if refetch:
                     fresh = read_page_auto(canon_app)
                     if fresh:

@@ -102,22 +102,45 @@ _CHROMIUM_BROWSERS = {
 
 
 def _detect_frontmost_browser() -> str | None:
-    """Return the localized name of the frontmost browser app, or None."""
+    """Return the localized name of the frontmost browser app, or None.
+
+    Uses Quartz-based live frontmost detection (via ax.active_app_pid)
+    rather than NSWorkspace.frontmostApplication(): NSWorkspace caches
+    its answer and only updates when CFRunLoop is pumped, which our
+    CLI/daemon Python process never does. Reading the cached value
+    would mis-detect Safari/Arc/Edge as the host terminal in daemon
+    mode and silently fall back to Chrome — operating the wrong
+    browser is worse than asking the model to pass `app` explicitly.
+    """
     try:
-        from AppKit import NSWorkspace  # type: ignore[import-untyped]
-        front = NSWorkspace.sharedWorkspace().frontmostApplication()
-        if front is None:
+        from .ax import active_app_pid
+        from AppKit import NSRunningApplication  # type: ignore[import-untyped]
+        pid = active_app_pid()
+        if not pid:
             return None
-        name = str(front.localizedName() or "")
-        lower = name.lower()
-        if "safari" in lower:
-            return "Safari"
-        if name in _CHROMIUM_BROWSERS or any(
-            k in lower for k in ("chrome", "arc", "edge", "brave",
-                                  "vivaldi", "opera")):
-            return name if name in _CHROMIUM_BROWSERS else "Google Chrome"
+        ra = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        name = str(ra.localizedName() or "") if ra is not None else ""
     except Exception:
         return None
+    lower = name.lower()
+    if "safari" in lower:
+        return "Safari"
+    if name in _CHROMIUM_BROWSERS:
+        return name
+    # Common Chromium-family aliases — map to their canonical app name
+    # so AppleScript's `tell application "..."` resolves correctly.
+    for keyword, canonical in (
+        ("chrome canary", "Google Chrome Canary"),
+        ("chrome beta", "Google Chrome Beta"),
+        ("chrome", "Google Chrome"),
+        ("arc", "Arc"),
+        ("brave", "Brave Browser"),
+        ("edge", "Microsoft Edge"),
+        ("vivaldi", "Vivaldi"),
+        ("opera", "Opera"),
+    ):
+        if keyword in lower:
+            return canonical
     return None
 
 
@@ -149,13 +172,22 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
     if dry_run:
         return f"would read_page in {app!r}" + (f" after navigate {url}" if url else "")
 
+    # AppleScript string literal escaping: backslash + double-quote.
+    # Without this, a URL or app name containing `"` or `\` breaks
+    # the script — or worse, lets malicious input inject AppleScript
+    # commands. Same escape we use in open_app for app names.
+    def _as_esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+    app_esc = _as_esc(app)
+
     # Step 1: optional navigation
     if url:
+        url_esc = _as_esc(url)
         if app == "Safari":
-            nav = f'tell application "Safari" to set URL of front document to "{url}"'
+            nav = f'tell application "{app_esc}" to set URL of front document to "{url_esc}"'
         elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
-            nav = (f'tell application "{app}" to set URL of active tab '
-                   f'of front window to "{url}"')
+            nav = (f'tell application "{app_esc}" to set URL of active tab '
+                   f'of front window to "{url_esc}"')
         else:
             return (f"ERROR: read_page can't navigate {app!r}. Open the URL "
                     f"first via `bash open '{url}'`, then call read_page.")
@@ -183,12 +215,12 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
         js = ("JSON.stringify({title:document.title,url:location.href,"
               "content:(document.body?document.body.innerText:'').slice(0,8000)})")
 
-    js_for_as = js.replace("\\", "\\\\").replace('"', '\\"')
+    js_for_as = _as_esc(js)
     if app == "Safari":
-        applescript = (f'tell application "Safari" to do JavaScript '
+        applescript = (f'tell application "{app_esc}" to do JavaScript '
                        f'"{js_for_as}" in front document')
     elif app in _CHROMIUM_BROWSERS or "chrome" in app.lower():
-        applescript = (f'tell application "{app}" to execute front window\'s '
+        applescript = (f'tell application "{app_esc}" to execute front window\'s '
                        f'active tab javascript "{js_for_as}"')
     elif "firefox" in app.lower():
         return ("ERROR: Firefox doesn't support AppleScript JS injection. "

@@ -965,6 +965,14 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         skill_block = render_skill_index(skill_groups)
         if skill_block:
             instructions = instructions + "\n\n" + skill_block
+        # SOUL + MEMORY: per-user voice and durable facts. Loaded fresh
+        # each turn so edits the user makes mid-run propagate. Both
+        # files are capped at 16 KB each (see personal.py) to bound
+        # prompt cost.
+        from .personal import render_personal_block
+        personal_block = render_personal_block()
+        if personal_block:
+            instructions = instructions + "\n\n" + personal_block
         # Force image attach on this turn if (a) the model just used
         # `screenshot`, (b) AX returned 0 elements (image is the only
         # signal), or (c) the very first turn (handled inside _build_input).

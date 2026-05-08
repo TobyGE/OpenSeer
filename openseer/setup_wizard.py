@@ -451,7 +451,7 @@ def configure_telegram() -> bool:
 def run_setup() -> int:
     print(_c("\nOpenSeer setup", BOLD) + " " + _c("— let's get you running", DIM))
 
-    _step(1, 5, "Choose model provider")
+    _step(1, 6, "Choose model provider")
     provider = choose_provider()
     if provider is None:
         print(_c("\nSetup paused — no usable provider. Install Codex CLI "
@@ -461,23 +461,40 @@ def run_setup() -> int:
         print(f"    Claude: open Claude.app or run `claude` CLI to sign in")
         return 1
 
-    _step(2, 5, "macOS Accessibility permission")
+    _step(2, 6, "macOS Accessibility permission")
     if not check_accessibility():
         print(_c("\nSetup paused — fix Accessibility and re-run.", YEL))
         return 2
 
-    _step(3, 5, "macOS Screen Recording permission")
+    _step(3, 6, "macOS Screen Recording permission")
     if not check_screen_recording():
         print(_c("\nSetup paused — fix Screen Recording and re-run.", YEL))
         return 3
 
-    _step(4, 5, f"Smoke test ({provider} model ping)")
+    _step(4, 6, f"Smoke test ({provider} model ping)")
     if not smoke_test(provider):
         print(_c("\nSetup paused — model call failed; check network or token.",
                  YEL))
         return 4
 
-    _step(5, 5, "Telegram inbound (optional — phone → Mac control)")
+    _step(5, 6, "Personality + memory files (SOUL.md / MEMORY.md)")
+    from .personal import (
+        seed_defaults_if_missing, SOUL_PATH, MEMORY_PATH,
+    )
+    soul_new, mem_new = seed_defaults_if_missing()
+    if soul_new:
+        _ok(f"created {SOUL_PATH}  (voice/tone — edit anytime)")
+    else:
+        _ok(f"using existing {SOUL_PATH}")
+    if mem_new:
+        _ok(f"created {MEMORY_PATH}  (durable facts — fill in payment, "
+            f"address, preferences)")
+    else:
+        _ok(f"using existing {MEMORY_PATH}")
+    print(_c("    Both files are full-injected into the prompt every run. "
+             "Edit them in any text editor.", DIM))
+
+    _step(6, 6, "Telegram inbound (optional — phone → Mac control)")
     configure_telegram()      # never blocks; returns even on skip
 
     print(_c("\nAll set.", GRN, BOLD) + " " + _c("Run", DIM) + " "

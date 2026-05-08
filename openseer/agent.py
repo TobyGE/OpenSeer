@@ -116,6 +116,7 @@ Then a colon, why, and `Next: <plan>`. Be honest — fake SUCCESS labels compoun
   reground       `target` description; returns resolved (x,y) without touching UI.
   read_skill     `skill_name` → returns the cheat-sheet body for next turn.
   write_skill    `skill_name` + `skill_body` (full SKILL.md). Persists durable app knowledge.
+  write_memory   `entry` — a Markdown line or short block. Appends to MEMORY.md (the user-facts file injected into every run's prompt). Use ONLY for things the user just confirmed and that should persist across runs (payment defaults, shipping addresses, preferences). Do NOT write task-specific values (the title of a movie they just watched, a one-time URL). Format `entry` like the existing MEMORY.md bullets so it merges cleanly. Example: `{{"action":"write_memory","entry":"- payment: AMEX ending 1234 (default)"}}`.
   terminate      `status` ∈ done|fail, `reason`, and for done: `verified_by_steps`.
 
 ## Chain Semantics — state-dependency rule
@@ -298,6 +299,7 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         kind=obj.get("kind"),
         question=obj.get("question"),
         options=obj.get("options"),
+        entry=obj.get("entry"),
     )
 
 
@@ -349,7 +351,7 @@ def _parse_actions(raw: str) -> list[Action]:
 # `screenshot` do NOT count as evidence of having done the work.
 _PRODUCING_ACTIONS = {"click", "double_click", "type", "key", "scroll",
                       "open_app", "bash", "web_search", "web_fetch",
-                      "read_page", "write_skill"}
+                      "read_page", "write_skill", "write_memory"}
 # `screenshot`, `get_app_state`, and `reground` are passive observers —
 # they do NOT produce or change the requested result. Citing only them
 # in `verified_by_steps` would let a run terminate done after merely
@@ -1247,6 +1249,181 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                 if skipped > 0:
                     say(f"  [{label}] (skipping {skipped} chained "
                         f"action(s) — ask_user ends the chain)")
+                break
+
+            # write_memory — append a durable user fact to MEMORY.md.
+            #
+            # Use this when a user reply (or earlier task evidence)
+            # produced something the agent should remember across runs:
+            # confirmed payment default, shipping address, preferences,
+            # account hints. The model passes a pre-formatted Markdown
+            # line/block in `entry`; personal.append_memory() handles
+            # the file write atomically. Writes are immediate (no
+            # confirmation) — the user can edit MEMORY.md any time, and
+            # since the agent only writes after the user gave the
+            # information, the failure mode is "remembered something
+            # the user can delete" rather than "leaked something the
+            # user never said".
+            if action.name == "write_memory":
+                from .personal import append_memory, MEMORY_PATH
+                entry = (action.entry or action.text or "").strip()
+                # Cap entry size. MEMORY.md is meant for short bullets
+                # (a payment default, a shipping address, a preference),
+                # not paragraphs. Bounding the size also prevents a
+                # prompt-injection vector where the model is tricked
+                # into hiding malicious instructions after a benign
+                # preview the user approves: with a hard ceiling, the
+                # full content fits in any reasonable preview, and the
+                # confirmation actually covers everything that lands
+                # on disk.
+                _MEMORY_ENTRY_MAX = 500
+                if not entry:
+                    result = ("ERROR: write_memory needs `entry` (the "
+                              "markdown line/block to append to MEMORY.md). "
+                              "Example: "
+                              "`{\"action\":\"write_memory\",\"entry\":"
+                              "\"- payment: AMEX ending 1234 (default)\"}`")
+                elif len(entry) > _MEMORY_ENTRY_MAX:
+                    result = (f"ERROR: write_memory `entry` is "
+                              f"{len(entry)} chars; the cap is "
+                              f"{_MEMORY_ENTRY_MAX}. MEMORY.md entries are "
+                              f"meant to be short bullets (one fact per "
+                              f"line). If you have multiple facts to "
+                              f"persist, emit one write_memory per fact "
+                              f"in separate turns.")
+                elif dry_run:
+                    # Match write_skill / executor side-effect actions:
+                    # in preview mode, describe what would happen but
+                    # don't mutate MEMORY.md.
+                    result = (f"would append to {MEMORY_PATH}: "
+                              f"{entry[:140]}"
+                              + ("…" if len(entry) > 140 else "")
+                              + "  [dry_run]")
+                else:
+                    # ALWAYS require user confirmation before writing —
+                    # same threat model as write_skill. MEMORY.md is
+                    # injected into every future run's prompt, so a
+                    # prompt-injected page (read_page / web_fetch
+                    # content under attacker control) could otherwise
+                    # cause the model to emit write_memory with
+                    # malicious instructions and durably poison future
+                    # runs. We route the confirmation through the same
+                    # ask_user callback used elsewhere — daemon turns
+                    # it into a Telegram Apply / Skip prompt; REPL or
+                    # any other caller without ask_user wired falls
+                    # back to a stdin preview + _confirm.
+                    user_approved = False
+                    user_skipped = False
+                    user_aborted = False
+                    if ask_user is not None:
+                        # entry is already capped at _MEMORY_ENTRY_MAX
+                        # above, so the preview equals the full payload.
+                        # The user approves what actually lands on disk.
+                        preview = entry
+                        try:
+                            # kind="choose" because we want the EXACT
+                            # custom button labels surfaced (some
+                            # callbacks ignore `options` when
+                            # kind="confirm" and just use Yes/No).
+                            reply = ask_user(
+                                question=(f"Append this to MEMORY.md?\n\n"
+                                          f"{preview}"),
+                                kind="choose",
+                                options=["Yes, save", "No, skip"],
+                                attachments=[],
+                            )
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:
+                            say(f"  [{label}] write_memory ask_user "
+                                f"errored: {e!r} — skipping write")
+                            reply = None
+                        # Accept any affirmative shape: our explicit
+                        # "Yes, save" plus the standard "Yes" /  "y"
+                        # variants in case a confirm-flavored callback
+                        # downgrades the choose options.
+                        if reply is None:
+                            user_aborted = True
+                        elif reply.strip().lower() in (
+                            "yes, save", "yes", "y", "ok", "save"
+                        ):
+                            user_approved = True
+                        else:
+                            user_skipped = True
+                    else:
+                        print()
+                        print(f"  ⚠ write_memory — about to append to "
+                              f"{MEMORY_PATH}")
+                        for line in entry.splitlines()[:30]:
+                            print(f"    | {line}")
+                        if entry.count("\n") > 30:
+                            print(f"    | ... "
+                                  f"({entry.count(chr(10)) - 30} more lines)")
+                        ans = _confirm(action)
+                        if ans == "q":
+                            user_aborted = True
+                        elif ans == "s":
+                            user_skipped = True
+                        else:
+                            user_approved = True
+
+                    if user_aborted:
+                        say("  [aborted by user]")
+                        ab_step = Step(
+                            idx=sn_action, action=action,
+                            result="aborted by user before write_memory",
+                            raw_response=raw,
+                            usage=usage if chain_pos == 0 else None,
+                            elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                            screenshot_path=raw_path,
+                            frame_hash=frame_hash,
+                        )
+                        record_step(ab_step)
+                        terminate = True
+                        break
+                    if user_skipped:
+                        sk_step = Step(
+                            idx=sn_action, action=action,
+                            result=("skipped by user — write_memory not "
+                                    "applied"),
+                            raw_response=raw,
+                            usage=usage if chain_pos == 0 else None,
+                            elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                            screenshot_path=raw_path,
+                            frame_hash=frame_hash,
+                        )
+                        record_step(sk_step)
+                        break
+                    if user_approved:
+                        try:
+                            append_memory(entry)
+                            result = (f"appended to {MEMORY_PATH}: "
+                                      f"{entry[:140]}"
+                                      + ("…" if len(entry) > 140 else ""))
+                        except Exception as e:
+                            result = f"ERROR: write_memory failed: {e!r}"
+                skipped = len(actions) - chain_pos - 1
+                if skipped > 0:
+                    skipped_names = [a.name for a in actions[chain_pos + 1:]]
+                    result = (f"{result}\n\n[NOTE] {skipped} chained "
+                              f"action(s) after this write_memory were "
+                              f"SKIPPED: {skipped_names}. Re-decide on "
+                              f"the next turn now that MEMORY.md has been "
+                              f"updated.")
+                ann_path = out_dir / f"{label.replace('.', '_')}-action.png"
+                frame.image.save(ann_path)
+                say(f"  [{label}] result:  write_memory: "
+                    f"{(entry or '<empty>')[:80]!r}")
+                step = Step(idx=sn_action, action=action, result=result,
+                            raw_response=raw,
+                            usage=usage if chain_pos == 0 else None,
+                            elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                            screenshot_path=raw_path, annotated_path=ann_path,
+                            frame_hash=frame_hash)
+                record_step(step)
+                if skipped > 0:
+                    say(f"  [{label}] (skipping {skipped} chained "
+                        f"action(s) — write_memory ends the chain)")
                 break
 
             # get_app_state — explicit AX refresh, optionally targeting a

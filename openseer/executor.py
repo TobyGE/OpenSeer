@@ -50,6 +50,7 @@ class Action:
     kind: str | None = None
     question: str | None = None
     options: list[str] | None = None
+    entry: str | None = None       # for write_memory: the markdown line/block to append to MEMORY.md
     status: str | None = None      # for terminate: "done" | "fail"
     reason: str | None = None
     thought: str | None = None

@@ -320,6 +320,23 @@ class RunReflectionCallback(Callback):
 
         skill_body = extract_skill_block(reflection)
         if skill_body:
+            # Persist the expected skill name as a sidecar so the
+            # daemon's Telegram "Apply" button (which fires after the
+            # run finishes and the in-memory ctx is gone) can re-run
+            # the same expected-name check this callback applies in
+            # _maybe_apply_skill. Without it, a click on Apply would
+            # bypass the name guard and could write a skill the
+            # in-process check already determined was wrong.
+            try:
+                expected = self._expected_skill_name(ctx, "")
+                if expected:
+                    (out_dir / "expected_skill.txt").write_text(
+                        expected, encoding="utf-8",
+                    )
+            except Exception as e:
+                if self.verbose:
+                    print(f"[reflection] could not write "
+                          f"expected_skill.txt: {e}")
             self._maybe_apply_skill(ctx, skill_body, trace_path)
 
     def _reflect(self, ctx: dict[str, Any], stream_full) -> str:

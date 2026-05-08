@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=68"]
+# setuptools 77 was the first release to recognise PEP 639 bare SPDX
+# license expressions (`license = "Apache-2.0"` below). Older versions
+# only validate `{text=...}`/`{file=...}` and reject this config at
+# build time, breaking sdist/wheel.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]

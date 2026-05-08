@@ -568,13 +568,22 @@ class _StepCheckController:
         nonce BEFORE sending, so the match works regardless of
         whether prompt_message_id has been recorded yet)
 
+    ``sender_id`` is the Telegram user id who started the task. In
+    group-chat deployments the per-30-step Continue / Stop buttons
+    are visible to every allowed participant; without a sender bind,
+    anyone in the chat can keep someone else's long-running Mac
+    automation going (or stop it). Only delivery from the initiating
+    sender is honored — same protection ``_AskController`` already
+    applies to ask_user replies.
+
     nonce is set in __init__ before the controller is registered, so
     the field is never observed unset by the callback path.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sender_id: int) -> None:
         self._event = threading.Event()
         self._decision: str | None = None  # "continue" | "stop" | None (timeout)
+        self.sender_id = int(sender_id)
         self.nonce: str = uuid.uuid4().hex[:12]
 
     def deliver(self, decision: str) -> None:
@@ -602,8 +611,10 @@ def _step_callback_markup(chat_id: int, nonce: str) -> dict:
     }
 
 
-def _make_step_check(bot: TelegramBot, chat_id: int):
-    """Returns the callback agent.run will invoke every N steps."""
+def _make_step_check(bot: TelegramBot, chat_id: int, sender_id: int):
+    """Returns the callback agent.run will invoke every N steps.
+    ``sender_id`` is the user who started the task; only their button
+    taps are honored (see _StepCheckController)."""
 
     def check(step_n: int, history: list) -> bool:
         last_name = "?"
@@ -617,7 +628,7 @@ def _make_step_check(bot: TelegramBot, chat_id: int):
         # arrives -> _handle_step_callback finds no controller -> the
         # click is discarded as "stale", and the worker would then
         # time out and stop a task the user actually chose to continue.
-        ctrl = _StepCheckController()
+        ctrl = _StepCheckController(sender_id)
         with _active_lock:
             _active_step_controllers[chat_id] = ctrl
         try:
@@ -669,14 +680,22 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     with _active_lock:
         ctrl = _active_step_controllers.get(chat_id)
 
-    # The click is "live" only if there is a controller AND its nonce
-    # matches the one baked into the clicked button's callback_data.
-    # The nonce is set in the controller __init__ BEFORE the prompt
-    # is sent, so this comparison is robust to:
+    # The click is "live" only if there is a controller, its nonce
+    # matches the clicked button's callback_data, AND the tapper is
+    # the user who started the task. The nonce is set in __init__
+    # BEFORE the prompt is sent, so this comparison is robust to:
     #   - taps that race ahead of bot.send returning
     #   - taps on PRIOR prompts whose buttons survived a failed edit
+    # The sender_id check is the group-chat authorization seal: in a
+    # multi-user chat we DON'T want any allowed participant to be
+    # able to authorize / abort someone else's long-running task.
     is_live = bool(
         ctrl is not None and recv_nonce and ctrl.nonce == recv_nonce
+        and int(cb.sender_id) == ctrl.sender_id
+    )
+    sender_mismatch = bool(
+        ctrl is not None and recv_nonce and ctrl.nonce == recv_nonce
+        and not is_live
     )
 
     # Deliver the decision FIRST (in-process, instant). UI cleanup
@@ -684,22 +703,39 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     if is_live:
         ctrl.deliver(decision)  # type: ignore[union-attr]
 
+    # Three UI-cleanup cases:
+    #   - live: edit prompt to show the decision + strip keyboard
+    #   - sender mismatch: leave the prompt + keyboard intact so the
+    #     intended user can still answer; only ack the wrong tapper
+    #   - truly stale (no controller, or nonce mismatch): edit to
+    #     "expired" and strip the keyboard
     if is_live:
         decided_text = ("✓ Continued" if decision == "continue"
                         else "⏵ Stopped")
-    else:
-        decided_text = "⌛ Task already ended — click ignored."
-    try:
-        bot.edit(chat_id, cb.message_id, decided_text,
-                 reply_markup={"inline_keyboard": []})
-    except Exception as e:
-        print(f"  [step-check] edit failed: {e}")
+        try:
+            bot.edit(chat_id, cb.message_id, decided_text,
+                     reply_markup={"inline_keyboard": []})
+        except Exception as e:
+            print(f"  [step-check] edit failed: {e}")
+    elif not sender_mismatch:
+        try:
+            bot.edit(chat_id, cb.message_id,
+                     "⌛ Task already ended — click ignored.",
+                     reply_markup={"inline_keyboard": []})
+        except Exception as e:
+            print(f"  [step-check] edit failed: {e}")
 
     try:
         if is_live:
             bot.answer_callback(
                 cb.callback_id,
                 text="Continuing" if decision == "continue" else "Stopping",
+            )
+        elif sender_mismatch:
+            bot.answer_callback(
+                cb.callback_id,
+                text="Only the task starter can answer",
+                show_alert=True,
             )
         else:
             bot.answer_callback(cb.callback_id, text="Task already ended")
@@ -801,6 +837,42 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
             print(f"  [telegram] invalid skill proposal edit failed: {e}")
         return
 
+    # Re-run the expected-name guard the in-process reflection
+    # callback applies. The reflection writes ~/.openseer/runs/<id>/
+    # expected_skill.txt as a sidecar; if parsed.name doesn't match
+    # the file's content, the run's reflection callback would have
+    # rejected this proposal in `_maybe_apply_skill`, so the
+    # Telegram-side Apply must reject it too. Without this guard a
+    # mis-targeted skill proposal that the in-process check already
+    # rejected (e.g. lululemon facts proposed under x-com-web) could
+    # still land via a button tap.
+    expected_path = (Path.home() / ".openseer" / "runs"
+                     / trace_id / "expected_skill.txt")
+    if expected_path.exists():
+        try:
+            expected = expected_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            expected = ""
+        if expected and expected != parsed.name:
+            msg = (f"Skill proposal name mismatch — "
+                   f"proposed `{parsed.name}` but reflection expected "
+                   f"`{expected}`. Edit the trace's `skill-md` block to "
+                   f"use `{expected}` (or pick a different skill manually).")
+            try:
+                bot.answer_callback(cb.callback_id,
+                                    text="Name mismatch — rejected",
+                                    show_alert=True)
+            except Exception:
+                pass
+            try:
+                bot.edit(cb.chat_id, cb.message_id, msg,
+                         reply_markup={"inline_keyboard": []})
+            except Exception as e:
+                print(f"  [telegram] skill name-mismatch edit failed: {e}")
+            print(f"  [telegram] rejected skill apply: name "
+                  f"{parsed.name!r} != expected {expected!r}")
+            return
+
     res = write_user_skill(parsed.name, skill_body, dry_run=False)
     if res.ok:
         msg = f"Applied skill update: {parsed.name}\n{res.path}"
@@ -863,7 +935,8 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
             callbacks.append(_TelegramProgress(bot, msg.chat_id, ack_msg_id,
                                                msg.text))
 
-        step_check = _make_step_check(bot, msg.chat_id) if step_check_interval > 0 else None
+        step_check = (_make_step_check(bot, msg.chat_id, msg.sender_id)
+                      if step_check_interval > 0 else None)
         ask_user_cb = _make_ask_user(bot, msg.chat_id, msg.sender_id)
 
         t0 = time.time()

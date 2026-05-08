@@ -393,28 +393,35 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     with _active_lock:
         ctrl = _active_step_controllers.get(chat_id)
 
-    # Always strip the buttons from the original prompt — even on stale
-    # clicks — so the chat reflects what was decided.
-    decided_text = ("✓ Continued" if decision == "continue"
-                    else "⏵ Stopped")
+    # Deliver the decision FIRST. If we did the bot.edit roundtrip
+    # before this and Telegram was slow, ctrl.wait() could expire and
+    # stop a task the user actually chose to continue. Decision
+    # delivery is in-process and instant; UI cleanup is best-effort.
+    if ctrl is not None:
+        ctrl.deliver(decision)
+
+    # Strip buttons + show outcome. Differentiate live vs stale clicks
+    # so the chat doesn't tell the user "Continued" when the task had
+    # already ended (timeout, prior Stop, or run finished).
+    if ctrl is not None:
+        decided_text = ("✓ Continued" if decision == "continue"
+                        else "⏵ Stopped")
+    else:
+        decided_text = "⌛ Task already ended — click ignored."
     try:
         bot.edit(chat_id, cb.message_id, decided_text,
                  reply_markup={"inline_keyboard": []})
     except Exception as e:
         print(f"  [step-check] edit failed: {e}")
 
-    if ctrl is None:
-        try:
-            bot.answer_callback(cb.callback_id, text="Task already ended")
-        except Exception:
-            pass
-        return True
-    ctrl.deliver(decision)
     try:
-        bot.answer_callback(
-            cb.callback_id,
-            text="Continuing" if decision == "continue" else "Stopping",
-        )
+        if ctrl is not None:
+            bot.answer_callback(
+                cb.callback_id,
+                text="Continuing" if decision == "continue" else "Stopping",
+            )
+        else:
+            bot.answer_callback(cb.callback_id, text="Task already ended")
     except Exception:
         pass
     return True

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -291,6 +292,117 @@ def _skill_body_from_trace(trace_id: str) -> str | None:
         return None
 
 
+# ─── step check-in (every N steps the daemon asks the user to continue) ──
+
+# Default cadence: ask after every 30 steps. Hard cap on max_steps stays
+# at 200 (set in run_daemon's tg_cfg defaults). Timeout: 5 minutes — if
+# the user doesn't tap a button, we stop the task. Conservative choice
+# (skip the wrong action > do the wrong action).
+_STEP_CHECK_TIMEOUT_S = 300.0
+
+
+class _StepCheckController:
+    """Handle for the worker thread to wait on a Telegram button click."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._decision: str | None = None  # "continue" | "stop" | None (timeout)
+
+    def deliver(self, decision: str) -> None:
+        self._decision = decision
+        self._event.set()
+
+    def wait(self, timeout: float) -> str | None:
+        return self._decision if self._event.wait(timeout) else None
+
+
+# Keyed by chat_id. Daemon enforces 1 active task at a time, so chat_id
+# uniquely identifies the in-flight controller.
+_active_step_controllers: dict[int, _StepCheckController] = {}
+_active_lock = threading.Lock()
+
+
+def _step_callback_markup(chat_id: int) -> dict:
+    return {
+        "inline_keyboard": [[
+            {"text": "Continue", "callback_data": f"step_continue:{chat_id}"},
+            {"text": "Stop",     "callback_data": f"step_stop:{chat_id}"},
+        ]]
+    }
+
+
+def _make_step_check(bot: TelegramBot, chat_id: int):
+    """Returns the callback agent.run will invoke every N steps."""
+
+    def check(step_n: int, history: list) -> bool:
+        last_name = "?"
+        if history:
+            try:
+                last_name = history[-1].action.name
+            except Exception:
+                pass
+        try:
+            bot.send(
+                chat_id,
+                f"⏸ Already {step_n} steps. Last action: {last_name}. Continue?",
+                reply_markup=_step_callback_markup(chat_id),
+            )
+        except Exception as e:
+            print(f"  [step-check] send failed: {e} — stopping task")
+            return False
+        ctrl = _StepCheckController()
+        with _active_lock:
+            _active_step_controllers[chat_id] = ctrl
+        try:
+            decision = ctrl.wait(_STEP_CHECK_TIMEOUT_S)
+        finally:
+            with _active_lock:
+                _active_step_controllers.pop(chat_id, None)
+        if decision == "continue":
+            print(f"  [step-check] chat={chat_id} step={step_n} → continue")
+            return True
+        if decision is None:
+            print(f"  [step-check] chat={chat_id} step={step_n} → "
+                  f"timeout (no button click in {int(_STEP_CHECK_TIMEOUT_S)}s)")
+            try:
+                bot.send(chat_id, "⏱ No reply in 5 min — stopping task.")
+            except Exception:
+                pass
+            return False
+        print(f"  [step-check] chat={chat_id} step={step_n} → stop")
+        return False
+
+    return check
+
+
+def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
+    """Returns True if this callback was a step_continue/step_stop button.
+    Dispatches the decision to the matching controller."""
+    data = cb.data or ""
+    if not (data.startswith("step_continue:") or data.startswith("step_stop:")):
+        return False
+    decision = "continue" if data.startswith("step_continue:") else "stop"
+    chat_id = cb.chat_id
+    with _active_lock:
+        ctrl = _active_step_controllers.get(chat_id)
+    if ctrl is None:
+        # Stale click — task already ended (timeout or user already chose).
+        try:
+            bot.answer_callback(cb.callback_id, text="Task already ended")
+        except Exception:
+            pass
+        return True
+    ctrl.deliver(decision)
+    try:
+        bot.answer_callback(
+            cb.callback_id,
+            text="Continuing" if decision == "continue" else "Stopping",
+        )
+    except Exception:
+        pass
+    return True
+
+
 def _skill_update_markup(trace_id: str) -> dict:
     return {
         "inline_keyboard": [[
@@ -406,24 +518,24 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
         print(f"  [telegram] skill rejection edit failed: {e}")
 
 
+_worker_lock = threading.Lock()       # only one agent_run at a time
+_worker_thread: threading.Thread | None = None
+
+
 def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
-                     max_steps: int, confirm_each: bool):
-    """Returns the on_message callback. Captures bot + session store."""
+                     max_steps: int, step_check_interval: int,
+                     confirm_each: bool):
+    """Returns the on_message callback. Captures bot + session store.
 
-    def on_message(msg: TelegramMessage) -> None:
-        print(f"\n[telegram] {msg.sender_name} ({msg.chat_id}) → {msg.text[:80]!r}")
+    Each incoming message spawns a background worker thread that runs
+    `agent_run` plus post-task work. The bot's main poll loop stays on
+    the main thread so it can keep ingesting `callback_query` updates
+    (used by the per-30-step "Continue?" buttons and skill-update
+    buttons). Only one worker runs at a time — Mac mouse/keyboard
+    can't be shared.
+    """
 
-        # Send ack so the user sees we got the message; we'll edit this
-        # message in place with progress, and finally with the result.
-        try:
-            ack = bot.send(msg.chat_id,
-                           f"⏳ working on:\n{msg.text[:200]}",
-                           reply_to=msg.message_id)
-            ack_msg_id = int(ack.get("message_id", 0))
-        except Exception as e:
-            print(f"  [telegram] ack failed: {e}")
-            ack_msg_id = 0
-
+    def _worker(msg: TelegramMessage, ack_msg_id: int) -> None:
         # Build session_context: remote-mode notice + prior tasks of this chat
         ctx_parts = [_REMOTE_NOTICE]
         prior_block = sessions.render_context(msg.chat_id)
@@ -441,6 +553,8 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
             callbacks.append(_TelegramProgress(bot, msg.chat_id, ack_msg_id,
                                                msg.text))
 
+        step_check = _make_step_check(bot, msg.chat_id) if step_check_interval > 0 else None
+
         t0 = time.time()
         try:
             history = agent_run(
@@ -450,6 +564,8 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                 confirm_each=confirm_each,
                 callbacks=callbacks,
                 session_context=session_context,
+                step_check_interval=step_check_interval,
+                step_check=step_check,
                 quiet=False,
             )
         except KeyboardInterrupt:
@@ -460,7 +576,7 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                     bot.send(msg.chat_id, "⏵ interrupted")
             except Exception:
                 pass
-            raise
+            return
         except Exception as e:
             print(f"  [agent] error: {e!r}")
             try:
@@ -472,10 +588,6 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
         dur = time.time() - t0
         result = _format_result(history, dur)
         trace_id = _latest_trace_id()
-        # Edit ack with summary; if reason is long, send the rest as
-        # one or more chunked follow-up messages (Telegram caps at 4096
-        # chars per message — long terminate.reason values would be
-        # silently truncated otherwise).
         try:
             if ack_msg_id:
                 short = result.split("\n\n", 1)[0]
@@ -488,11 +600,6 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
         except Exception as e:
             print(f"  [telegram] reply send failed: {e}")
 
-        # If the terminate action declared attachments, ship them too.
-        # Lets the model send a screenshot back to the user's phone via
-        # `{"action":"terminate","status":"done","reason":"...",
-        #   "attachments":["/Users/.../proof.png"]}`. PNG/JPG/GIF only;
-        # missing or oversized files just log a warning.
         last = history[-1] if history else None
         attaches: list[str] = []
         if last and last.action.name == "terminate":
@@ -511,7 +618,6 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
             bot, msg.chat_id, trace_id, ack_msg_id or msg.message_id,
         )
 
-        # Record into session memory for the next message in this chat
         status, result_text = _canonical_status(history)
         sessions.append(msg.chat_id, TaskSummary(
             task=msg.text,
@@ -521,6 +627,58 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
             ts=time.time(),
         ))
         print(f"[telegram] replied ({dur:.1f}s, {len(history)} steps, status={status})")
+
+    def on_message(msg: TelegramMessage) -> None:
+        global _worker_thread
+        print(f"\n[telegram] {msg.sender_name} ({msg.chat_id}) → {msg.text[:80]!r}")
+
+        # Reject if a task is already running. Mac CU can't multiplex
+        # mouse/keyboard, so concurrent agent_runs would clobber each
+        # other. Telling the user is more useful than silently queueing.
+        if _worker_thread is not None and _worker_thread.is_alive():
+            try:
+                bot.send(
+                    msg.chat_id,
+                    "⏳ Another task is still running. Wait for it to "
+                    "finish, or tap Stop on its check-in to free the daemon.",
+                    reply_to=msg.message_id,
+                )
+            except Exception:
+                pass
+            return
+
+        try:
+            ack = bot.send(msg.chat_id,
+                           f"⏳ working on:\n{msg.text[:200]}",
+                           reply_to=msg.message_id)
+            ack_msg_id = int(ack.get("message_id", 0))
+        except Exception as e:
+            print(f"  [telegram] ack failed: {e}")
+            ack_msg_id = 0
+
+        # Spawn worker. daemon=True so the thread doesn't block process
+        # exit on Ctrl+C (the worker's blocking subprocess calls are
+        # generally non-cancellable from outside; we accept that the
+        # current step may finish unfinished if the user hard-quits).
+        def _run() -> None:
+            try:
+                _worker(msg, ack_msg_id)
+            finally:
+                _worker_lock.release()
+
+        if not _worker_lock.acquire(blocking=False):
+            # Race: another thread grabbed the lock between the check
+            # above and now. Tell the user.
+            try:
+                bot.send(msg.chat_id,
+                         "⏳ Another task started just before yours. Wait.",
+                         reply_to=msg.message_id)
+            except Exception:
+                pass
+            return
+        t = threading.Thread(target=_run, daemon=True, name="openseer-worker")
+        _worker_thread = t
+        t.start()
 
     return on_message
 
@@ -615,11 +773,20 @@ def run_daemon() -> int:
 
     on_msg = _make_dispatcher(
         bot, sessions,
-        max_steps=int(tg_cfg.get("max_steps") or 25),
+        max_steps=int(tg_cfg.get("max_steps") or 200),
+        step_check_interval=int(tg_cfg.get("step_check_interval") or 30),
         confirm_each=bool(tg_cfg.get("confirm_each", False)),
     )
+
+    # Callback router: step_* buttons go to the per-task controller,
+    # everything else falls through to the existing skill-update handler.
+    def _on_callback(cb: TelegramCallback) -> None:
+        if _handle_step_callback(bot, cb):
+            return
+        _handle_skill_callback(bot, cb)
+
     try:
-        bot.poll(on_msg, on_callback=lambda cb: _handle_skill_callback(bot, cb))
+        bot.poll(on_msg, on_callback=_on_callback)
     except KeyboardInterrupt:
         pass
     print("daemon: stopped.")

@@ -686,13 +686,15 @@ def _handle_reground(action: Action, frame: Frame,
     )
 
 
-def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
+def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         confirm_each: bool = False,
         out_dir: Path | None = None, sleep_between: float = 0.0,
         callbacks: list[Callback] | None = None,
         grounder: Grounder | str = "gpt55",
         external_grounder: Grounder | str | None = None,
         session_context: str = "",
+        step_check_interval: int = 0,
+        step_check=None,
         quiet: bool = False) -> list[Step]:
     """Run the agent loop. Returns the list of steps."""
     # Each task gets a short trace_id; runs land under ~/.openseer/runs/<id>/
@@ -1498,6 +1500,40 @@ def run(task: str, *, max_steps: int = 20, dry_run: bool = True,
             if settle > 0:
                 time.sleep(settle)
         if sleep_between: time.sleep(sleep_between)
+
+        # ── User check-in every N steps ───────────────────────────────
+        # Long-running tasks (200-step cap) should pause at intervals to
+        # let the user confirm they want to keep going. The caller passes
+        # a `step_check(step_n, history) -> bool` callback (the daemon's
+        # version sends an inline-button Telegram message and waits for
+        # the user to tap Continue / Stop). When step_check returns
+        # False (or times out), append a synthetic `terminate(fail)` so
+        # the transcript reflects "user stopped" cleanly.
+        if (step_check is not None and step_check_interval > 0
+                and len(history) > 0
+                and len(history) % step_check_interval == 0
+                and not is_done):
+            try:
+                should_continue = bool(step_check(len(history), history))
+            except Exception as e:
+                say(f"[agent] step_check error: {e!r} — stopping")
+                should_continue = False
+            if not should_continue:
+                say(f"[agent] user stopped at step {len(history)}/{max_steps}")
+                stop_action = Action(
+                    name="terminate", status="fail",
+                    reason=(f"User stopped at step {len(history)}/{max_steps} "
+                            f"via check-in."),
+                )
+                stop_step = Step(
+                    idx=len(history) + 1, action=stop_action,
+                    result="user-stopped via check-in",
+                    raw_response="",
+                )
+                history.append(stop_step)
+                emit(EventType.STEP_RECORDED, step=stop_step.idx,
+                     action=stop_action.name, result=stop_step.result)
+                break
 
     # Final status: derive from the last action recorded. Skipped if a
     # TASK_FAILED was already emitted (in which case the consumer treats

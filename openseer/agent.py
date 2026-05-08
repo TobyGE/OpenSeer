@@ -882,6 +882,16 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                 cur_key = (canon_app, cur_url) if cur_url else None
                 cached_text = ctx.get("_browser_cached_text", "")
                 turns_since = ctx.get("_browser_turns_since_fetch", 99)
+                # Record every probed URL so post-run reflection can
+                # infer the primary website. The model's actions don't
+                # always carry the URL on themselves (a click goes to
+                # x,y, no URL), and Step.user_text where the page text
+                # lives isn't persisted on Step objects, so without
+                # this list reflection has no signal for the site.
+                if cur_url:
+                    visited = ctx.setdefault("_browser_urls_visited", [])
+                    if not visited or visited[-1] != cur_url:
+                        visited.append(cur_url)
 
                 # Re-fetch via JS when ANY of:
                 #   - URL or app changed (key mismatch)

@@ -195,7 +195,9 @@ def canonical_site_skill_name(domain: str) -> str:
     return f"{_site_slug_from_domain(domain)}-web"
 
 
-def _infer_site_domain(history: list[Any], app_name: str, task_text: str = "") -> str:
+def _infer_site_domain(history: list[Any], app_name: str,
+                       task_text: str = "",
+                       visited_urls: list[str] | None = None) -> str:
     if (app_name or "").strip().lower() not in _BROWSER_APPS:
         return ""
     for pat, domain in _SITE_ALIASES:
@@ -203,6 +205,20 @@ def _infer_site_domain(history: list[Any], app_name: str, task_text: str = "") -
             return domain
     text_blobs = [task_text or ""]
     counts: dict[str, int] = {}
+
+    # Primary signal: URLs the agent loop actually probed via
+    # _browser_current_url() each turn. Step.user_text (which would
+    # contain the page-content block's URL line) isn't persisted on
+    # Step objects, and clicks don't carry their target URL on
+    # themselves, so without this list inference is effectively
+    # blind on most browser tasks.
+    for url in visited_urls or []:
+        for m in _URL_RE.finditer(str(url or "")):
+            domain = _domain_from_host(m.group(1))
+            if not domain or domain in _IGNORED_INFERENCE_DOMAINS:
+                continue
+            counts[domain] = counts.get(domain, 0) + 1
+
     for s in history:
         a = s.action
         fields = [
@@ -314,7 +330,10 @@ class RunReflectionCallback(Callback):
         read_names = _read_skill_names(history)
         target_skill = None
         app_name = _infer_app_name(history, None)
-        site_domain = _infer_site_domain(history, app_name, str(ctx.get("task", "")))
+        visited_urls = ctx.get("_browser_urls_visited") or []
+        site_domain = _infer_site_domain(history, app_name,
+                                         str(ctx.get("task", "")),
+                                         visited_urls=visited_urls)
         site_skill = None
         if site_domain:
             site_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))
@@ -335,7 +354,9 @@ class RunReflectionCallback(Callback):
         elif read_names:
             target_skill = find_skill_for_app(skill_groups, "", preferred_names=read_names)
             app_name = _infer_app_name(history, target_skill)
-            site_domain = _infer_site_domain(history, app_name, str(ctx.get("task", "")))
+            site_domain = _infer_site_domain(history, app_name,
+                                             str(ctx.get("task", "")),
+                                             visited_urls=visited_urls)
 
         ui_actions = sum(
             1 for s in history
@@ -438,7 +459,10 @@ class RunReflectionCallback(Callback):
         skill_groups = ctx.get("skill_groups") or []
         read_names = _read_skill_names(history)
         app_name = _infer_app_name(history, None)
-        site_domain = _infer_site_domain(history, app_name, str(ctx.get("task", "")))
+        site_domain = _infer_site_domain(
+            history, app_name, str(ctx.get("task", "")),
+            visited_urls=ctx.get("_browser_urls_visited") or [],
+        )
         target_skill = None
         if site_domain:
             target_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))

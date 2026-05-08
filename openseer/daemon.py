@@ -293,6 +293,259 @@ def _skill_body_from_trace(trace_id: str) -> str | None:
         return None
 
 
+# ─── ask_user (model pauses to ask the user mid-run) ─────────────────────
+
+# Same 5-min cap as step_check; conservative — give up rather than block
+# the worker indefinitely waiting for someone who's away from their phone.
+_ASK_USER_TIMEOUT_S = 300.0
+
+
+class _AskController:
+    """Worker-side handle for an active ask_user call.
+
+    For ``kind="confirm"`` and ``kind="choose"`` the user replies via
+    inline buttons; the callback handler decodes the option from
+    callback_data and delivers the option text. For ``kind="text"``,
+    the user's NEXT plain message in this chat is captured by the
+    daemon's on_message router and delivered as the reply (so the
+    user just types their answer like any other message).
+
+    ``sender_id`` is the Telegram user id of the person who started
+    the task. Replies (button click or text) are only honored when
+    they come from this same sender. Without that bind, group-chat
+    deployments would let any participant tap Continue / answer the
+    text question, which can authorise hard-to-reverse actions (pay,
+    send, post) on behalf of the wrong user.
+    """
+
+    def __init__(self, kind: str, options: list[str],
+                 sender_id: int) -> None:
+        self._event = threading.Event()
+        self._reply: str | None = None
+        self.kind = kind
+        self.options = list(options or [])
+        self.sender_id = int(sender_id)
+        self.nonce: str = uuid.uuid4().hex[:12]
+
+    def deliver(self, reply: str) -> None:
+        self._reply = reply
+        self._event.set()
+
+    def wait(self, timeout: float) -> str | None:
+        return self._reply if self._event.wait(timeout) else None
+
+
+_active_ask_controllers: dict[int, _AskController] = {}
+
+
+def _ask_button_markup(chat_id: int, nonce: str,
+                       options: list[str]) -> dict:
+    """Render an inline-keyboard with one button per option.
+
+    Each button's callback_data is ``ask_btn:<chat>:<nonce>:<index>``
+    so the handler can recover both which prompt this is for (nonce
+    binding, same trick as step-check) and which option was chosen.
+    Long option labels are truncated for the button face but the full
+    text is what we deliver as the reply.
+    """
+    rows = []
+    for i, opt in enumerate(options):
+        face = (opt[:48] + "…") if len(opt) > 48 else opt
+        rows.append([{
+            "text": face,
+            "callback_data": f"ask_btn:{chat_id}:{nonce}:{i}",
+        }])
+    return {"inline_keyboard": rows}
+
+
+def _make_ask_user(bot: TelegramBot, chat_id: int, sender_id: int):
+    """Returns the ask_user callback agent.run will invoke when the
+    model emits an ask_user action. ``sender_id`` binds the active
+    ask to the user who started the task — see _AskController."""
+
+    def ask(*, question: str, kind: str,
+            options: list[str] | None,
+            attachments: list[str] | None) -> str | None:
+        # Optional attachments — the model lists screenshot or file
+        # paths it wants the user to see alongside the question. Send
+        # them BEFORE the prompt so the question lands at the bottom
+        # of the chat with the visual context already scrolled in.
+        for path in attachments or []:
+            try:
+                if not Path(path).exists():
+                    print(f"  [ask] attachment missing: {path}")
+                    continue
+                bot.send_photo(chat_id, path)
+            except Exception as e:
+                print(f"  [ask] photo {path}: {e}")
+
+        # Resolve options. confirm = Yes/No unless overridden;
+        # choose = explicit list (else degrade to text); text = no buttons.
+        if kind == "confirm":
+            opts = list(options) if options else ["Yes", "No"]
+        elif kind == "choose":
+            if not options:
+                print(f"  [ask] kind=choose with no options; falling back "
+                      f"to text")
+                kind = "text"
+                opts = []
+            else:
+                opts = list(options)
+        else:
+            kind = "text"
+            opts = []
+
+        ctrl = _AskController(kind, opts, sender_id)
+        with _active_lock:
+            _active_ask_controllers[chat_id] = ctrl
+        try:
+            try:
+                if kind in ("confirm", "choose"):
+                    bot.send(
+                        chat_id,
+                        f"❔ {question}",
+                        reply_markup=_ask_button_markup(chat_id, ctrl.nonce, opts),
+                    )
+                else:
+                    bot.send(
+                        chat_id,
+                        f"❔ {question}\n\n"
+                        f"(Reply with text — your next message in this chat "
+                        f"will be taken as the answer.)",
+                    )
+            except Exception as e:
+                print(f"  [ask] send failed: {e} — aborting ask_user")
+                return None
+            decision = ctrl.wait(_ASK_USER_TIMEOUT_S)
+        finally:
+            with _active_lock:
+                _active_ask_controllers.pop(chat_id, None)
+
+        if decision is None:
+            try:
+                bot.send(chat_id,
+                         "⏱ No reply in 5 min — task stopped.")
+            except Exception:
+                pass
+            print(f"  [ask] chat={chat_id} timeout (no reply in "
+                  f"{int(_ASK_USER_TIMEOUT_S)}s)")
+            return None
+        print(f"  [ask] chat={chat_id} → {decision[:80]!r}")
+        return decision
+
+    return ask
+
+
+def _handle_ask_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
+    """Returns True if this callback was an ask_btn (confirm/choose)
+    button. Decodes the chosen option from callback_data and delivers
+    it to the matching controller."""
+    data = cb.data or ""
+    if not data.startswith("ask_btn:"):
+        return False
+    parts = data.split(":")
+    # Expected shape: ask_btn:<chat>:<nonce>:<option_index>
+    if len(parts) < 4:
+        try:
+            bot.answer_callback(cb.callback_id, text="Malformed button")
+        except Exception:
+            pass
+        return True
+    nonce = parts[2]
+    try:
+        idx = int(parts[3])
+    except ValueError:
+        idx = -1
+
+    chat_id = cb.chat_id
+    with _active_lock:
+        ctrl = _active_ask_controllers.get(chat_id)
+
+    is_live = bool(
+        ctrl is not None and nonce
+        and ctrl.nonce == nonce
+        and ctrl.kind in ("confirm", "choose")
+        and 0 <= idx < len(ctrl.options)
+        # Bind to the initiating sender — in group chats, only the user
+        # who started the task should be able to answer their own ask.
+        and int(cb.sender_id) == ctrl.sender_id
+    )
+
+    # Deliver before any UI cleanup (network can be slow; we don't want
+    # ctrl.wait to time out before delivery).
+    chosen = ""
+    if is_live:
+        chosen = ctrl.options[idx]   # type: ignore[union-attr]
+        ctrl.deliver(chosen)         # type: ignore[union-attr]
+
+    # Distinguish three cases for the UI cleanup:
+    #   live click  → edit prompt to show the answer, strip keyboard
+    #   no controller → truly stale, edit to "expired", strip keyboard
+    #   wrong sender (group chat) → leave the prompt and keyboard
+    #     intact so the intended user can still answer; only ack the
+    #     unauthorised tap so that participant sees feedback.
+    sender_mismatch = bool(
+        ctrl is not None and not is_live
+        and (ctrl.kind in ("confirm", "choose"))
+        and int(cb.sender_id) != ctrl.sender_id
+    )
+    if is_live:
+        try:
+            bot.edit(chat_id, cb.message_id, f"❔ Answered: {chosen}",
+                     reply_markup={"inline_keyboard": []})
+        except Exception as e:
+            print(f"  [ask] edit failed: {e}")
+    elif not sender_mismatch:
+        try:
+            bot.edit(chat_id, cb.message_id,
+                     "⌛ Question expired — click ignored.",
+                     reply_markup={"inline_keyboard": []})
+        except Exception as e:
+            print(f"  [ask] edit failed: {e}")
+    try:
+        if is_live:
+            bot.answer_callback(cb.callback_id, text=chosen)
+        elif sender_mismatch:
+            bot.answer_callback(cb.callback_id,
+                                text="Only the task starter can answer",
+                                show_alert=True)
+        else:
+            bot.answer_callback(cb.callback_id, text="Expired")
+    except Exception:
+        pass
+    return True
+
+
+def _maybe_route_message_to_ask(bot: TelegramBot,
+                                msg: TelegramMessage) -> bool:
+    """If a text-kind ask_user is currently waiting in this chat AND
+    the sender matches the user who started the task, consume the
+    message as the reply and return True (so the on_message handler
+    skips the normal new-task path). Returns False otherwise.
+
+    A reply from a different sender in a group chat falls through to
+    the normal dispatcher — which will treat it as a new task or
+    reject it via the worker-busy lock. The pending ask still waits
+    for the original sender or its 5-min timeout.
+    """
+    with _active_lock:
+        ctrl = _active_ask_controllers.get(msg.chat_id)
+    if ctrl is None or ctrl.kind != "text":
+        return False
+    if int(msg.sender_id) != ctrl.sender_id:
+        # Different group-chat participant — ignore their message for
+        # ask routing. Do NOT consume it; let it fall through to the
+        # normal task-or-reject path.
+        return False
+    ctrl.deliver(msg.text or "")
+    try:
+        bot.send(msg.chat_id, "✓ Got your reply.",
+                 reply_to=msg.message_id)
+    except Exception:
+        pass
+    return True
+
+
 # ─── step check-in (every N steps the daemon asks the user to continue) ──
 
 # Default cadence: ask after every 30 steps. Hard cap on max_steps stays
@@ -611,6 +864,7 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                                                msg.text))
 
         step_check = _make_step_check(bot, msg.chat_id) if step_check_interval > 0 else None
+        ask_user_cb = _make_ask_user(bot, msg.chat_id, msg.sender_id)
 
         t0 = time.time()
         try:
@@ -623,6 +877,7 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                 session_context=session_context,
                 step_check_interval=step_check_interval,
                 step_check=step_check,
+                ask_user=ask_user_cb,
                 quiet=False,
             )
         except KeyboardInterrupt:
@@ -688,6 +943,14 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
     def on_message(msg: TelegramMessage) -> None:
         global _worker_thread
         print(f"\n[telegram] {msg.sender_name} ({msg.chat_id}) → {msg.text[:80]!r}")
+
+        # If a text-kind ask_user is currently waiting in this chat,
+        # the user's message is the answer to the question — NOT a new
+        # task. Route it to the controller and return; the worker
+        # thread that called ask_user is blocked on its event and will
+        # resume now.
+        if _maybe_route_message_to_ask(bot, msg):
+            return
 
         # Reject if a task is already running. Mac CU can't multiplex
         # mouse/keyboard, so concurrent agent_runs would clobber each
@@ -841,15 +1104,34 @@ def run_daemon() -> int:
         confirm_each=bool(tg_cfg.get("confirm_each", False)),
     )
 
-    # Callback router: step_* buttons go to the per-task controller,
+    # Callback router: step_* check-in buttons → step controller,
+    # ask_btn:* (confirm/choose) → ask controller,
     # everything else falls through to the existing skill-update handler.
     def _on_callback(cb: TelegramCallback) -> None:
         if _handle_step_callback(bot, cb):
             return
+        if _handle_ask_callback(bot, cb):
+            return
         _handle_skill_callback(bot, cb)
 
+    # Bypass the trigger_prefix filter ONLY for the user who started a
+    # task that's currently waiting on a text-kind ask_user — and only
+    # for THEM, not for every participant in a group chat. Without this
+    # narrowing, other group members' chat traffic would also bypass
+    # the prefix filter, get routed to the dispatcher, and produce
+    # noisy "task already running" / "no allowed_chat_ids" replies.
+    def _ask_text_active(chat_id: int, sender_id: int) -> bool:
+        with _active_lock:
+            ctrl = _active_ask_controllers.get(chat_id)
+        return (
+            ctrl is not None
+            and ctrl.kind == "text"
+            and int(sender_id) == ctrl.sender_id
+        )
+
     try:
-        bot.poll(on_msg, on_callback=_on_callback)
+        bot.poll(on_msg, on_callback=_on_callback,
+                 bypass_prefix=_ask_text_active)
     except KeyboardInterrupt:
         pass
     print("daemon: stopped.")

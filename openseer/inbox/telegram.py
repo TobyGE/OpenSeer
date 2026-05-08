@@ -335,13 +335,22 @@ class TelegramBot:
         self._stop.set()
 
     def poll(self, on_message: Callable[[TelegramMessage], None],
-             on_callback: Callable[[TelegramCallback], None] | None = None) -> None:
+             on_callback: Callable[[TelegramCallback], None] | None = None,
+             bypass_prefix: Callable[[int, int], bool] | None = None) -> None:
         """Long-poll forever. Blocks until stop() is called or process dies.
 
         Calls `on_message(msg)` for each NEW message that:
           - has text (we ignore stickers, voice, photos for now)
           - comes from an allowed chat_id (if allowlist set)
-          - starts with trigger_prefix (if set)
+          - starts with trigger_prefix (if set), UNLESS ``bypass_prefix``
+            is provided and returns True for ``(chat_id, sender_id)``.
+            The bypass hook is what lets the daemon route a free-form
+            text reply to an active ``ask_user(kind="text")`` even when
+            the user's normal task-trigger prefix is set — replies
+            aren't tasks. The hook receives sender_id so a group-chat
+            bypass only relaxes filtering for the user who actually
+            started the task; everyone else's plain-text traffic
+            still gets dropped by the prefix filter.
         Also dispatches inline-button callback_query updates to
         ``on_callback`` when provided.
 
@@ -431,11 +440,16 @@ class TelegramBot:
                     continue
 
                 if self.trigger_prefix:
-                    if not text.startswith(self.trigger_prefix):
-                        continue
-                    text = text[len(self.trigger_prefix):].strip()
-                    if not text:
-                        continue
+                    sender_id = int(sender.get("id", 0))
+                    skip_prefix = bool(
+                        bypass_prefix and bypass_prefix(chat_id, sender_id)
+                    )
+                    if not skip_prefix:
+                        if not text.startswith(self.trigger_prefix):
+                            continue
+                        text = text[len(self.trigger_prefix):].strip()
+                        if not text:
+                            continue
 
                 msg = TelegramMessage(
                     update_id=int(upd["update_id"]),

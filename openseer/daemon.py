@@ -382,7 +382,9 @@ def _make_step_check(bot: TelegramBot, chat_id: int):
 
 def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     """Returns True if this callback was a step_continue/step_stop button.
-    Dispatches the decision to the matching controller."""
+    Dispatches the decision to the matching controller AND edits the
+    original prompt message to remove the buttons + show the resolution
+    so the chat doesn't accumulate dangling Continue?/Stop? prompts."""
     data = cb.data or ""
     if not (data.startswith("step_continue:") or data.startswith("step_stop:")):
         return False
@@ -390,8 +392,18 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     chat_id = cb.chat_id
     with _active_lock:
         ctrl = _active_step_controllers.get(chat_id)
+
+    # Always strip the buttons from the original prompt — even on stale
+    # clicks — so the chat reflects what was decided.
+    decided_text = ("✓ Continued" if decision == "continue"
+                    else "⏵ Stopped")
+    try:
+        bot.edit(chat_id, cb.message_id, decided_text,
+                 reply_markup={"inline_keyboard": []})
+    except Exception as e:
+        print(f"  [step-check] edit failed: {e}")
+
     if ctrl is None:
-        # Stale click — task already ended (timeout or user already chose).
         try:
             bot.answer_callback(cb.callback_id, text="Task already ended")
         except Exception:
@@ -465,7 +477,8 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
             pass
         try:
             bot.edit(cb.chat_id, cb.message_id,
-                     f"Skipped skill update for trace {trace_id}.")
+                     f"Skipped skill update for trace {trace_id}.",
+                     reply_markup={"inline_keyboard": []})
         except Exception as e:
             print(f"  [telegram] skill skip edit failed: {e}")
         else:
@@ -480,7 +493,8 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
         except Exception:
             pass
         try:
-            bot.edit(cb.chat_id, cb.message_id, msg)
+            bot.edit(cb.chat_id, cb.message_id, msg,
+                     reply_markup={"inline_keyboard": []})
         except Exception as e:
             print(f"  [telegram] skill apply missing trace failed: {e}")
         return
@@ -493,7 +507,8 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
         except Exception:
             pass
         try:
-            bot.edit(cb.chat_id, cb.message_id, msg)
+            bot.edit(cb.chat_id, cb.message_id, msg,
+                     reply_markup={"inline_keyboard": []})
         except Exception as e:
             print(f"  [telegram] invalid skill proposal edit failed: {e}")
         return
@@ -506,7 +521,8 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
         except Exception:
             pass
         try:
-            bot.edit(cb.chat_id, cb.message_id, msg)
+            bot.edit(cb.chat_id, cb.message_id, msg,
+                     reply_markup={"inline_keyboard": []})
         except Exception as e:
             print(f"  [telegram] skill apply confirmation failed: {e}")
         print(f"  [telegram] applied skill {parsed.name} from trace {trace_id}")
@@ -518,7 +534,8 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
     except Exception:
         pass
     try:
-        bot.edit(cb.chat_id, cb.message_id, msg)
+        bot.edit(cb.chat_id, cb.message_id, msg,
+                 reply_markup={"inline_keyboard": []})
     except Exception as e:
         print(f"  [telegram] skill rejection edit failed: {e}")
 

@@ -302,11 +302,19 @@ _STEP_CHECK_TIMEOUT_S = 300.0
 
 
 class _StepCheckController:
-    """Handle for the worker thread to wait on a Telegram button click."""
+    """Handle for the worker thread to wait on a Telegram button click.
+
+    `prompt_message_id` is set after the prompt is successfully sent.
+    The callback handler uses it to ignore taps on PREVIOUS step
+    prompts whose buttons weren't successfully stripped (e.g. when
+    `bot.edit` failed transiently): a stale click would otherwise
+    be delivered as the answer to the CURRENT prompt because the
+    controller dict is keyed only by chat_id."""
 
     def __init__(self) -> None:
         self._event = threading.Event()
         self._decision: str | None = None  # "continue" | "stop" | None (timeout)
+        self.prompt_message_id: int | None = None
 
     def deliver(self, decision: str) -> None:
         self._decision = decision
@@ -351,11 +359,12 @@ def _make_step_check(bot: TelegramBot, chat_id: int):
             _active_step_controllers[chat_id] = ctrl
         try:
             try:
-                bot.send(
+                sent = bot.send(
                     chat_id,
                     f"⏸ Already {step_n} steps. Last action: {last_name}. Continue?",
                     reply_markup=_step_callback_markup(chat_id),
                 )
+                ctrl.prompt_message_id = int(sent.get("message_id", 0)) or None
             except Exception as e:
                 print(f"  [step-check] send failed: {e} — stopping task")
                 return False
@@ -393,17 +402,22 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     with _active_lock:
         ctrl = _active_step_controllers.get(chat_id)
 
-    # Deliver the decision FIRST. If we did the bot.edit roundtrip
-    # before this and Telegram was slow, ctrl.wait() could expire and
-    # stop a task the user actually chose to continue. Decision
-    # delivery is in-process and instant; UI cleanup is best-effort.
-    if ctrl is not None:
-        ctrl.deliver(decision)
+    # The click is "live" only if there is a controller AND it points
+    # at THIS prompt. A stale tap on a previous prompt (whose buttons
+    # we failed to strip) would otherwise be delivered as the answer
+    # to the current prompt — wrong control flow.
+    is_live = bool(
+        ctrl is not None
+        and ctrl.prompt_message_id is not None
+        and ctrl.prompt_message_id == cb.message_id
+    )
 
-    # Strip buttons + show outcome. Differentiate live vs stale clicks
-    # so the chat doesn't tell the user "Continued" when the task had
-    # already ended (timeout, prior Stop, or run finished).
-    if ctrl is not None:
+    # Deliver the decision FIRST (in-process, instant). UI cleanup
+    # follows over the network and is best-effort.
+    if is_live:
+        ctrl.deliver(decision)  # type: ignore[union-attr]
+
+    if is_live:
         decided_text = ("✓ Continued" if decision == "continue"
                         else "⏵ Stopped")
     else:
@@ -415,7 +429,7 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
         print(f"  [step-check] edit failed: {e}")
 
     try:
-        if ctrl is not None:
+        if is_live:
             bot.answer_callback(
                 cb.callback_id,
                 text="Continuing" if decision == "continue" else "Stopping",

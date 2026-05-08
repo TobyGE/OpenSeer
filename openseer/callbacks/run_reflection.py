@@ -321,6 +321,15 @@ class RunReflectionCallback(Callback):
 
         if site_skill is not None:
             target_skill = site_skill
+        elif site_domain:
+            # We identified a website but no skill for it exists yet.
+            # Don't fall through to find_skill_for_app(app=browser) —
+            # that would match other site skills (e.g. x-com-web which
+            # declares requires.apps: [Google Chrome]) and the model
+            # would dutifully merge this run's site facts into the
+            # wrong site's skill. Leave target_skill=None so the
+            # reflection prompts a NEW site skill instead.
+            target_skill = None
         elif app_name:
             target_skill = find_skill_for_app(skill_groups, app_name, preferred_names=read_names)
         elif read_names:

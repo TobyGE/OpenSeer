@@ -442,7 +442,14 @@ class RunReflectionCallback(Callback):
         target_skill = None
         if site_domain:
             target_skill = find_skill(skill_groups, canonical_site_skill_name(site_domain))
-        if target_skill is None and (app_name or read_names):
+        # Mirror the no-fallback rule from _reflect: when a browser run
+        # detected a site domain but no skill for that site exists yet,
+        # don't fall back to find_skill_for_app(<browser>) — that would
+        # match other site skills declaring the same browser as host
+        # and the proposed new <site>-web name would get rejected as a
+        # mismatch. Stay on the new-site path.
+        if (target_skill is None and not site_domain
+                and (app_name or read_names)):
             target_skill = find_skill_for_app(skill_groups, app_name, preferred_names=read_names)
         if target_skill is not None:
             return target_skill.name

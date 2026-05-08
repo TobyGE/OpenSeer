@@ -1509,10 +1509,21 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         # the user to tap Continue / Stop). When step_check returns
         # False (or times out), append a synthetic `terminate(fail)` so
         # the transcript reflects "user stopped" cleanly.
+        #
+        # Why floor-division instead of `% interval == 0`: a chain of
+        # multiple actions can cross the boundary in a single iteration
+        # (e.g. history grows 19 -> 21 with click+click), and an exact
+        # modulo check would silently skip that turn and never fire
+        # again. Comparing floor(len/interval) to the previous floor
+        # catches any boundary crossing.
+        cur_floor = (len(history) // step_check_interval
+                     if step_check_interval > 0 else 0)
+        prev_floor = ctx.get("_step_check_last_floor", 0)
         if (step_check is not None and step_check_interval > 0
                 and len(history) > 0
-                and len(history) % step_check_interval == 0
+                and cur_floor > prev_floor
                 and not is_done):
+            ctx["_step_check_last_floor"] = cur_floor
             try:
                 should_continue = bool(step_check(len(history), history))
             except Exception as e:

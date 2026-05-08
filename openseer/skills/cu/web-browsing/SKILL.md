@@ -233,3 +233,70 @@ If AX returns very few elements for a clearly busy page:
 - Using `cmd+shift+R` in Safari expecting a hard reload (you'll
   toggle Reader Mode instead).
 - Relying on `cmd+T` "definitely opens a new blank tab" in Arc.
+
+## Confirming before hard-to-reverse actions
+
+Web tasks frequently end at a payment / submission / publish button.
+Don't click it. Stop one step earlier and confirm with `ask_user`
+when it's available, attaching a screenshot of the current screen
+so the user sees exactly what's about to happen.
+
+Trigger list — confirm before:
+
+- ANY payment / "Place Order" / "Confirm Purchase" button (AMC,
+  Amazon, Costco, Instacart, etc.).
+- Posting a tweet / X reply / LinkedIn post / Reddit comment.
+- Sending a chat message in WeChat / Slack / iMessage web.
+- Deleting an item, archiving a chat, unsubscribing from a paid
+  service.
+- Submitting any form whose result is hard to undo (visa application,
+  appointment booking, account closure).
+
+Pattern:
+
+```
+1. bash screencapture -x /tmp/openseer-confirm.png
+2. ask_user kind=confirm question="Place this order? Total $39.96,
+   2 Adult tickets, AMC Stony Brook 17, Sat May 9 7:30 PM, seats G3+G4."
+   attachments=["/tmp/openseer-confirm.png"]
+3. read the reply on next turn:
+   - "Yes" → click the final button → terminate(done) verifying it
+   - "No"  → terminate(fail) with reason "user declined"
+```
+
+Don't confirm trivial intermediate clicks (Continue / Get Tickets /
+Next page navigation). Confirm only the final commit step where
+backing out costs the user real money or social capital.
+
+## What MEMORY.md skips vs what it does NOT skip
+
+MEMORY.md cached preferences let you skip **choice / preference
+asks**, NOT the **final commit confirmation**. The "Confirming
+before hard-to-reverse actions" rule above is non-negotiable: even
+when every preference is cached, the very last click that costs the
+user real money / sends a public message / submits a form STILL
+needs an `ask_user(kind="confirm")` with a screenshot.
+
+Concrete distinction:
+
+| Cached in MEMORY.md | Effect |
+|---|---|
+| `payment: AMEX 1234 (default)` | Skip "which card?" — auto-select AMEX 1234 in the card picker. **Still confirm before clicking Place Order.** |
+| `shipping: Palo Alto, CA 94025` | Skip "which address?" — pick the matching saved address. Still confirm the final order. |
+| `seats: rear row, center` | Skip "which seat type?" — auto-pick rear-center seats. Still confirm before purchase. |
+
+Only ask preference questions when MEMORY.md doesn't cover them OR
+when the on-screen options don't match what's cached.
+
+## Memory-first lookup → narrowed ask
+
+When MEMORY.md PARTIALLY answers (e.g. has payment but not address),
+phrase the ask narrowly:
+
+```
+ask_user kind=confirm question="Use the cached AMEX 1234 and ship to
+[address from form prefill]?"
+```
+
+vs. starting from scratch with a broad open-ended ask. Less typing
+for the user, faster path to action.

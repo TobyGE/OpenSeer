@@ -295,6 +295,9 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         verified_by_steps=_verified_steps(obj.get("verified_by_steps")),
         attachments=obj.get("attachments"),
         selector=obj.get("selector"),
+        kind=obj.get("kind"),
+        question=obj.get("question"),
+        options=obj.get("options"),
     )
 
 
@@ -695,6 +698,7 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         session_context: str = "",
         step_check_interval: int = 0,
         step_check=None,
+        ask_user=None,
         quiet: bool = False) -> list[Step]:
     """Run the agent loop. Returns the list of steps."""
     # Each task gets a short trace_id; runs land under ~/.openseer/runs/<id>/
@@ -973,6 +977,38 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         personal_block = render_personal_block()
         if personal_block:
             instructions = instructions + "\n\n" + personal_block
+
+        # ask_user is only advertised to the model when the caller
+        # actually wired a callback (daemon: Phase 3, REPL: stdin).
+        # Without this gate, models follow the prompt and emit
+        # ask_user, then the agent's no-callback fallback synthesises
+        # terminate(fail) — turning every confirmation point into a
+        # surprise task abort. The chain handler still recognises
+        # ask_user even without this block (so a model that emits it
+        # for some other reason gracefully degrades), but it's not
+        # listed in the tool catalog the model normally reads.
+        if ask_user is not None:
+            instructions = instructions + "\n\n" + (
+                "## Tool: ask_user (available this run)\n"
+                "Pause and ask the user a question. The reply comes back "
+                "as text on the next turn.\n\n"
+                "  `kind` ∈ confirm | choose | text\n"
+                "    confirm: Yes/No (auto options unless `options` overrides)\n"
+                "    choose : caller surfaces the explicit `options` list\n"
+                "    text   : free-form text reply\n"
+                "  `question`    the prompt to show the user (required)\n"
+                "  `options`     list of strings (required for kind=choose)\n"
+                "  `attachments` optional file paths (screenshot / image) to "
+                "show the user along with the question — e.g. a screenshot of "
+                "the selected seats before confirming.\n\n"
+                "Use ask_user BEFORE hard-to-reverse actions (paying, sending "
+                "messages, posting publicly, deleting). Use it at decision "
+                "points where the user clearly has a preference (which card / "
+                "seat / shipping address). Don't ask about things already "
+                "answered in MEMORY.md — read MEMORY.md first.\n"
+                "After ask_user the chain ends; next turn you'll see "
+                "`User reply (kind=...): <answer>` in the user message."
+            )
         # Force image attach on this turn if (a) the model just used
         # `screenshot`, (b) AX returned 0 elements (image is the only
         # signal), or (c) the very first turn (handled inside _build_input).
@@ -1023,6 +1059,14 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         # whole chain. This is the speedup of #4.
         terminate = False
         chain_aborted = False
+        # is_done is normally assigned per-action inside the chain loop
+        # at the "validate done" branch, but observation actions
+        # (read_skill, get_app_state, screenshot, ask_user, …) break
+        # the chain BEFORE that branch runs. Initialise here so the
+        # post-loop step-check read (`not is_done`) can't hit an
+        # UnboundLocalError on an iteration whose only action was an
+        # observation.
+        is_done = False
         for chain_pos, action in enumerate(actions):
             sn_action = len(history) + 1
             label = f"step{sn_action:02d}"
@@ -1086,6 +1130,123 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                 if skipped > 0:
                     say(f"  [{label}] (skipping {skipped} chained "
                         f"action(s) — read_skill ends the chain)")
+                break
+
+            # ask_user — pause and request user input.
+            #
+            # Three kinds the model can emit:
+            #   - "confirm" → caller surfaces Yes/No (default Yes/No when
+            #     options not supplied)
+            #   - "choose"  → caller surfaces the explicit `options` list
+            #   - "text"    → caller takes a free-form text reply
+            #
+            # The actual user-prompting happens in the `ask_user`
+            # callback (daemon: Telegram inline buttons + waited-on
+            # event; REPL: stdin). When no callback is registered, we
+            # synthesize a `terminate(fail)` so the run still ends
+            # cleanly with the question in `reason` — the user can
+            # answer in the next chat message.
+            if action.name == "ask_user":
+                question = (action.question or action.text
+                            or action.reason or "").strip()
+                kind = (action.kind or "text").lower()
+                if kind not in ("confirm", "choose", "text"):
+                    kind = "text"
+                opts = action.options or (
+                    ["Yes", "No"] if kind == "confirm" else None
+                )
+                if not question:
+                    err_msg = ("ERROR: ask_user needs `question` (the "
+                               "prompt to show the user).")
+                    say(f"  [{label}] {err_msg}")
+                    err_step = Step(
+                        idx=sn_action, action=action,
+                        result=err_msg,
+                        raw_response=raw,
+                        usage=usage if chain_pos == 0 else None,
+                        elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                        screenshot_path=raw_path,
+                        frame_hash=frame_hash,
+                    )
+                    record_step(err_step)
+                    break
+                if ask_user is None:
+                    # Fallback: convert into terminate(fail) so the
+                    # daemon's chat session_context surfaces the
+                    # question on the next user message. Not ideal,
+                    # but safer than just erroring.
+                    say(f"  [{label}] ask_user: no callback wired — "
+                        f"converting to terminate(fail)")
+                    fb_action = Action(
+                        name="terminate", status="fail",
+                        reason=question,
+                        attachments=action.attachments,
+                    )
+                    fb_step = Step(
+                        idx=sn_action, action=fb_action,
+                        result=f"task ended: fail — {question}",
+                        raw_response=raw,
+                        usage=usage if chain_pos == 0 else None,
+                        elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                        screenshot_path=raw_path,
+                        frame_hash=frame_hash,
+                    )
+                    record_step(fb_step)
+                    say(f"\n[agent] terminated: fail — {question}")
+                    terminate = True
+                    break
+                # Live ask: callback handles UI + blocks for reply.
+                try:
+                    reply = ask_user(
+                        question=question, kind=kind, options=opts,
+                        attachments=list(action.attachments or []),
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    reply = None
+                    say(f"  [{label}] ask_user error: {e!r}")
+                if reply is None:
+                    # Timeout / failure / user closed — terminate.
+                    fb_action = Action(
+                        name="terminate", status="fail",
+                        reason=(f"User did not respond to: {question}"),
+                    )
+                    fb_step = Step(
+                        idx=sn_action, action=fb_action,
+                        result="ask_user timed out / no reply",
+                        raw_response=raw,
+                        usage=usage if chain_pos == 0 else None,
+                        elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                        screenshot_path=raw_path,
+                        frame_hash=frame_hash,
+                    )
+                    record_step(fb_step)
+                    say(f"\n[agent] terminated: fail — ask_user timed out")
+                    terminate = True
+                    break
+                result = (f"User reply (kind={kind}): {reply}")
+                skipped = len(actions) - chain_pos - 1
+                if skipped > 0:
+                    skipped_names = [a.name for a in actions[chain_pos + 1:]]
+                    result = (f"{result}\n\n[NOTE] {skipped} chained "
+                              f"action(s) after this ask_user were SKIPPED "
+                              f"(you decided them without the user reply): "
+                              f"{skipped_names}. Re-decide on the next "
+                              f"turn with the reply above in context.")
+                ann_path = out_dir / f"{label.replace('.', '_')}-action.png"
+                frame.image.save(ann_path)
+                say(f"  [{label}] result:  ask_user[{kind}] → {reply!r}"[:200])
+                step = Step(idx=sn_action, action=action, result=result,
+                            raw_response=raw,
+                            usage=usage if chain_pos == 0 else None,
+                            elapsed_ms=elapsed_ms if chain_pos == 0 else 0,
+                            screenshot_path=raw_path, annotated_path=ann_path,
+                            frame_hash=frame_hash)
+                record_step(step)
+                if skipped > 0:
+                    say(f"  [{label}] (skipping {skipped} chained "
+                        f"action(s) — ask_user ends the chain)")
                 break
 
             # get_app_state — explicit AX refresh, optionally targeting a

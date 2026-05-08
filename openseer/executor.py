@@ -43,6 +43,13 @@ class Action:
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
     selector: str | None = None    # for read_page: optional CSS selector to extract a specific element instead of full body
+    # ask_user: pause and request user input. `kind` ∈ {"confirm", "choose", "text"}.
+    # `question` is the prompt shown to the user; `options` is required for kind="choose"
+    # and ignored otherwise (kind="confirm" auto-uses Yes/No). `attachments` reuses
+    # the terminate field — model lists screenshot/file paths it wants to send.
+    kind: str | None = None
+    question: str | None = None
+    options: list[str] | None = None
     status: str | None = None      # for terminate: "done" | "fail"
     reason: str | None = None
     thought: str | None = None

@@ -32,6 +32,7 @@ import json
 import signal
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from .agent import OAI_MODEL, run as agent_run
@@ -304,17 +305,24 @@ _STEP_CHECK_TIMEOUT_S = 300.0
 class _StepCheckController:
     """Handle for the worker thread to wait on a Telegram button click.
 
-    `prompt_message_id` is set after the prompt is successfully sent.
-    The callback handler uses it to ignore taps on PREVIOUS step
-    prompts whose buttons weren't successfully stripped (e.g. when
-    `bot.edit` failed transiently): a stale click would otherwise
-    be delivered as the answer to the CURRENT prompt because the
-    controller dict is keyed only by chat_id."""
+    Each prompt gets a fresh ``nonce`` baked into its callback_data.
+    The callback handler matches the received nonce against the
+    controller's nonce to bind clicks to exactly the prompt that
+    spawned them — robust to BOTH:
+      - Stale taps on a PRIOR prompt whose buttons we failed to
+        strip after edit (old nonce, no match -> ignored)
+      - Taps that race ahead of bot.send returning (we set the
+        nonce BEFORE sending, so the match works regardless of
+        whether prompt_message_id has been recorded yet)
+
+    nonce is set in __init__ before the controller is registered, so
+    the field is never observed unset by the callback path.
+    """
 
     def __init__(self) -> None:
         self._event = threading.Event()
         self._decision: str | None = None  # "continue" | "stop" | None (timeout)
-        self.prompt_message_id: int | None = None
+        self.nonce: str = uuid.uuid4().hex[:12]
 
     def deliver(self, decision: str) -> None:
         self._decision = decision
@@ -330,11 +338,13 @@ _active_step_controllers: dict[int, _StepCheckController] = {}
 _active_lock = threading.Lock()
 
 
-def _step_callback_markup(chat_id: int) -> dict:
+def _step_callback_markup(chat_id: int, nonce: str) -> dict:
     return {
         "inline_keyboard": [[
-            {"text": "Continue", "callback_data": f"step_continue:{chat_id}"},
-            {"text": "Stop",     "callback_data": f"step_stop:{chat_id}"},
+            {"text": "Continue",
+             "callback_data": f"step_continue:{chat_id}:{nonce}"},
+            {"text": "Stop",
+             "callback_data": f"step_stop:{chat_id}:{nonce}"},
         ]]
     }
 
@@ -359,12 +369,11 @@ def _make_step_check(bot: TelegramBot, chat_id: int):
             _active_step_controllers[chat_id] = ctrl
         try:
             try:
-                sent = bot.send(
+                bot.send(
                     chat_id,
                     f"⏸ Already {step_n} steps. Last action: {last_name}. Continue?",
-                    reply_markup=_step_callback_markup(chat_id),
+                    reply_markup=_step_callback_markup(chat_id, ctrl.nonce),
                 )
-                ctrl.prompt_message_id = int(sent.get("message_id", 0)) or None
             except Exception as e:
                 print(f"  [step-check] send failed: {e} — stopping task")
                 return False
@@ -398,18 +407,23 @@ def _handle_step_callback(bot: TelegramBot, cb: TelegramCallback) -> bool:
     if not (data.startswith("step_continue:") or data.startswith("step_stop:")):
         return False
     decision = "continue" if data.startswith("step_continue:") else "stop"
+    # callback_data shape: "step_<decision>:<chat_id>:<nonce>". Older
+    # clients (or messages from an earlier daemon version without the
+    # nonce) only have two parts — treat those as stale.
+    parts = data.split(":")
+    recv_nonce = parts[2] if len(parts) >= 3 else ""
     chat_id = cb.chat_id
     with _active_lock:
         ctrl = _active_step_controllers.get(chat_id)
 
-    # The click is "live" only if there is a controller AND it points
-    # at THIS prompt. A stale tap on a previous prompt (whose buttons
-    # we failed to strip) would otherwise be delivered as the answer
-    # to the current prompt — wrong control flow.
+    # The click is "live" only if there is a controller AND its nonce
+    # matches the one baked into the clicked button's callback_data.
+    # The nonce is set in the controller __init__ BEFORE the prompt
+    # is sent, so this comparison is robust to:
+    #   - taps that race ahead of bot.send returning
+    #   - taps on PRIOR prompts whose buttons survived a failed edit
     is_live = bool(
-        ctrl is not None
-        and ctrl.prompt_message_id is not None
-        and ctrl.prompt_message_id == cb.message_id
+        ctrl is not None and recv_nonce and ctrl.nonce == recv_nonce
     )
 
     # Deliver the decision FIRST (in-process, instant). UI cleanup

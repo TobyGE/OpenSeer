@@ -1761,11 +1761,59 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                             say(f"  [{label}] ⚠ BLOCKED by safety: {why}")
                             safety_blocked = True
                         elif cb.mode == "confirm":
-                            try:
-                                ans = input(f"  ⚠ safety: {why}. Run anyway? [y/N] ").strip().lower()
-                            except EOFError:
-                                ans = ""
-                            if ans not in ("y", "yes"):
+                            # Route confirmation through ask_user when
+                            # the caller wired it (daemon: Telegram
+                            # buttons; future REPL ask_user impls). Falls
+                            # back to stdin input() ONLY when no
+                            # ask_user is available — without that gate,
+                            # daemon users on their phone never see the
+                            # safety prompt and the input() blocks the
+                            # worker thread waiting for a stdin reply
+                            # at the Mac that the user can't reach.
+                            user_ok = False
+                            if ask_user is not None:
+                                # Brief action descriptor so the user
+                                # has context for the decision.
+                                act_desc = action.name
+                                if action.name == "click":
+                                    if action.target:
+                                        act_desc = f"click {action.target!r}"
+                                    elif action.x is not None:
+                                        act_desc = f"click at ({action.x},{action.y})"
+                                elif action.name == "bash" and action.cmd:
+                                    act_desc = f"bash: {action.cmd[:160]}"
+                                elif action.name == "type" and action.text:
+                                    act_desc = f"type: {action.text[:80]!r}"
+                                try:
+                                    reply = ask_user(
+                                        question=(
+                                            f"⚠ Safety check: {why}\n\n"
+                                            f"About to: {act_desc}\n\n"
+                                            f"Proceed?"
+                                        ),
+                                        kind="choose",
+                                        options=["Yes, proceed", "No, abort"],
+                                        attachments=[],
+                                    )
+                                except KeyboardInterrupt:
+                                    raise
+                                except Exception as e:
+                                    say(f"  [{label}] safety ask_user "
+                                        f"errored: {e!r}; aborting")
+                                    reply = None
+                                if reply and reply.strip().lower() in (
+                                    "yes, proceed", "yes", "y", "ok"
+                                ):
+                                    user_ok = True
+                            else:
+                                try:
+                                    ans = input(
+                                        f"  ⚠ safety: {why}. Run anyway? [y/N] "
+                                    ).strip().lower()
+                                except EOFError:
+                                    ans = ""
+                                user_ok = ans in ("y", "yes")
+                            if not user_ok:
                                 say(f"  [{label}] aborted by safety check")
                                 safety_blocked = True
                         else:  # "log" — just print

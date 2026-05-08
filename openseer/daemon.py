@@ -341,19 +341,24 @@ def _make_step_check(bot: TelegramBot, chat_id: int):
                 last_name = history[-1].action.name
             except Exception:
                 pass
-        try:
-            bot.send(
-                chat_id,
-                f"⏸ Already {step_n} steps. Last action: {last_name}. Continue?",
-                reply_markup=_step_callback_markup(chat_id),
-            )
-        except Exception as e:
-            print(f"  [step-check] send failed: {e} — stopping task")
-            return False
+        # Register the controller BEFORE we send the prompt. Otherwise
+        # an instant button-tap can race the bot's poll loop: callback
+        # arrives -> _handle_step_callback finds no controller -> the
+        # click is discarded as "stale", and the worker would then
+        # time out and stop a task the user actually chose to continue.
         ctrl = _StepCheckController()
         with _active_lock:
             _active_step_controllers[chat_id] = ctrl
         try:
+            try:
+                bot.send(
+                    chat_id,
+                    f"⏸ Already {step_n} steps. Last action: {last_name}. Continue?",
+                    reply_markup=_step_callback_markup(chat_id),
+                )
+            except Exception as e:
+                print(f"  [step-check] send failed: {e} — stopping task")
+                return False
             decision = ctrl.wait(_STEP_CHECK_TIMEOUT_S)
         finally:
             with _active_lock:
@@ -771,10 +776,16 @@ def run_daemon() -> int:
     signal.signal(signal.SIGINT, _on_sigint)
     signal.signal(signal.SIGTERM, _on_sigint)
 
+    # Defaults applied with `is None` (not `or`) so an explicit 0 in
+    # the config disables the feature instead of being replaced by
+    # the fallback. Same pattern for max_steps in case someone sets
+    # a smaller cap on purpose.
+    _max_steps_cfg = tg_cfg.get("max_steps")
+    _interval_cfg = tg_cfg.get("step_check_interval")
     on_msg = _make_dispatcher(
         bot, sessions,
-        max_steps=int(tg_cfg.get("max_steps") or 200),
-        step_check_interval=int(tg_cfg.get("step_check_interval") or 30),
+        max_steps=int(_max_steps_cfg) if _max_steps_cfg is not None else 200,
+        step_check_interval=int(_interval_cfg) if _interval_cfg is not None else 30,
         confirm_each=bool(tg_cfg.get("confirm_each", False)),
     )
 

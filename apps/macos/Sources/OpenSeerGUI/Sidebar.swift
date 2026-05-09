@@ -25,26 +25,22 @@ struct Sidebar: View {
             }
             .padding(16)
         }
-        .frame(width: 260)
+        .frame(maxWidth: .infinity)
         .background(.background.secondary)
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("OpenSeer").font(.title2.bold())
-            Text("local + Telegram daemon")
-                .font(.caption).foregroundStyle(.secondary)
-        }
+        Text("OpenSeer").font(.title2.bold())
     }
 
     private var providerSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             sectionHeader("Provider")
             if let s = statusBlob {
-                providerRow(name: "OpenAI · GPT-5.5",
+                providerRow(name: "OpenAI GPT",
                             status: s.providers.openai,
                             isSelected: s.selectedProvider == "openai")
-                providerRow(name: "Anthropic · Haiku 4.5",
+                providerRow(name: "Anthropic Claude",
                             status: s.providers.anthropic,
                             isSelected: s.selectedProvider == "anthropic")
             } else {
@@ -133,14 +129,7 @@ struct Sidebar: View {
                   : "exclamationmark.triangle.fill")
                 .foregroundStyle(status.loggedIn ? .green : .orange)
                 .font(.callout)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(.callout)
-                Text(status.loggedIn
-                     ? "expires in \(status.expiresInS / 3600)h"
-                     : (status.error ?? "needs login"))
-                    .font(.caption2).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.tail)
-            }
+            Text(name).font(.callout)
             Spacer()
             if isSelected {
                 Image(systemName: "circle.fill")

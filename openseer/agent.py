@@ -117,7 +117,12 @@ Then a colon, why, and `Next: <plan>`. Be honest — fake SUCCESS labels compoun
   read_skill     `skill_name` → returns the cheat-sheet body for next turn.
   write_skill    `skill_name` + `skill_body` (full SKILL.md). Persists durable app knowledge.
   write_memory   `entry` — a Markdown line or short block. Appends to MEMORY.md (the user-facts file injected into every run's prompt). Use ONLY for things the user just confirmed and that should persist across runs (payment defaults, shipping addresses, preferences). Do NOT write task-specific values (the title of a movie they just watched, a one-time URL). Format `entry` like the existing MEMORY.md bullets so it merges cleanly. Example: `{{"action":"write_memory","entry":"- payment: AMEX ending 1234 (default)"}}`.
-  terminate      `status` ∈ done|fail, `reason`, and for done: `verified_by_steps`.
+  terminate      `status` ∈ done|fail|answer, `reason`, and for done: `verified_by_steps`.
+                 Use `answer` for purely-conversational replies (greetings, "are you online?",
+                 questions you can answer from prior knowledge / session memory) where NO
+                 desktop interaction is required. `answer` is treated as success and skips
+                 the verified_by_steps requirement — `reason` IS the user-facing reply.
+                 Never use `answer` to dodge a real task that needs clicks/typing.
 
 ## Chain Semantics — state-dependency rule
 
@@ -274,7 +279,7 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         return v
 
     name = obj.get("action") or ""
-    if not name and obj.get("status") in ("done", "fail"):
+    if not name and obj.get("status") in ("done", "fail", "answer"):
         name = "terminate"
     return Action(
         name=name,
@@ -392,6 +397,12 @@ def _validate_done(action: Action, history: list["Step"]) -> str | None:
     is_done = action.name == "done" or (
         action.name == "terminate" and (action.status or "done").lower() == "done"
     )
+    # `status="answer"` is the conversational-reply escape hatch
+    # (greetings, questions answerable from prior knowledge / session
+    # memory). It's success without producing-step verification —
+    # `reason` is itself the user-facing reply. The system prompt
+    # instructs the model to use this only when no desktop work was
+    # needed; abuse falls under the existing run-reflection signal.
     if not is_done:
         return None
     # Compute the producing-step suggestion ONCE so every error path
@@ -802,7 +813,8 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         for cb in cbs:
             cb.on_step_recorded(ctx, step)
         emit(EventType.STEP_RECORDED, step_idx=step.idx,
-             action=step.action.name, result=step.result)
+             action=step.action.name, result=step.result,
+             reason=step.action.reason or "")
 
     for cb in cbs:
         cb.on_run_start(ctx)
@@ -815,6 +827,28 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         sn = i + 1
         ctx["step_idx"] = sn
         emit(EventType.STEP_STARTED)
+
+        # External-stop sentinel. The macOS GUI's Stop button and the
+        # Telegram /stop command both work by `touch out_dir/CANCEL`
+        # — out-of-band so they don't need to signal the daemon
+        # process or care which thread the loop is running on. We
+        # check at the top of every step (fine-grained enough that
+        # the user-perceived latency is bounded by one step's
+        # capture/inference/action cycle).
+        cancel_path = out_dir / "CANCEL"
+        if cancel_path.exists():
+            say(f"\n[agent] external stop requested via {cancel_path.name}")
+            stop_action = Action(
+                name="terminate", status="fail",
+                reason="User pressed Stop.",
+            )
+            stop_step = Step(idx=sn, action=stop_action,
+                             result="user-stopped via Stop button",
+                             raw_response="")
+            history.append(stop_step)
+            emit(EventType.STEP_RECORDED, step=sn,
+                 action=stop_action.name, result=stop_step.result)
+            break
 
         # budget / circuit-breakers can stop us before the next API call
         if not all(cb.on_should_continue(ctx) for cb in cbs):
@@ -2021,6 +2055,11 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
             final_status = "empty"
         elif last.action.name == "terminate":
             final_status = (last.action.status or "done").lower()
+            # `answer` is a success variant for conversational
+            # replies; downstream consumers (GUI footer, Telegram
+            # progress) only know done/fail/cap, so collapse here.
+            if final_status == "answer":
+                final_status = "done"
         elif last.action.name in ("done", "fail", "verify_failed"):
             final_status = last.action.name
         else:

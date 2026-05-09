@@ -3,15 +3,16 @@ import SwiftUI
 
 /// Daemon lifecycle: start / stop a long-running `openseer daemon`
 /// subprocess, watch ~/.openseer/runs/ for new trace dirs that the
-/// daemon spawns, surface them as RunSession objects so they show
-/// up in the same chat panel as locally-launched tasks.
+/// daemon spawns, and group every run into a `ChatThread` so the GUI
+/// can show one row per ongoing conversation rather than one per task.
 @MainActor
 final class DaemonController: ObservableObject {
     @Published private(set) var isRunning: Bool = false
     @Published private(set) var startupError: String? = nil
-    /// All sessions currently or recently visible in the chat. Local
-    /// (user-typed) and remote (daemon-spawned) interleave by ts.
-    @Published private(set) var sessions: [RunSession] = []
+    /// Threads visible in the session list. Each thread holds 1..N
+    /// runs. Telegram traces with the same chat_id share a thread;
+    /// every local prompt gets its own thread.
+    @Published private(set) var threads: [ChatThread] = []
 
     private var stream: CLI.StreamHandle?
     private var runsWatcher: DirectoryWatcher?
@@ -29,29 +30,24 @@ final class DaemonController: ObservableObject {
     /// hasn't been observed yet. The directory watcher reads
     /// task.json from each new dir and, if the prompt matches a
     /// pending claim, skips it instead of producing a duplicate
-    /// .daemonTrace session. Codex P2: without this, the dir
-    /// watcher races the stdout-parsed trace id (no ordering
-    /// guarantee between pipe readability and FS callbacks).
+    /// daemon-side session.
     private var pendingLocalPrompts: [String] = []
-    /// trace_ids we've already attached so the directory watcher
-    /// doesn't double-spawn sessions when the daemon writes multiple
-    /// files into a new run dir.
+    /// trace_ids already attached so the directory watcher doesn't
+    /// double-spawn sessions when the daemon writes multiple files
+    /// into a new run dir.
     private var seenTraces: Set<String> = []
 
     init(binary: String) {
         self.binary = binary
         // On startup, scan existing run dirs so the chat shows
         // recent history rather than appearing empty.
-        loadRecentRuns(limit: 8)
+        loadRecentRuns(limit: 16)
     }
 
     func start() {
         guard !isRunning else { return }
         startupError = nil
         let h = CLI.stream(path: binary, args: ["daemon"]) { line in
-            // Daemon prints status to stdout (human-friendly).
-            // We don't surface it as a RunSession — those come from
-            // file-watching the runs/ dir. Just log for debug.
             if !line.hasPrefix("[stderr] ") {
                 NSLog("openseer daemon: %@", line)
             }
@@ -66,14 +62,8 @@ final class DaemonController: ObservableObject {
             Task {
                 let exit = await h.wait()
                 await MainActor.run {
-                    // Bail if a newer Start has already taken over —
-                    // otherwise this stale wait flips isRunning back
-                    // to false on the live daemon and a follow-up
-                    // Start would spawn a duplicate (codex P2).
                     guard myGen == self.daemonGen else { return }
                     self.isRunning = false
-                    // Suppress error for user-initiated stops (SIGTERM
-                    // shows up as a non-zero exit; not a real failure).
                     if exit != 0 && self.startupError == nil
                         && !self.intentionalStop {
                         self.startupError = "Daemon exited with code \(exit)"
@@ -88,8 +78,6 @@ final class DaemonController: ObservableObject {
 
     func stop() {
         intentionalStop = true
-        // Bump generation so the in-flight wait task ignores its
-        // exit and doesn't clobber a future Start's state.
         daemonGen += 1
         stream?.terminate()
         stream = nil
@@ -100,21 +88,40 @@ final class DaemonController: ObservableObject {
         isRunning = false
     }
 
-    /// Add a locally-spawned session (ChatView calls this when the
-    /// user submits a prompt and the local task starts).
-    func addLocal(session: RunSession) {
-        sessions.append(session)
+    /// ChatView calls this when the user submits a local prompt.
+    /// Each local Send creates its own thread (no continue-thread UX
+    /// in the composer yet; easy to lift later).
+    func addLocalRun(_ s: RunSession) -> ChatThread {
+        let id = "local:" + UUID().uuidString
+        let t = ChatThread(id: id, kind: .local)
+        t.addRun(s)
+        threads.append(t)
+        return t
+    }
+
+    /// Remove a thread (and every run it contains). When
+    /// `deleteRunDirs` is true, also wipe the on-disk trace dirs so
+    /// they don't reappear next launch via `loadRecentRuns`.
+    func deleteThread(_ id: String, deleteRunDirs: Bool) {
+        guard let idx = threads.firstIndex(where: { $0.id == id })
+        else { return }
+        let t = threads[idx]
+        for run in t.runs where run.status == .running { run.cancel() }
+        threads.remove(at: idx)
+        if deleteRunDirs {
+            for run in t.runs {
+                guard let tid = run.traceId else { continue }
+                let runDir = NSHomeDirectory()
+                    + "/.openseer/runs/" + tid
+                try? FileManager.default.removeItem(atPath: runDir)
+            }
+        }
     }
 
     /// Local sessions call this once their subprocess prints its
-    /// trace id (parsed from `[agent] out_dir=…`). Reserves the id
-    /// in seenTraces so the directory watcher's later observation
-    /// doesn't double-spawn it as a fake "remote" daemon session.
-    /// Drops the matching prompt from `pendingLocalPrompts` so a
-    /// later remote run with the same text isn't silently skipped.
-    /// We take prompt explicitly because at this moment task.json
-    /// often hasn't been written yet — the agent prints out_dir
-    /// before its trajectory callback fires (codex P2).
+    /// trace id. Reserves the id in seenTraces so the directory
+    /// watcher's later observation doesn't double-spawn it as a
+    /// daemon trace.
     func reserveLocalTrace(_ traceId: String, prompt: String) {
         seenTraces.insert(traceId)
         if let i = pendingLocalPrompts.firstIndex(of: prompt) {
@@ -123,17 +130,12 @@ final class DaemonController: ObservableObject {
     }
 
     /// ChatView.submit calls this BEFORE spawning the local task,
-    /// so even if the directory watcher fires before the
-    /// subprocess has printed `[agent] out_dir=…` we know to skip
-    /// the new dir. Matches on the exact prompt text from task.json.
+    /// so even if the directory watcher fires before the subprocess
+    /// has printed `[agent] out_dir=…` we know to skip the new dir.
     func claimLocalPrompt(_ prompt: String) {
         pendingLocalPrompts.append(prompt)
     }
 
-    /// Returns true if the dir's task.json prompt matches an
-    /// outstanding local claim, in which case the watcher should
-    /// NOT spawn a daemon session for it. Removes the claim on
-    /// match (one prompt = one claim).
     private func consumePendingClaim(for dir: String) -> Bool {
         let taskPath = dir + "/task.json"
         guard let data = FileManager.default.contents(atPath: taskPath),
@@ -158,13 +160,10 @@ final class DaemonController: ObservableObject {
         }
         runsWatcher?.start()
 
-        // Belt-and-braces poll. A new run dir is created BEFORE
-        // task.json is written; the parent FS event fires once for
-        // the dir creation, but writes INSIDE the child dir don't
-        // trigger more parent events. Without periodic re-scan a
-        // run could be observed in that window with no task.json,
-        // be skipped, and then never picked up. Cheap to poll
-        // every 2s — directory listing is one syscall.
+        // Belt-and-braces poll: parent-dir events fire on dir
+        // creation, but task.json/chat.json are written INTO the
+        // new dir later, which doesn't re-trigger the parent
+        // watcher. Cheap to poll every 2s — one syscall.
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0,
                                          repeats: true) { [weak self] _ in
             Task { @MainActor in self?.scanForNewRuns() }
@@ -177,19 +176,43 @@ final class DaemonController: ObservableObject {
         else { return }
         for name in entries where name != "latest" && !seenTraces.contains(name) {
             let runDir = dir + "/" + name
-            // Validate it looks like a run dir (has task.json).
             let taskFile = runDir + "/task.json"
             guard FileManager.default.fileExists(atPath: taskFile) else { continue }
-            // Skip if the run is owned by an in-flight local
-            // submission. Mark seen so we don't keep checking.
             seenTraces.insert(name)
-            if consumePendingClaim(for: runDir) {
-                continue
-            }
+            if consumePendingClaim(for: runDir) { continue }
+
             let s = RunSession(source: .daemonTrace(traceId: name),
                                binary: binary)
             s.attachToTrace(name)
-            sessions.append(s)
+            attachRunToThread(s, runDir: runDir)
+        }
+    }
+
+    /// Slot a daemon-spawned run into the right ChatThread, creating
+    /// the thread if it doesn't exist. Falls back to a per-run thread
+    /// when chat.json is missing (older traces).
+    private func attachRunToThread(_ s: RunSession, runDir: String) {
+        let key: String
+        let kind: ChatThread.Kind
+        if let meta = ChatMeta.load(runDir: runDir) {
+            key = "tg:\(meta.chatId)"
+            kind = .telegram(chatId: meta.chatId)
+        } else {
+            // No chat.json — likely a pre-grouping trace OR a local
+            // run whose dir we observed (claim should have caught
+            // it; this is the safety net). Use the trace id as the
+            // thread key so it stands alone.
+            key = "trace:" + (s.traceId ?? UUID().uuidString)
+            kind = .local
+        }
+        if let existing = threads.first(where: { $0.id == key }) {
+            existing.addRun(s)
+            // Bump @Published so SwiftUI re-sorts the list.
+            objectWillChange.send()
+        } else {
+            let t = ChatThread(id: key, kind: kind)
+            t.addRun(s)
+            threads.append(t)
         }
     }
 
@@ -199,29 +222,28 @@ final class DaemonController: ObservableObject {
         else { return }
         let dirs = entries.filter { $0 != "latest" }
         // Mark ALL existing dirs as seen so the periodic poll
-        // doesn't treat older traces as "new daemon runs" once
-        // the daemon is started — only show the most recent few
-        // in the chat (codex P2: otherwise old history floods in).
+        // doesn't treat older traces as "new daemon runs" once the
+        // daemon is started.
         for name in dirs { seenTraces.insert(name) }
-        // Sort by modification time, newest first.
         let withMtime: [(String, Date)] = dirs.compactMap { name in
             let p = dir + "/" + name
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: p),
                   let m = attrs[.modificationDate] as? Date else { return nil }
             return (name, m)
         }.sorted { $0.1 > $1.1 }
-        for (name, _) in withMtime.prefix(limit) {
+        for (name, mtime) in withMtime.prefix(limit) {
+            let runDir = dir + "/" + name
             let s = RunSession(source: .daemonTrace(traceId: name),
                                binary: binary)
+            s.createdAt = mtime
             s.attachToTrace(name)
-            sessions.insert(s, at: 0)
+            attachRunToThread(s, runDir: runDir)
         }
     }
 }
 
 /// Watch a directory for entry-list changes (creation/deletion of
-/// children) via DispatchSource. Cheaper than polling and matches
-/// the kqueue path Foundation uses for FSEvents.
+/// children) via DispatchSource.
 final class DirectoryWatcher: @unchecked Sendable {
     private let path: String
     private let onChange: @Sendable () -> Void

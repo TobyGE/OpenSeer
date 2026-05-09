@@ -41,6 +41,9 @@ struct BubbleView: View {
                 if expanded || !turn.actions.isEmpty {
                     actionList
                 }
+                if let final = turn.finalOutput {
+                    finalOutputBlock(final)
+                }
                 tokenLine
             }
             Spacer(minLength: 30)
@@ -97,6 +100,24 @@ struct BubbleView: View {
             }
         }
         .padding(.leading, 4)
+    }
+
+    private func finalOutputBlock(_ text: String) -> some View {
+        // The model's user-facing final answer (terminate.reason).
+        // Visually distinct from the per-step thought lines so the
+        // user can see the conclusion at a glance without expanding.
+        Text(text)
+            .font(.body)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10).padding(.vertical, 8)
+            .background(Color.accentColor.opacity(0.10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.accentColor.opacity(0.25), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .padding(.top, 2)
     }
 
     private var tokenLine: some View {
@@ -173,16 +194,20 @@ struct SessionFooter: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer()
-            // Local subprocess we own → real cancel is meaningful
-            // (terminate the process). For .daemonTrace runs we
-            // don't have process control; the underlying remote
-            // task would keep going. Hide the button rather than
-            // mislead the user.
+            // Stop is cooperative for both sources: the agent
+            // checks `<run>/CANCEL` at the top of every step and
+            // exits with a synthetic terminate. For local runs we
+            // also hard-kill the subprocess after a short grace
+            // window in case the loop is stuck in a long call.
             if session.status == .running {
-                if case .localPrompt = session.source {
-                    Button("Cancel") { session.cancel() }
-                        .controlSize(.small)
+                Button {
+                    session.cancel()
+                } label: {
+                    Label("Stop", systemImage: "stop.fill")
+                        .labelStyle(.titleAndIcon)
                 }
+                .controlSize(.small)
+                .tint(.red)
             }
         }
         .padding(.horizontal, 12)

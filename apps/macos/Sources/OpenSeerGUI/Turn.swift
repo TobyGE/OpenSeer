@@ -34,6 +34,19 @@ struct Turn: Identifiable {
         var name: String
         var summary: String
         var result: String
+        /// `action.reason` from the agent. For `terminate` this is
+        /// the model's final user-facing reply; we surface it as a
+        /// distinct "final output" block in the bubble.
+        var reason: String = ""
+    }
+
+    /// Terminate's reason text, if this turn ended with a terminate
+    /// action. Used by the bubble to render a final-output block.
+    var finalOutput: String? {
+        guard let last = actions.last,
+              last.name == "terminate",
+              !last.reason.isEmpty else { return nil }
+        return last.reason
     }
 }
 
@@ -93,9 +106,11 @@ enum TurnFolder {
             if var last = turns.last, !last.isUserPrompt {
                 let name = event.data["action"]?.string ?? "?"
                 let result = event.data["result"]?.string ?? ""
+                let reason = event.data["reason"]?.string ?? ""
                 let summary = makeActionSummary(event.data)
                 last.actions.append(.init(
-                    name: name, summary: summary, result: result
+                    name: name, summary: summary,
+                    result: result, reason: reason
                 ))
                 turns[turns.count - 1] = last
                 return true

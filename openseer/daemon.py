@@ -147,13 +147,29 @@ def _build_remote_notice(host_term: tuple[str, int] | None) -> str:
         "Telegram chat. The user is NOT at this Mac right now — they only "
         "see what you send back. So:\n"
         f"{host_line}"
+        "  - The Mac's screen may show OpenSeer's own GUI window "
+        "    ('OpenSeerGUI') with a 'Sessions' sidebar listing past "
+        "    task titles. That sidebar is INTERNAL trace metadata "
+        "    for trace files on disk — it is NOT the conversation "
+        "    history of this Telegram chat. The only authoritative "
+        "    history is the RECENT SESSION CONTEXT block below. "
+        "    Never treat OpenSeerGUI's UI text as something the user "
+        "    said in this chat, and never click/type into it.\n"
+        "  - CONVERSATIONAL inputs (greetings like '在吗' / 'hi' / 'are "
+        "    you online?', questions about you/the daemon, small talk, "
+        "    or anything answerable from prior knowledge or this chat's "
+        "    session memory) → respond on step 1 with "
+        "    `terminate(status=\"answer\", reason=\"<your reply>\")`. "
+        "    DO NOT click around or type into apps to manufacture a "
+        "    fake reply — the user's Mac is unattended and any UI "
+        "    actions will go to whatever app happens to be in focus.\n"
         "  - If the request is AMBIGUOUS with no referent in this chat's "
         "    prior tasks (e.g. 'do it again' with nothing in history), "
         "    terminate(fail) and ask for clarification — don't guess.\n"
-        "  - DESCRIBE what's on screen in terminate.reason. To attach an "
-        "    image, take a screenshot to a file and include "
-        "    `\"attachments\":[\"/path.png\"]` on terminate "
-        "    (PNG/JPG/GIF, ≤10 MB).\n"
+        "  - For real desktop tasks: DESCRIBE what's on screen in "
+        "    terminate.reason. To attach an image, take a screenshot "
+        "    to a file and include `\"attachments\":[\"/path.png\"]` "
+        "    on terminate (PNG/JPG/GIF, ≤10 MB).\n"
         "  - VERIFY the actual end state before terminate(done) — no human "
         "    will catch a wrong claim.]"
     )
@@ -165,6 +181,45 @@ _REMOTE_NOTICE: str = _build_remote_notice(None)
 
 
 # ─── live-progress callback ─────────────────────────────────────────────────
+
+class _ActiveRunTracker(Callback):
+    """Publishes the active run's out_dir to module state so `/stop`
+    can write a CANCEL sentinel into it. Cleared on run end. We can't
+    just use _latest_trace_id() because the latest symlink might
+    point at a finished run; we need the in-flight one specifically.
+
+    Also writes ``chat.json`` into the run dir with the originating
+    Telegram chat_id, so GUIs and tooling can group runs by
+    conversation thread (one Telegram chat = one ongoing thread,
+    even if it contains many trace dirs).
+    """
+
+    name = "ActiveRunTracker"
+
+    def __init__(self, chat_id: int | None = None,
+                 chat_kind: str = "telegram") -> None:
+        self.chat_id = chat_id
+        self.chat_kind = chat_kind
+
+    def on_run_start(self, ctx):  # type: ignore[override]
+        global _active_run_dir
+        out_dir: Path = ctx.get("out_dir")
+        with _active_lock:
+            _active_run_dir = out_dir
+        if self.chat_id is not None and out_dir is not None:
+            try:
+                (out_dir / "chat.json").write_text(json.dumps({
+                    "kind": self.chat_kind,
+                    "chat_id": self.chat_id,
+                }, ensure_ascii=False, indent=2))
+            except Exception as e:
+                print(f"  [chat-meta] failed to write chat.json: {e!r}")
+
+    def on_run_end(self, ctx):  # type: ignore[override]
+        global _active_run_dir
+        with _active_lock:
+            _active_run_dir = None
+
 
 class _TelegramProgress(Callback):
     """Pushes step-level progress into the user's Telegram chat by
@@ -241,6 +296,11 @@ def _format_result(history: list, dur_s: float) -> str:
     a = last.action
     if a.name == "terminate":
         st = (a.status or "done").lower()
+        # `answer` is a conversational success — render the reason
+        # by itself so the Telegram reply reads naturally instead
+        # of "✓ answer  1 steps · 2s".
+        if st == "answer":
+            return a.reason or "(no reply text)"
         glyph = "✓" if st == "done" else "⚠"
         head = f"{glyph} {st}  {len(history)} steps · {dur_s:.1f}s"
         return f"{head}\n\n{a.reason or ''}" if a.reason else head
@@ -258,7 +318,11 @@ def _canonical_status(history: list) -> tuple[str, str]:
     a = last.action
     result = a.reason or ""
     if a.name == "terminate":
-        return (a.status or "done").lower(), result
+        st = (a.status or "done").lower()
+        # `answer` is a conversational success — collapse to "done"
+        # so session-memory and downstream filters still see a uniform
+        # outcome bucket.
+        return ("done" if st == "answer" else st), result
     if a.name in ("done", "fail", "verify_failed"):
         return a.name, result
     return "cap", result
@@ -939,6 +1003,12 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
 _worker_lock = threading.Lock()       # only one agent_run at a time
 _worker_thread: threading.Thread | None = None
 
+# When a worker is running an agent_run, this points at its run dir so
+# `/stop` can cooperatively interrupt by writing a CANCEL sentinel
+# inside it. Cleared once the worker returns. Read+write under
+# `_active_lock`. None means no task is currently running.
+_active_run_dir: Path | None = None
+
 # Per-chat "generation" counter bumped by /new (and /reset). The worker
 # captures the gen at task start; if it's been bumped by the time the
 # task finishes, the worker skips appending its TaskSummary so a mid-run
@@ -952,6 +1022,7 @@ _SLASH_HELP = (
     "Available commands:\n"
     "  /new       — clear this chat's session memory and start fresh\n"
     "  /reset     — alias for /new\n"
+    "  /stop      — interrupt the currently running task\n"
     "  /status    — show whether a task is currently running + last action\n"
     "  /help      — this list\n\n"
     "Anything else is treated as a task. The daemon runs one task at a "
@@ -1031,6 +1102,42 @@ def _maybe_handle_slash(bot: TelegramBot, sessions: ChatSessions,
             pass
         return True
 
+    if head == "/stop":
+        # Cooperative stop: write CANCEL into the active run dir.
+        # The agent loop checks for it at the top of every step and
+        # appends a synthetic terminate(fail) when found. We don't
+        # signal the daemon process directly because that would kill
+        # ALL chats' tasks (and the daemon).
+        with _active_lock:
+            run_dir = _active_run_dir
+        if run_dir is None:
+            try:
+                bot.send(msg.chat_id,
+                         "Nothing is running right now.",
+                         reply_to=msg.message_id)
+            except Exception:
+                pass
+            return True
+        try:
+            (run_dir / "CANCEL").write_text(
+                f"requested by chat {msg.chat_id} at {time.time()}\n"
+            )
+        except Exception as e:
+            try:
+                bot.send(msg.chat_id, f"⚠️ Couldn't request stop: {e}",
+                         reply_to=msg.message_id)
+            except Exception:
+                pass
+            return True
+        try:
+            bot.send(msg.chat_id,
+                     "🛑 Stop requested — the agent will exit at the "
+                     "next step boundary.",
+                     reply_to=msg.message_id)
+        except Exception:
+            pass
+        return True
+
     if head == "/status":
         running = bool(_worker_thread and _worker_thread.is_alive())
         prior = sessions.history(msg.chat_id)
@@ -1105,6 +1212,10 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
         if ack_msg_id:
             callbacks.append(_TelegramProgress(bot, msg.chat_id, ack_msg_id,
                                                msg.text))
+        # Track the active run's dir so /stop can write CANCEL into it,
+        # and tag the run with its chat_id so GUIs can group traces by
+        # Telegram conversation thread.
+        callbacks.append(_ActiveRunTracker(chat_id=msg.chat_id))
 
         step_check = (_make_step_check(bot, msg.chat_id, msg.sender_id)
                       if step_check_interval > 0 else None)

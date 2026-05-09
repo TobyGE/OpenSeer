@@ -10,7 +10,7 @@ struct OpenSeerApp: App {
         WindowGroup("OpenSeer") {
             RootView()
                 .environmentObject(openseer)
-                .frame(minWidth: 760, minHeight: 540)
+                .frame(minWidth: 960, minHeight: 600)
         }
         .windowResizability(.contentSize)
     }

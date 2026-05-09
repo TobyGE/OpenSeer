@@ -20,6 +20,21 @@ final class RunSession: ObservableObject, Identifiable {
     @Published var status: Status = .running
     @Published var traceId: String? = nil
     @Published var errorMessage: String? = nil
+    /// When this session was created in the GUI. Used to order the
+    /// session list (newest first). For historical daemon traces
+    /// loaded at startup we override this from the run dir's mtime.
+    var createdAt: Date = Date()
+
+    /// Title for the session list row. Falls back to the prompt
+    /// captured in the source enum for local runs, or the first
+    /// user-prompt turn for daemon-tailed runs, or the trace id.
+    var title: String {
+        if case .localPrompt(let p) = source, !p.isEmpty { return p }
+        if let prompt = turns.first(where: { $0.isUserPrompt })?.promptText,
+           !prompt.isEmpty { return prompt }
+        if let tid = traceId { return "trace \(tid.prefix(8))…" }
+        return "New session"
+    }
 
     enum Status: Equatable {
         case running, done, fail, cap, interrupted
@@ -154,9 +169,31 @@ final class RunSession: ObservableObject, Identifiable {
         watcher?.start()
     }
 
+    /// Cooperative stop. For local runs we both write the CANCEL
+    /// sentinel (so the agent loop exits cleanly with a synthetic
+    /// terminate step) AND terminate the subprocess as a hard
+    /// fallback if the loop is wedged in a long capture/inference
+    /// call. For daemon-spawned runs we can't kill the process
+    /// (it's the daemon's worker thread, killing it would take down
+    /// every other chat) — the sentinel is the only knob we have.
     func cancel() {
-        stream?.terminate()
-        watcher?.stop()
+        if let tid = traceId {
+            let cancelPath = NSHomeDirectory()
+                + "/.openseer/runs/\(tid)/CANCEL"
+            FileManager.default.createFile(
+                atPath: cancelPath,
+                contents: "requested by GUI Stop button\n".data(using: .utf8))
+        }
+        if case .localPrompt = source {
+            // Give the agent a moment to see the sentinel and emit
+            // its synthetic terminate event, then hard-kill if it
+            // hasn't exited.
+            let s = stream
+            Task.detached {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                s?.terminate()
+            }
+        }
         if status == .running { status = .interrupted }
     }
 

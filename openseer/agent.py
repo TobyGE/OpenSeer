@@ -132,6 +132,18 @@ When the next decision needs to observe a new state, emit ONE action and stop.
 Multiple separate `{{...}}{{...}}` JSON objects are FORBIDDEN — that is not chaining,
 that is scripting unobserved state. When in doubt, stay single.
 
+Concrete examples of BAD chains (do not emit these in one response):
+ - `click → key cmd+h → screenshot → key cmd+shift+h → wait`
+   (every action between the click and the final wait depends on what
+   happened on screen, but you didn't look. Emit just `click`, see
+   the next screenshot, then decide.)
+ - `bash → click → bash → click`
+   (the second bash depends on whether the first click landed.)
+ - Any chain longer than 3 actions on a UI you don't fully control.
+
+If you find yourself drafting a chain of 4+ actions in one response,
+stop and emit the FIRST action by itself.
+
 ## Execution Bias
 
  - Act this turn — don't stop with a plan when a tool would move forward.

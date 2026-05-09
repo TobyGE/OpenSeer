@@ -149,14 +149,33 @@ class _PrettyConsole(Callback):
         # over-truncated. We only care about VISIBLE width.
         import re as _re
         visible = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+        # Display columns ≠ character count. CJK / fullwidth / emoji
+        # characters render two columns wide; counting them as one
+        # underestimates the real width and lets the line wrap, which
+        # breaks the \r overwrite (next transient lands on a fresh row
+        # and we accumulate ghost lines per delta — see the 30-line
+        # repeat the user hit when the streaming thought was Chinese).
+        import unicodedata as _ud
+        def _w(ch: str) -> int:
+            cat = _ud.east_asian_width(ch)
+            return 2 if cat in ("W", "F") else 1
+        def _wlen(s: str) -> int:
+            return sum(_w(ch) for ch in s)
         budget = cols - 4                     # leave a small margin
-        if len(visible) > budget:
-            # Drop characters until visible length fits. Keep ANSI codes
-            # at the end intact by truncating the visible portion only.
-            # Simple approach: truncate visible, prefer head + ellipsis,
-            # then re-color-strip so we don't leave dangling escape codes.
-            trimmed = visible[: budget - 1] + "…"
-            text = trimmed
+        if _wlen(visible) > budget:
+            # Greedily truncate by display width, leaving room for "…".
+            target = budget - 1
+            acc = 0
+            cut = 0
+            for i, ch in enumerate(visible):
+                w = _w(ch)
+                if acc + w > target:
+                    cut = i
+                    break
+                acc += w
+            else:
+                cut = len(visible)
+            text = visible[:cut] + "…"
         sys.stdout.write("\r\033[2K  " + text)
         sys.stdout.flush()
         self._transient_active = True

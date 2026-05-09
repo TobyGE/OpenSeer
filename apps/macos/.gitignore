@@ -1,0 +1,11 @@
+# SwiftPM build output
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode user state (if anyone opens Package.swift in Xcode)
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# OS noise
+.DS_Store

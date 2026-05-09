@@ -808,17 +808,12 @@ _BANNER = (
 
 
 def _preflight() -> bool:
-    """Check auth before starting the loop. Returns False if we should bail."""
-    st = auth_mod.token_status()
-    if not st.has_file:
-        print(c("Not logged in.", RED))
-        print(st.summary())
-        print(f"\nRun {c('openseer auth login', CYN)} first.")
-        return False
-    if st.expired:
-        print(c("Login expired.", YEL))
-        print(st.summary())
-        print(f"\nRun {c('openseer auth login', CYN)} to refresh.")
+    """Provider-aware login check before starting the loop. Returns
+    False if we should bail. Dispatches by the resolved provider so
+    Anthropic-only users aren't rejected for missing Codex login."""
+    ok, msg = auth_mod.preflight()
+    if not ok:
+        print(c(msg, YEL))
         return False
     return True
 
@@ -829,7 +824,20 @@ def repl() -> int:
 
     _setup_readline()
     print(_BANNER)
-    print(c(f"  logged in: {auth_mod.token_status().plan_type or '?'}", DIM))
+    # Provider-aware login banner. Codex shows plan_type ("plus"/"pro"/...);
+    # Anthropic shows subscriptionType from the Keychain blob.
+    from .agent import _resolve_provider
+    _prov = _resolve_provider()
+    if _prov == "anthropic":
+        try:
+            from . import anthropic_messages as _ant
+            _st = _ant.token_status()
+            _label = f"Claude ({_st.get('subscription') or '?'})"
+        except Exception:
+            _label = "Claude"
+    else:
+        _label = f"Codex ({auth_mod.token_status().plan_type or '?'})"
+    print(c(f"  logged in: {_label}", DIM))
     print()
 
     # Session memory: bounded summary of recent tasks + variable bag.

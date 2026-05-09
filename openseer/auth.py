@@ -116,6 +116,54 @@ def codex_cli_path() -> Optional[str]:
     return shutil.which("codex")
 
 
+def preflight() -> tuple[bool, str]:
+    """Provider-aware login check used before launching agent.run.
+
+    OpenSeer supports two providers (selected by config + OPENSEER_PROVIDER):
+    OpenAI / Codex OAuth and Anthropic / Claude Code OAuth. The original
+    preflight was hardcoded to the Codex check, which rejected
+    Anthropic-only users — they had to log into Codex unnecessarily for
+    `openseer task` and the REPL to even start. This dispatches by the
+    resolved provider.
+
+    Returns (ok, message). ``ok=False`` means the caller should print the
+    message and exit; ``ok=True`` means the agent loop is safe to start.
+    """
+    # Avoid a top-level import cycle (agent imports anthropic_messages).
+    from .agent import _resolve_provider
+
+    provider = _resolve_provider()
+    if provider == "anthropic":
+        try:
+            from . import anthropic_messages as _ant
+        except Exception as e:
+            return False, f"❌ Anthropic provider selected but import failed: {e}"
+        try:
+            st = _ant.token_status()
+        except Exception as e:
+            return False, f"❌ Anthropic token check raised: {e}"
+        if not st.get("present"):
+            err = st.get("error") or "Claude Code OAuth not found in macOS Keychain."
+            return False, (
+                f"❌ {err}\n\nLog into Claude Code first:\n"
+                f"    open Claude.app and sign in\n"
+                f"    (or `claude` CLI to launch the OAuth flow)"
+            )
+        if int(st.get("expires_in_s", 0)) <= 0:
+            return False, ("⚠️  Claude Code OAuth token appears expired. "
+                           "Open Claude.app and sign in again.")
+        return True, ""
+
+    # default: openai (Codex OAuth in ~/.codex/auth.json)
+    st = token_status()
+    if not st.has_file:
+        return False, st.summary() + "\n\nLog in first:\n    openseer auth login\n"
+    if st.expired:
+        return False, ("⚠️  ChatGPT OAuth token appears expired.\n"
+                       + st.summary() + "\nTry: openseer auth login")
+    return True, ""
+
+
 def run_codex_login() -> int:
     """Spawn `codex login` in the foreground (interactive). Returns exit code.
 

@@ -41,16 +41,14 @@ def _add_task_args(ap: argparse.ArgumentParser) -> None:
 
 
 def cmd_task(args: argparse.Namespace) -> int:
-    # quick sanity check before running anything heavy
-    st = auth_mod.token_status()
-    if not st.has_file:
-        print(st.summary())
-        print("\nLog in first:\n    openseer auth login\n")
-        return 1
-    if st.expired:
-        print("⚠️  ChatGPT OAuth token appears expired.")
-        print(st.summary())
-        print("Try: openseer auth login")
+    # Provider-aware login check before running anything heavy. Older
+    # code only checked Codex/ChatGPT OAuth, which rejected users on
+    # Anthropic config — they got an "ChatGPT OAuth token" error even
+    # though their `provider` was set to anthropic. preflight() checks
+    # the right backend.
+    ok, msg = auth_mod.preflight()
+    if not ok:
+        print(msg)
         return 1
 
     run(args.task, max_steps=args.max_steps, dry_run=not args.execute,

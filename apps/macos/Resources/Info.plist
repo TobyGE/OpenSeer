@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>OpenSeer</string>
+    <key>CFBundleExecutable</key>
+    <string>OpenSeerGUI</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.openseer.OpenSeer</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>OpenSeer</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <!-- Permission usage strings. Accessibility + Screen Recording
+         are requested at runtime by AXIsProcessTrusted /
+         CGRequestScreenCaptureAccess; macOS shows these strings in
+         the system prompt. -->
+    <key>NSAccessibilityUsageDescription</key>
+    <string>OpenSeer reads on-screen UI elements (button text, labels) so the agent can decide what to click.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>OpenSeer scripts apps via AppleEvents to switch focus and read window titles.</string>
+</dict>
+</plist>

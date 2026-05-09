@@ -62,23 +62,32 @@ final class SetupViewModel: ObservableObject {
         isProbing = false
     }
 
-    /// Run `openseer auth login` in the background, refresh on exit.
-    /// (Currently this hits Codex CLI's flow; Anthropic login goes
-    /// through Claude.app — we open it via `open -a Claude` instead.)
+    /// `openseer auth login --provider openai` — codex CLI's
+    /// browser-based OAuth.
     func runOpenAILogin() async {
-        _ = await CLI.run(path: binary, args: ["auth", "login"])
+        _ = await CLI.run(path: binary,
+                          args: ["auth", "login", "--provider", "openai"])
         await probe()
     }
 
-    /// Open Claude.app so the user can complete OAuth there. Best-
-    /// effort; if Claude isn't installed we surface that on the next
-    /// probe via the anthropic.error field.
+    /// `openseer auth login --provider anthropic` — claude CLI's
+    /// browser-based OAuth (`claude auth login` under the hood).
+    /// If `claude` isn't installed the call returns non-zero and
+    /// the next probe surfaces it via `anthropic.error`.
     func runAnthropicLogin() async {
-        _ = await CLI.run(path: "/usr/bin/open", args: ["-a", "Claude"])
-        // Give Claude a moment to focus before the next probe; even
-        // if the user hasn't clicked through yet, the GUI's manual
-        // refresh button will pick up the new state.
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        _ = await CLI.run(path: binary,
+                          args: ["auth", "login", "--provider", "anthropic"])
+        await probe()
+    }
+
+    /// `openseer permissions request` — calls AXIsProcessTrusted
+    /// (with prompt) AND CGRequestScreenCaptureAccess from the
+    /// PYTHON process so macOS adds it to the Privacy lists. The
+    /// .app's TCC grants don't propagate to the python child;
+    /// without this the user could never get python into those
+    /// lists and runs would silently fail to capture/control.
+    func runPermissionRequest() async {
+        _ = await CLI.run(path: binary, args: ["permissions", "request"])
         await probe()
     }
 

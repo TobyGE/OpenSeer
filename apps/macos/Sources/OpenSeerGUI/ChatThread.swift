@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 /// A logical conversation thread. Holds 1..N RunSession objects in
 /// chronological order. The session list shows ChatThreads (not raw
@@ -16,6 +17,13 @@ final class ChatThread: ObservableObject, Identifiable {
     let id: String              // e.g. "tg:12345" or "local:<uuid>"
     let kind: Kind
     @Published var runs: [RunSession] = []
+    /// Forward subscriptions: when a child RunSession publishes a
+    /// change (turns appended, status flipped on task_finished), we
+    /// re-publish so the SessionRow watching `thread.title` /
+    /// `thread.status` re-evaluates. Without this the list row
+    /// stays frozen on the trace-id fallback even after events
+    /// have been parsed.
+    private var childCancellables: [UUID: AnyCancellable] = [:]
 
     enum Kind: Equatable {
         case local
@@ -58,11 +66,18 @@ final class ChatThread: ObservableObject, Identifiable {
         runs.contains { $0.status == .running }
     }
 
-    /// Append a run to the thread. No-op if already present.
+    /// Append a run to the thread. No-op if already present. Also
+    /// subscribes to the run's objectWillChange so this thread
+    /// re-publishes whenever a child run's turns / status update.
     func addRun(_ s: RunSession) {
-        if !runs.contains(where: { $0.id == s.id }) {
-            runs.append(s)
-        }
+        guard !runs.contains(where: { $0.id == s.id }) else { return }
+        runs.append(s)
+        childCancellables[s.id] = s.objectWillChange
+            .sink { [weak self] _ in
+                // Force SessionRow / detail-pane re-render. We're
+                // already on the main actor (RunSession is @MainActor).
+                self?.objectWillChange.send()
+            }
     }
 }
 

@@ -322,9 +322,9 @@ private struct AnthropicLoginView: View {
             } else {
                 Label("Claude Code not signed in", systemImage: "person.crop.circle.badge.questionmark")
                     .foregroundStyle(.orange)
-                Text("Open Claude.app and sign in there. OpenSeer reads the OAuth token Claude stores in macOS Keychain — no separate auth needed.")
+                Text("Click Sign in — your browser will open for OAuth. OpenSeer reuses the token Claude Code stores in macOS Keychain. Requires the `claude` CLI (`npm install -g @anthropic-ai/claude-code`).")
                     .font(.callout).foregroundStyle(.secondary)
-                Button("Open Claude.app") {
+                Button("Sign in with Claude") {
                     Task {
                         isLoggingIn = true
                         await model.runAnthropicLogin()
@@ -347,20 +347,26 @@ private struct PermissionsStepView: View {
         let p = model.status?.permissions
         VStack(alignment: .leading, spacing: 12) {
             Text("macOS permissions").font(.title2.bold())
-            Text("OpenSeer needs Accessibility (to inject mouse/keyboard) and Screen Recording (to capture screenshots). Both are checked against THIS process — once you grant them to your terminal app (or Claude/Cursor/whichever launches OpenSeer), the daemon inherits the same grant.")
+            Text("OpenSeer needs Accessibility (to inject mouse/keyboard) and Screen Recording (to capture screenshots). Click each \"Request\" button — macOS will prompt and add OpenSeer to the relevant Privacy list. After flipping the toggle in System Settings, hit Refresh below.")
                 .foregroundStyle(.secondary)
 
             permissionRow(
                 title: "Accessibility",
                 granted: p?.accessibility ?? false,
-                fix: "Open System Settings → Privacy & Security → Accessibility",
-                deepLink: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                onRequest: {
+                    Task { await model.runPermissionRequest() }
+                    // Also open Settings — request runs in
+                    // background so the user doesn't have to wait.
+                    Permissions.openSystemSettings(pane: .accessibility)
+                }
             )
             permissionRow(
                 title: "Screen Recording",
                 granted: p?.screenRecording ?? false,
-                fix: "Open System Settings → Privacy & Security → Screen Recording",
-                deepLink: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                onRequest: {
+                    Task { await model.runPermissionRequest() }
+                    Permissions.openSystemSettings(pane: .screenRecording)
+                }
             )
 
             if (p?.accessibility ?? false) && (p?.screenRecording ?? false) {
@@ -372,7 +378,7 @@ private struct PermissionsStepView: View {
     }
 
     private func permissionRow(title: String, granted: Bool,
-                               fix: String, deepLink: String) -> some View {
+                               onRequest: @escaping () -> Void) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: granted ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(granted ? .green : .orange)
@@ -382,14 +388,30 @@ private struct PermissionsStepView: View {
                 if granted {
                     Text("Granted.").font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Text(fix).font(.caption).foregroundStyle(.secondary)
-                    Button("Open System Settings") {
-                        if let url = URL(string: deepLink) {
-                            NSWorkspace.shared.open(url)
+                    Text("Click Request — macOS will prompt and "
+                         + "add OpenSeer to the Privacy list. Then "
+                         + "flip the toggle and tap Refresh.\n\n"
+                         + "If OpenSeer is ALREADY in the list and "
+                         + "the toggle looks on, this build's "
+                         + "signature differs from the previous one "
+                         + "(every rebuild gets a new ad-hoc "
+                         + "signature). Click the – button to "
+                         + "remove OpenSeer from the list, then "
+                         + "click Request to add it back fresh.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Button("Request") { onRequest() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        Button("Open Settings") {
+                            if title == "Accessibility" {
+                                Permissions.openSystemSettings(pane: .accessibility)
+                            } else {
+                                Permissions.openSystemSettings(pane: .screenRecording)
+                            }
                         }
+                        .controlSize(.small)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
                 }
             }
             Spacer()

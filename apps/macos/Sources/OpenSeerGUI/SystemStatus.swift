@@ -83,11 +83,16 @@ extension SystemStatus.Telegram {
 /// on parse failure so callers can show an error rather than crash.
 @MainActor
 final class StatusProbe {
+    /// Whether the bundled-python CLI sees TCC permissions as
+    /// granted. The python child is the process that actually
+    /// captures the screen and drives mouse/keyboard, so its view
+    /// is authoritative — overriding from Swift would falsely
+    /// green-light a setup where only the .app is in the Privacy
+    /// list but the python child isn't.
     static func fetch(binary: String) async -> SystemStatus? {
         let r = await CLI.run(path: binary, args: ["check", "--json"])
         guard r.exitCode == 0 else { return nil }
         guard let data = r.stdout.data(using: .utf8) else { return nil }
-        let decoder = JSONDecoder()
-        return try? decoder.decode(SystemStatus.self, from: data)
+        return try? JSONDecoder().decode(SystemStatus.self, from: data)
     }
 }

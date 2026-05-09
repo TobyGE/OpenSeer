@@ -69,6 +69,13 @@ def cmd_auth_status(args: argparse.Namespace) -> int:
 
 
 def cmd_auth_login(args: argparse.Namespace) -> int:
+    # `--provider` lets the GUI's setup wizard trigger the right
+    # OAuth browser flow without each side reimplementing the
+    # shell-out. Default stays Codex (legacy callers).
+    provider = (getattr(args, "provider", None) or "openai").lower()
+    if provider == "anthropic":
+        from .setup_wizard import run_claude_login
+        return run_claude_login()
     return auth_mod.run_codex_login()
 
 
@@ -88,6 +95,16 @@ def cmd_check(args: argparse.Namespace) -> int:
     and as a quick CLI diagnostic for users."""
     from . import check as _check
     return _check.main(json_out=bool(args.json))
+
+
+def cmd_permissions_request(args: argparse.Namespace) -> int:
+    """Trigger the macOS Accessibility + Screen-Recording prompts
+    FROM THIS python process so it ends up in the relevant Privacy
+    lists. The GUI's setup wizard calls this when the user clicks
+    Request — without it, the python child never appears in System
+    Settings and capture/control silently fail at runtime."""
+    from . import check as _check
+    return _check.request_permissions()
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -125,6 +142,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Emit a JSON blob instead of human summary")
     p_check.set_defaults(func=cmd_check)
 
+    p_perm = sub.add_parser(
+        "permissions",
+        help="Request TCC prompts (Accessibility, Screen Recording) "
+             "from THIS python process so macOS adds it to the "
+             "Privacy lists.",
+    )
+    sub_perm = p_perm.add_subparsers(dest="perm_cmd", required=True)
+    sub_perm.add_parser("request",
+                        help="Trigger the prompts and exit"
+                        ).set_defaults(func=cmd_permissions_request)
+
     p_task = sub.add_parser("task", help="Run the agent on a one-off task")
     _add_task_args(p_task)
     p_task.set_defaults(func=cmd_task)
@@ -145,13 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
     sub_auth = p_auth.add_subparsers(dest="auth_cmd", metavar="{status,login,logout}")
     sub_auth.required = True
     sub_auth.add_parser("status", help="Show login state").set_defaults(func=cmd_auth_status)
-    sub_auth.add_parser("login",  help="Log in via Codex CLI").set_defaults(func=cmd_auth_login)
+    p_login = sub_auth.add_parser(
+        "login",
+        help="Run the OAuth browser flow for the selected provider",
+    )
+    p_login.add_argument(
+        "--provider", choices=["openai", "anthropic"], default="openai",
+        help="openai → codex login (default); anthropic → claude auth login",
+    )
+    p_login.set_defaults(func=cmd_auth_login)
     sub_auth.add_parser("logout", help="Wipe local tokens").set_defaults(func=cmd_auth_logout)
 
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "check", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "check", "permissions", "-h", "--help"}
 
 
 def main() -> None:

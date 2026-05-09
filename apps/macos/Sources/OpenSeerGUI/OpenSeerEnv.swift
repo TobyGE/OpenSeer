@@ -53,6 +53,10 @@ final class OpenSeerEnv: ObservableObject {
             )
             return
         }
+        // Note: StatusProbe.fetch already replaces blob.permissions
+        // with Swift-side probes. The python child's TCC identity
+        // differs from the .app's, so the JSON's permission flags
+        // are unreliable in the bundled release.
         provider = blob.selectedProvider ?? ""
 
         // Build a one-line summary for the chat header.
@@ -83,12 +87,23 @@ final class OpenSeerEnv: ObservableObject {
         }
     }
 
-    /// Find `openseer` on $PATH. We try in order:
-    ///   1. ./.venv/bin/openseer  (the dev workflow most contributors use)
-    ///   2. /usr/local/bin/openseer
-    ///   3. /opt/homebrew/bin/openseer
-    ///   4. plain $PATH lookup via `which`
+    /// Find `openseer`. We try in order:
+    ///   1. Bundled shim at <App>.app/Contents/MacOS/openseer (DMG release)
+    ///   2. ./.venv/bin/openseer  (dev workflow)
+    ///   3. /usr/local/bin/openseer
+    ///   4. /opt/homebrew/bin/openseer
+    ///   5. plain $PATH lookup via `which`
     private func locateBinary() -> String? {
+        // The release .app bundles its own Python + openseer. The
+        // shim lives in Resources/ (not MacOS/ — extra scripts in
+        // MacOS confuse codesign). Prefer it over PATH so a stale
+        // system openseer doesn't hijack a user who installed the
+        // .app and never `pip install`'d anything.
+        let bundled = Bundle.main.bundlePath
+            + "/Contents/Resources/openseer"
+        if FileManager.default.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
         let candidates: [String] = [
             FileManager.default.currentDirectoryPath + "/.venv/bin/openseer",
             "/usr/local/bin/openseer",
@@ -98,9 +113,18 @@ final class OpenSeerEnv: ObservableObject {
             if FileManager.default.isExecutableFile(atPath: c) { return c }
         }
         // Fall back to `which`. Some users have it via pyenv/conda shims.
+        // GUI processes launched by Finder inherit a sparse PATH
+        // (/usr/bin:/bin) — prepend the usual locations so `which`
+        // can find pyenv/conda/npm-global installs.
         let task = Process()
         task.launchPath = "/usr/bin/env"
         task.arguments = ["which", "openseer"]
+        var env = ProcessInfo.processInfo.environment
+        let extra = "/opt/homebrew/bin:/usr/local/bin:"
+            + (NSHomeDirectory() + "/.local/bin:")
+            + (NSHomeDirectory() + "/.npm-global/bin")
+        env["PATH"] = extra + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        task.environment = env
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = Pipe()

@@ -32,3 +32,7 @@ logs/
 .openseer/
 oauth-tokens.json
 openseer.egg-info
+
+# macOS app build artifacts
+apps/macos/dist/
+apps/macos/.build-cache/

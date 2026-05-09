@@ -195,6 +195,46 @@ def collect() -> dict[str, Any]:
     }
 
 
+def request_permissions() -> int:
+    """Trigger the TCC prompts FROM THIS python process so macOS
+    adds it to the Accessibility / Screen-Recording Privacy lists.
+    The bundled .app's TCC grants don't transfer to the python
+    child; the user has to grant them to python directly. macOS
+    only surfaces a process in those lists once it's actually
+    called the relevant API, which is what we do here.
+
+    Idempotent: calling twice is harmless; if already granted, the
+    APIs return immediately without any UI.
+    """
+    granted_ax = False
+    granted_sr = False
+    try:
+        # AXIsProcessTrustedWithOptions(prompt=true) — opens the
+        # "OpenSeer wants to control your computer" dialog and
+        # registers this process in the AX list.
+        from ApplicationServices import (  # type: ignore[import-untyped]
+            AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
+        )
+        from CoreFoundation import CFDictionaryCreate, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks  # type: ignore[import-untyped]
+        opts = {kAXTrustedCheckOptionPrompt: True}
+        granted_ax = bool(AXIsProcessTrustedWithOptions(opts))
+    except Exception as e:
+        print(f"  [perms] accessibility request failed: {e!r}")
+    try:
+        # CGRequestScreenCaptureAccess prompts AND registers in the
+        # Screen Recording list. First call is the magic one — it
+        # makes the row appear in System Settings so the user can
+        # toggle it on.
+        from Quartz import CGRequestScreenCaptureAccess  # type: ignore[import-untyped]
+        granted_sr = bool(CGRequestScreenCaptureAccess())
+    except Exception as e:
+        print(f"  [perms] screen-recording request failed: {e!r}")
+    print(f"accessibility:    {'granted' if granted_ax else 'pending — toggle in System Settings'}")
+    print(f"screen recording: {'granted' if granted_sr else 'pending — toggle in System Settings'}")
+    return 0
+
+
 def main(json_out: bool = True) -> int:
     """CLI entry. ``json_out=True`` prints a single JSON object;
     ``False`` is a brief human summary for terminal use."""

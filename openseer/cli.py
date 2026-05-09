@@ -71,12 +71,22 @@ def cmd_auth_status(args: argparse.Namespace) -> int:
 def cmd_auth_login(args: argparse.Namespace) -> int:
     # `--provider` lets the GUI's setup wizard trigger the right
     # OAuth browser flow without each side reimplementing the
-    # shell-out. Default stays Codex (legacy callers).
+    # shell-out. Default stays openai (legacy callers).
     provider = (getattr(args, "provider", None) or "openai").lower()
     if provider == "anthropic":
-        from .setup_wizard import run_claude_login
-        return run_claude_login()
-    return auth_mod.run_codex_login()
+        if getattr(args, "legacy", False):
+            from .setup_wizard import run_claude_login
+            return run_claude_login()
+        from . import oauth_anthropic
+        return oauth_anthropic.run_login()
+    # OpenAI: run the OAuth flow directly so users don't need the
+    # Codex CLI installed. Falls through to codex CLI only if our
+    # native flow can't bind its callback port (busy 1455) and the
+    # user explicitly wants the legacy path via `--legacy`.
+    if getattr(args, "legacy", False):
+        return auth_mod.run_codex_login()
+    from . import oauth_openai
+    return oauth_openai.run_login()
 
 
 def cmd_auth_logout(args: argparse.Namespace) -> int:
@@ -179,7 +189,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_login.add_argument(
         "--provider", choices=["openai", "anthropic"], default="openai",
-        help="openai → codex login (default); anthropic → claude auth login",
+        help="openai → ChatGPT OAuth (default); anthropic → Claude OAuth",
+    )
+    p_login.add_argument(
+        "--legacy", action="store_true",
+        help="(openai only) shell out to `codex login` instead of "
+             "the built-in OAuth flow. Requires the Codex CLI.",
     )
     p_login.set_defaults(func=cmd_auth_login)
     sub_auth.add_parser("logout", help="Wipe local tokens").set_defaults(func=cmd_auth_logout)

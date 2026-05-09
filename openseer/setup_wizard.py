@@ -113,6 +113,14 @@ def _claude_cli_path() -> str | None:
     return shutil.which("claude")
 
 
+def _run_openai_login() -> int:
+    """ChatGPT OAuth via the native PKCE flow. Replaces the old
+    `codex login` shell-out so the setup wizard works on a clean
+    machine without the Codex CLI installed."""
+    from . import oauth_openai
+    return oauth_openai.run_login()
+
+
 def run_claude_login() -> int:
     """Trigger Claude Code's OAuth browser flow via `claude auth login`.
     Returns the subprocess exit code; 0 = success, the OAuth blob is now
@@ -224,11 +232,11 @@ def check_login(allow_login: bool = True) -> bool:
         _fail(f"auth file is unreadable: {st.error}")
         if not allow_login:
             return False
-        if not _ask("Re-run codex login to recreate it? [Y/n]"):
+        if not _ask("Re-run ChatGPT login to recreate it? [Y/n]"):
             return False
-        rc = auth_mod.run_codex_login()
+        rc = _run_openai_login()
         if rc != 0:
-            _fail(f"codex login exited with code {rc}.")
+            _fail(f"OpenAI login exited with code {rc}.")
             return False
         st = auth_mod.token_status()
     if st.has_file and not st.expired and not st.error:
@@ -242,12 +250,12 @@ def check_login(allow_login: bool = True) -> bool:
     if not allow_login:
         return False
 
-    if not _ask("Run codex login now? [Y/n]"):
+    if not _ask("Run ChatGPT login now? [Y/n]"):
         _fail("Skipped — re-run `openseer setup` when ready.")
         return False
-    rc = auth_mod.run_codex_login()
+    rc = _run_openai_login()
     if rc != 0:
-        _fail(f"codex login exited with code {rc}.")
+        _fail(f"OpenAI login exited with code {rc}.")
         return False
     # re-check
     st = auth_mod.token_status()

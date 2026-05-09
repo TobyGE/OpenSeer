@@ -53,11 +53,25 @@ Rules:
 - If the failure was only network/API/SSL, do not propose a skill update for
   that cause.
 - Prefer `Skill update: none` unless the run taught reusable app behavior.
-- If a concrete website skill target is provided and the run discovered
-  avoidable, reusable site behavior such as a wrong URL route, a search
-  submission footgun, an overlay/suggestion requirement, or a product-card
-  navigation workaround, propose that website skill update. Do not leave it
-  as `none` when the same lesson would clearly save future steps.
+- Triggers for proposing a skill update — propose when ANY of these hold,
+  not only when something went wrong:
+    (a) the run completed (or partially completed) an end-to-end flow on
+        a site/app whose multi-step happy-path order would save the next
+        run from re-discovering it (e.g. AMC: result → Get Tickets →
+        showtime → seat map → Continue → ticket type → Continue →
+        food → Continue → Confirm Purchase). Worked-as-intended sequences
+        are still durable knowledge.
+    (b) the run discovered a footgun: a wrong URL route, a search
+        submission gotcha, an overlay/suggestion requirement, a
+        product-card navigation workaround, an invisible login wall,
+        a stale tab handler, etc.
+    (c) the run learned where a specific control lives (which sidebar
+        houses purchase history, which keyboard shortcut opens search,
+        which menu has the export option) when that location is not
+        obvious from the page chrome alone.
+  Do not leave it as `none` when the same lesson would clearly save
+  future steps. End-to-end flow ordering on consumer sites is almost
+  always trigger (a).
 - If an existing skill target is provided, update that exact skill name.
 - Do not create task-specific skills such as wechat-message or wechat-group.
 - One macOS app should usually have one CU skill named <app-slug>-mac.

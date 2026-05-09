@@ -548,11 +548,19 @@ def _maybe_route_message_to_ask(bot: TelegramBot,
 
 # ─── step check-in (every N steps the daemon asks the user to continue) ──
 
-# Default cadence: ask after every 30 steps. Hard cap on max_steps stays
-# at 200 (set in run_daemon's tg_cfg defaults). Timeout: 5 minutes — if
-# the user doesn't tap a button, we stop the task. Conservative choice
-# (skip the wrong action > do the wrong action).
-_STEP_CHECK_TIMEOUT_S = 300.0
+# Default cadence: ask after every 30 steps. Hard cap on max_steps
+# stays at 200 (set in run_daemon's tg_cfg defaults).
+#
+# Timeout: 60 seconds. The check-in is an "intermission" — a chance
+# for the user to interject if the run is going off the rails. If
+# they don't reply, the task keeps going (auto-continue). Reasoning:
+# the user already authorised the task by sending it, and step
+# check-ins fire mid-run; defaulting to "stop" on no-reply meant a
+# user away from their phone returning to find their long task
+# silently aborted at step 30. ask_user (which IS a hard requirement
+# for input — different controller) keeps its 5-min stop-on-timeout
+# behaviour.
+_STEP_CHECK_TIMEOUT_S = 60.0
 
 
 class _StepCheckController:
@@ -631,13 +639,21 @@ def _make_step_check(bot: TelegramBot, chat_id: int, sender_id: int):
         ctrl = _StepCheckController(sender_id)
         with _active_lock:
             _active_step_controllers[chat_id] = ctrl
+        sent_msg_id: int | None = None
         try:
             try:
-                bot.send(
+                sent = bot.send(
                     chat_id,
                     f"⏸ Already {step_n} steps. Last action: {last_name}. Continue?",
                     reply_markup=_step_callback_markup(chat_id, ctrl.nonce),
                 )
+                # Capture the prompt message id so we can strip the
+                # keyboard if the user doesn't reply in time. Without
+                # this, a late Stop tap after auto-continue lands on a
+                # popped controller, gets "task already ended", and
+                # the still-running task keeps going — confusing UX.
+                if isinstance(sent, dict):
+                    sent_msg_id = int(sent.get("message_id") or 0) or None
             except Exception as e:
                 print(f"  [step-check] send failed: {e} — stopping task")
                 return False
@@ -650,12 +666,32 @@ def _make_step_check(bot: TelegramBot, chat_id: int, sender_id: int):
             return True
         if decision is None:
             print(f"  [step-check] chat={chat_id} step={step_n} → "
-                  f"timeout (no button click in {int(_STEP_CHECK_TIMEOUT_S)}s)")
-            try:
-                bot.send(chat_id, "⏱ No reply in 5 min — stopping task.")
-            except Exception:
-                pass
-            return False
+                  f"timeout (no button click in {int(_STEP_CHECK_TIMEOUT_S)}s) "
+                  f"— auto-continue")
+            # Strip the keyboard from the original prompt so a late
+            # Stop tap can't pretend to be active. Re-purpose the
+            # message text to reflect the auto-continue, so the chat
+            # also stays scannable.
+            if sent_msg_id is not None:
+                try:
+                    bot.edit(
+                        chat_id, sent_msg_id,
+                        f"⏱ No reply in {int(_STEP_CHECK_TIMEOUT_S)}s — "
+                        f"continuing automatically.",
+                        reply_markup={"inline_keyboard": []},
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    bot.send(
+                        chat_id,
+                        f"⏱ No reply in {int(_STEP_CHECK_TIMEOUT_S)}s — "
+                        f"continuing automatically.",
+                    )
+                except Exception:
+                    pass
+            return True
         print(f"  [step-check] chat={chat_id} step={step_n} → stop")
         return False
 

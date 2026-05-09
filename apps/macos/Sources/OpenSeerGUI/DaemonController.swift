@@ -177,7 +177,24 @@ final class DaemonController: ObservableObject {
         for name in entries where name != "latest" && !seenTraces.contains(name) {
             let runDir = dir + "/" + name
             let taskFile = runDir + "/task.json"
+            let chatFile = runDir + "/chat.json"
+            // task.json is written first by TrajectoryCallback;
+            // chat.json a moment later by _ActiveRunTracker. There
+            // is a brief window where task.json exists but
+            // chat.json doesn't — codex P2: if we marked the trace
+            // seen now and fell back to a local thread, the next
+            // poll would skip the dir and the Telegram conversation
+            // would be split into a fresh standalone session.
+            //
+            // Strategy: defer (don't insert seenTraces) for up to
+            // ~6s if chat.json is missing AND the dir is fresh.
+            // After that we accept whatever's there (older traces
+            // legitimately have no chat.json).
             guard FileManager.default.fileExists(atPath: taskFile) else { continue }
+            if !FileManager.default.fileExists(atPath: chatFile),
+               isDirFresh(runDir, withinSeconds: 6) {
+                continue   // wait for chat.json on the next poll
+            }
             seenTraces.insert(name)
             if consumePendingClaim(for: runDir) { continue }
 
@@ -186,6 +203,16 @@ final class DaemonController: ObservableObject {
             s.attachToTrace(name)
             attachRunToThread(s, runDir: runDir)
         }
+    }
+
+    /// True if the dir was created within `withinSeconds` ago.
+    /// Used to give chat.json a chance to appear before we commit
+    /// to a thread classification.
+    private func isDirFresh(_ path: String,
+                            withinSeconds: TimeInterval) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date else { return false }
+        return Date().timeIntervalSince(mtime) < withinSeconds
     }
 
     /// Slot a daemon-spawned run into the right ChatThread, creating

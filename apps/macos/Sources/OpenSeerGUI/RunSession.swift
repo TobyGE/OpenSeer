@@ -102,12 +102,15 @@ final class RunSession: ObservableObject, Identifiable {
             return
         }
 
-        // 5-second deadline to see the trace_id line. If the CLI
-        // doesn't print one (older builds, or it died before
-        // logging), surface that and fail the session — without a
-        // watcher we'll never get task_finished events.
+        // 15-second deadline to see the trace_id line. CLI is run
+        // with PYTHONUNBUFFERED=1 (CLI.swift) so the line should
+        // arrive within milliseconds, but the agent may already be
+        // mid-screenshot/inference before we attach. If we still
+        // don't see it after 15s assume the subprocess died early
+        // and surface that — without a watcher we'd never get
+        // task_finished events.
         Task.detached { [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
             await MainActor.run {
                 guard let self else { return }
                 if self.watcher == nil {

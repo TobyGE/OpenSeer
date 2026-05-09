@@ -104,8 +104,17 @@ final class OpenSeerEnv: ObservableObject {
         if FileManager.default.isExecutableFile(atPath: bundled) {
             return bundled
         }
+        // Dev workflow puts `openseer` in the repo-root .venv; from
+        // `swift run` cwd that's two levels up (apps/macos → repo).
+        // Codex P2: a single ./venv check missed this case and made
+        // first-launch from the documented `cd apps/macos && swift
+        // run` flow report "CLI missing" unless the user added it to
+        // PATH.
+        let cwd = FileManager.default.currentDirectoryPath
         let candidates: [String] = [
-            FileManager.default.currentDirectoryPath + "/.venv/bin/openseer",
+            cwd + "/.venv/bin/openseer",
+            cwd + "/../.venv/bin/openseer",
+            cwd + "/../../.venv/bin/openseer",
             "/usr/local/bin/openseer",
             "/opt/homebrew/bin/openseer",
         ]

@@ -24,6 +24,7 @@ enum CLI {
                 let task = Process()
                 task.executableURL = URL(fileURLWithPath: path)
                 task.arguments = args
+                task.environment = childEnvironment()
                 let outPipe = Pipe()
                 let errPipe = Pipe()
                 task.standardOutput = outPipe
@@ -62,6 +63,7 @@ enum CLI {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = args
+        task.environment = childEnvironment()
         let outPipe = Pipe()
         let errPipe = Pipe()
         task.standardOutput = outPipe
@@ -115,6 +117,20 @@ enum CLI {
             }
         }
     }
+}
+
+/// Build the env passed to every `openseer …` child. Forces
+/// unbuffered Python I/O so stdout lines (the agent's `out_dir=…`
+/// header in particular) reach our LineBuffer immediately instead
+/// of getting block-buffered behind a pipe — codex P1: without
+/// this the GUI's 5-second deadline to discover a local task's
+/// trace id often expires while the agent is still in capture/
+/// model work, marking the session failed even though it's running
+/// fine.
+private func childEnvironment() -> [String: String] {
+    var env = ProcessInfo.processInfo.environment
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 }
 
 /// Accumulates bytes and flushes complete (newline-terminated) UTF-8

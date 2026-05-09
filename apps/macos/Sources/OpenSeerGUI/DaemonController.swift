@@ -1,0 +1,257 @@
+import Foundation
+import SwiftUI
+
+/// Daemon lifecycle: start / stop a long-running `openseer daemon`
+/// subprocess, watch ~/.openseer/runs/ for new trace dirs that the
+/// daemon spawns, surface them as RunSession objects so they show
+/// up in the same chat panel as locally-launched tasks.
+@MainActor
+final class DaemonController: ObservableObject {
+    @Published private(set) var isRunning: Bool = false
+    @Published private(set) var startupError: String? = nil
+    /// All sessions currently or recently visible in the chat. Local
+    /// (user-typed) and remote (daemon-spawned) interleave by ts.
+    @Published private(set) var sessions: [RunSession] = []
+
+    private var stream: CLI.StreamHandle?
+    private var runsWatcher: DirectoryWatcher?
+    private var pollTimer: Timer?
+    private let binary: String
+    /// Bumped every start/stop. The wait task captures the value at
+    /// spawn time and only mutates state if it still matches —
+    /// otherwise a stale wait from an old handle would clobber the
+    /// freshly-started daemon's state after a rapid Stop+Start.
+    private var daemonGen: Int = 0
+    /// True while the user-initiated stop is in flight, so the wait
+    /// block doesn't surface SIGTERM-style exits as startup errors.
+    private var intentionalStop: Bool = false
+    /// Local prompts that have been spawned but whose run dir
+    /// hasn't been observed yet. The directory watcher reads
+    /// task.json from each new dir and, if the prompt matches a
+    /// pending claim, skips it instead of producing a duplicate
+    /// .daemonTrace session. Codex P2: without this, the dir
+    /// watcher races the stdout-parsed trace id (no ordering
+    /// guarantee between pipe readability and FS callbacks).
+    private var pendingLocalPrompts: [String] = []
+    /// trace_ids we've already attached so the directory watcher
+    /// doesn't double-spawn sessions when the daemon writes multiple
+    /// files into a new run dir.
+    private var seenTraces: Set<String> = []
+
+    init(binary: String) {
+        self.binary = binary
+        // On startup, scan existing run dirs so the chat shows
+        // recent history rather than appearing empty.
+        loadRecentRuns(limit: 8)
+    }
+
+    func start() {
+        guard !isRunning else { return }
+        startupError = nil
+        let h = CLI.stream(path: binary, args: ["daemon"]) { line in
+            // Daemon prints status to stdout (human-friendly).
+            // We don't surface it as a RunSession — those come from
+            // file-watching the runs/ dir. Just log for debug.
+            if !line.hasPrefix("[stderr] ") {
+                NSLog("openseer daemon: %@", line)
+            }
+        }
+        do {
+            try h.start()
+            self.stream = h
+            isRunning = true
+            daemonGen += 1
+            let myGen = daemonGen
+            startWatcher()
+            Task {
+                let exit = await h.wait()
+                await MainActor.run {
+                    // Bail if a newer Start has already taken over —
+                    // otherwise this stale wait flips isRunning back
+                    // to false on the live daemon and a follow-up
+                    // Start would spawn a duplicate (codex P2).
+                    guard myGen == self.daemonGen else { return }
+                    self.isRunning = false
+                    // Suppress error for user-initiated stops (SIGTERM
+                    // shows up as a non-zero exit; not a real failure).
+                    if exit != 0 && self.startupError == nil
+                        && !self.intentionalStop {
+                        self.startupError = "Daemon exited with code \(exit)"
+                    }
+                    self.intentionalStop = false
+                }
+            }
+        } catch {
+            startupError = "spawn failed: \(error)"
+        }
+    }
+
+    func stop() {
+        intentionalStop = true
+        // Bump generation so the in-flight wait task ignores its
+        // exit and doesn't clobber a future Start's state.
+        daemonGen += 1
+        stream?.terminate()
+        stream = nil
+        runsWatcher?.stop()
+        runsWatcher = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
+        isRunning = false
+    }
+
+    /// Add a locally-spawned session (ChatView calls this when the
+    /// user submits a prompt and the local task starts).
+    func addLocal(session: RunSession) {
+        sessions.append(session)
+    }
+
+    /// Local sessions call this once their subprocess prints its
+    /// trace id (parsed from `[agent] out_dir=…`). Reserves the id
+    /// in seenTraces so the directory watcher's later observation
+    /// doesn't double-spawn it as a fake "remote" daemon session.
+    /// Drops the matching prompt from `pendingLocalPrompts` so a
+    /// later remote run with the same text isn't silently skipped.
+    /// We take prompt explicitly because at this moment task.json
+    /// often hasn't been written yet — the agent prints out_dir
+    /// before its trajectory callback fires (codex P2).
+    func reserveLocalTrace(_ traceId: String, prompt: String) {
+        seenTraces.insert(traceId)
+        if let i = pendingLocalPrompts.firstIndex(of: prompt) {
+            pendingLocalPrompts.remove(at: i)
+        }
+    }
+
+    /// ChatView.submit calls this BEFORE spawning the local task,
+    /// so even if the directory watcher fires before the
+    /// subprocess has printed `[agent] out_dir=…` we know to skip
+    /// the new dir. Matches on the exact prompt text from task.json.
+    func claimLocalPrompt(_ prompt: String) {
+        pendingLocalPrompts.append(prompt)
+    }
+
+    /// Returns true if the dir's task.json prompt matches an
+    /// outstanding local claim, in which case the watcher should
+    /// NOT spawn a daemon session for it. Removes the claim on
+    /// match (one prompt = one claim).
+    private func consumePendingClaim(for dir: String) -> Bool {
+        let taskPath = dir + "/task.json"
+        guard let data = FileManager.default.contents(atPath: taskPath),
+              let obj = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let prompt = obj["task"] as? String else {
+            return false
+        }
+        if let i = pendingLocalPrompts.firstIndex(of: prompt) {
+            pendingLocalPrompts.remove(at: i)
+            return true
+        }
+        return false
+    }
+
+    private func startWatcher() {
+        let dir = NSHomeDirectory() + "/.openseer/runs"
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        runsWatcher = DirectoryWatcher(path: dir) { [weak self] in
+            Task { @MainActor in self?.scanForNewRuns() }
+        }
+        runsWatcher?.start()
+
+        // Belt-and-braces poll. A new run dir is created BEFORE
+        // task.json is written; the parent FS event fires once for
+        // the dir creation, but writes INSIDE the child dir don't
+        // trigger more parent events. Without periodic re-scan a
+        // run could be observed in that window with no task.json,
+        // be skipped, and then never picked up. Cheap to poll
+        // every 2s — directory listing is one syscall.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0,
+                                         repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.scanForNewRuns() }
+        }
+    }
+
+    private func scanForNewRuns() {
+        let dir = NSHomeDirectory() + "/.openseer/runs"
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir)
+        else { return }
+        for name in entries where name != "latest" && !seenTraces.contains(name) {
+            let runDir = dir + "/" + name
+            // Validate it looks like a run dir (has task.json).
+            let taskFile = runDir + "/task.json"
+            guard FileManager.default.fileExists(atPath: taskFile) else { continue }
+            // Skip if the run is owned by an in-flight local
+            // submission. Mark seen so we don't keep checking.
+            seenTraces.insert(name)
+            if consumePendingClaim(for: runDir) {
+                continue
+            }
+            let s = RunSession(source: .daemonTrace(traceId: name),
+                               binary: binary)
+            s.attachToTrace(name)
+            sessions.append(s)
+        }
+    }
+
+    private func loadRecentRuns(limit: Int) {
+        let dir = NSHomeDirectory() + "/.openseer/runs"
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir)
+        else { return }
+        let dirs = entries.filter { $0 != "latest" }
+        // Mark ALL existing dirs as seen so the periodic poll
+        // doesn't treat older traces as "new daemon runs" once
+        // the daemon is started — only show the most recent few
+        // in the chat (codex P2: otherwise old history floods in).
+        for name in dirs { seenTraces.insert(name) }
+        // Sort by modification time, newest first.
+        let withMtime: [(String, Date)] = dirs.compactMap { name in
+            let p = dir + "/" + name
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: p),
+                  let m = attrs[.modificationDate] as? Date else { return nil }
+            return (name, m)
+        }.sorted { $0.1 > $1.1 }
+        for (name, _) in withMtime.prefix(limit) {
+            let s = RunSession(source: .daemonTrace(traceId: name),
+                               binary: binary)
+            s.attachToTrace(name)
+            sessions.insert(s, at: 0)
+        }
+    }
+}
+
+/// Watch a directory for entry-list changes (creation/deletion of
+/// children) via DispatchSource. Cheaper than polling and matches
+/// the kqueue path Foundation uses for FSEvents.
+final class DirectoryWatcher: @unchecked Sendable {
+    private let path: String
+    private let onChange: @Sendable () -> Void
+    private var fd: Int32 = -1
+    private var src: DispatchSourceFileSystemObject?
+
+    init(path: String, onChange: @escaping @Sendable () -> Void) {
+        self.path = path
+        self.onChange = onChange
+    }
+
+    func start() {
+        fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let q = DispatchQueue(label: "openseer.dirwatch", qos: .background)
+        let s = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .rename], queue: q)
+        s.setEventHandler { [weak self] in self?.onChange() }
+        s.setCancelHandler { [fd = self.fd] in
+            if fd >= 0 { close(fd) }
+        }
+        s.resume()
+        src = s
+    }
+
+    func stop() {
+        src?.cancel()
+        src = nil
+        fd = -1
+    }
+
+    deinit { stop() }
+}

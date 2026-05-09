@@ -19,7 +19,7 @@ final class OpenSeerEnv: ObservableObject {
         case error(String)
     }
 
-    @Published private(set) var status: Status = .loading
+    @Published var status: Status = .loading
     @Published private(set) var binaryPath: String? = nil
     @Published private(set) var authSummary: String = ""
     @Published private(set) var provider: String = ""

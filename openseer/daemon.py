@@ -939,10 +939,140 @@ def _handle_skill_callback(bot: TelegramBot, cb: TelegramCallback) -> None:
 _worker_lock = threading.Lock()       # only one agent_run at a time
 _worker_thread: threading.Thread | None = None
 
+# Per-chat "generation" counter bumped by /new (and /reset). The worker
+# captures the gen at task start; if it's been bumped by the time the
+# task finishes, the worker skips appending its TaskSummary so a mid-run
+# clear actually stays cleared. Without this, `/new` during a running
+# task wipes prior history but the still-running task's summary lands
+# right after, partially defeating the reset.
+_session_gen: dict[int, int] = {}
+
+
+_SLASH_HELP = (
+    "Available commands:\n"
+    "  /new       — clear this chat's session memory and start fresh\n"
+    "  /reset     — alias for /new\n"
+    "  /status    — show whether a task is currently running + last action\n"
+    "  /help      — this list\n\n"
+    "Anything else is treated as a task. The daemon runs one task at a "
+    "time on this Mac; if a task is already running you'll get a "
+    "\"task in progress\" reply (slash commands always work)."
+)
+
+
+def _maybe_handle_slash(bot: TelegramBot, sessions: ChatSessions,
+                       msg: TelegramMessage,
+                       our_username: str | None = None) -> bool:
+    """Lightweight chat-control commands. Returns True if the message
+    was handled as a command (caller should NOT treat it as a task).
+
+    Commands are case-insensitive, must be the entire message body
+    (no inline arguments yet), and tolerate the @bot suffix Telegram
+    auto-appends in groups (`/new@seer_1101_bot`).
+
+    ``our_username`` is the daemon's own bot username (without `@`).
+    When provided, an explicit `@OtherBot` suffix is rejected so a
+    command addressed to a different bot in the same group can't
+    accidentally drive this daemon (e.g. `/new@OtherBot` should NOT
+    clear OpenSeer's session memory)."""
+    cmd = (msg.text or "").strip()
+    if not cmd.startswith("/"):
+        return False
+    parts = cmd.split()
+    head_full = parts[0]
+    has_args = len(parts) > 1
+    # Honor explicit @suffix: only accept when missing or matching us.
+    if "@" in head_full:
+        verb, _, target = head_full.partition("@")
+        if our_username and target.lower() != our_username.lower():
+            # Command for a different bot — silently ignore so the
+            # other bot can handle it. Don't reply with help.
+            return True
+        head = verb.lower()
+    else:
+        head = head_full.lower()
+
+    # None of the current commands accept inline arguments. Reject
+    # `/new buy tickets` etc. with help — the destructive ones (/new,
+    # /reset) MUST NOT silently fire when the user supplied extra text
+    # they probably intended as task input. Codex flagged this case.
+    if has_args:
+        try:
+            bot.send(
+                msg.chat_id,
+                (f"Command {head!r} doesn't take arguments. "
+                 f"Did you mean to send a task without the slash, or "
+                 f"to run the bare command? " + _SLASH_HELP),
+                reply_to=msg.message_id,
+            )
+        except Exception:
+            pass
+        return True
+
+    if head in ("/new", "/reset"):
+        # Clear and bump the gen as ONE atomic operation under the
+        # _active_lock — same lock the worker uses around its
+        # gen-check + sessions.append. Without this, the worker can
+        # observe gen=match, release the lock, and then this handler
+        # squeezes in a clear+bump before the worker's append, which
+        # repopulates the just-reset chat. (Codex flagged that race.)
+        with _active_lock:
+            n = sessions.clear(msg.chat_id)
+            _session_gen[msg.chat_id] = _session_gen.get(msg.chat_id, 0) + 1
+        try:
+            bot.send(
+                msg.chat_id,
+                (f"🧹 Session memory cleared ({n} prior task"
+                 f"{'s' if n != 1 else ''} forgotten). "
+                 f"Send your next task fresh."),
+                reply_to=msg.message_id,
+            )
+        except Exception:
+            pass
+        return True
+
+    if head == "/status":
+        running = bool(_worker_thread and _worker_thread.is_alive())
+        prior = sessions.history(msg.chat_id)
+        last = prior[-1] if prior else None
+        lines = [
+            f"running: {'yes' if running else 'no'}",
+            f"session memory: {len(prior)} prior task"
+            f"{'s' if len(prior) != 1 else ''}",
+        ]
+        if last:
+            lines.append(f"last task: {last.task[:80]!r} → {last.status}")
+        try:
+            bot.send(msg.chat_id, "\n".join(lines), reply_to=msg.message_id)
+        except Exception:
+            pass
+        return True
+
+    if head == "/help":
+        try:
+            bot.send(msg.chat_id, _SLASH_HELP, reply_to=msg.message_id)
+        except Exception:
+            pass
+        return True
+
+    # Unknown slash command — answer with help so the user discovers
+    # the real ones. Without this branch a typo'd `/news` would fall
+    # through and become a task ("/news" sent to the model).
+    try:
+        bot.send(
+            msg.chat_id,
+            f"Unknown command {head!r}. {_SLASH_HELP}",
+            reply_to=msg.message_id,
+        )
+    except Exception:
+        pass
+    return True
+
 
 def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
                      max_steps: int, step_check_interval: int,
-                     confirm_each: bool):
+                     confirm_each: bool,
+                     bot_username: str | None = None):
     """Returns the on_message callback. Captures bot + session store.
 
     Each incoming message spawns a background worker thread that runs
@@ -953,7 +1083,12 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
     can't be shared.
     """
 
-    def _worker(msg: TelegramMessage, ack_msg_id: int) -> None:
+    def _worker(msg: TelegramMessage, ack_msg_id: int,
+                start_gen: int) -> None:
+        # `start_gen` is captured in on_message synchronously BEFORE
+        # the worker thread is spawned. Reading it here would race
+        # with a /new sent in the gap between thread.start() and the
+        # worker actually scheduling — codex flagged that case.
         # Build session_context: remote-mode notice + prior tasks of this chat
         ctx_parts = [_REMOTE_NOTICE]
         prior_block = sessions.render_context(msg.chat_id)
@@ -1040,18 +1175,42 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
         )
 
         status, result_text = _canonical_status(history)
-        sessions.append(msg.chat_id, TaskSummary(
-            task=msg.text,
-            status=status,
-            result=(result_text or "")[:300],
-            trace_id=trace_id,
-            ts=time.time(),
-        ))
+        # Skip the session-memory append if the user ran /new (or
+        # /reset) while this task was in flight. Combine the gen
+        # check AND the append into a single critical section under
+        # _active_lock so the slash handler can't squeeze a
+        # clear+bump in between (codex P2 race).
+        appended = False
+        with _active_lock:
+            current_gen = _session_gen.get(msg.chat_id, 0)
+            if current_gen == start_gen:
+                sessions.append(msg.chat_id, TaskSummary(
+                    task=msg.text,
+                    status=status,
+                    result=(result_text or "")[:300],
+                    trace_id=trace_id,
+                    ts=time.time(),
+                ))
+                appended = True
+        if not appended:
+            print(f"[telegram] session was /new'd mid-task; "
+                  f"skipping post-task append for chat {msg.chat_id}")
+            print(f"[telegram] replied ({dur:.1f}s, {len(history)} steps, "
+                  f"status={status}, post-reset)")
+            return
         print(f"[telegram] replied ({dur:.1f}s, {len(history)} steps, status={status})")
 
     def on_message(msg: TelegramMessage) -> None:
         global _worker_thread
         print(f"\n[telegram] {msg.sender_name} ({msg.chat_id}) → {msg.text[:80]!r}")
+
+        # Slash commands FIRST — even before ask_user routing. A user
+        # who's mid-conversation with a text ask_user might still want
+        # to /new or /status to bail out; consuming `/new` as the
+        # ask reply would be confusing. The handler returns False for
+        # non-slash messages so normal flow continues.
+        if _maybe_handle_slash(bot, sessions, msg, bot_username):
+            return
 
         # If a text-kind ask_user is currently waiting in this chat,
         # the user's message is the answer to the question — NOT a new
@@ -1085,13 +1244,22 @@ def _make_dispatcher(bot: TelegramBot, sessions: ChatSessions, *,
             print(f"  [telegram] ack failed: {e}")
             ack_msg_id = 0
 
+        # Capture the chat's session generation BEFORE spawning the
+        # worker. If we read it inside the worker thread, a /new sent
+        # in the gap between thread.start() and the worker actually
+        # being scheduled would land its bump first, making
+        # start_gen == current_gen at the end so the worker would
+        # append its summary into the just-cleared session.
+        with _active_lock:
+            start_gen = _session_gen.get(msg.chat_id, 0)
+
         # Spawn worker. daemon=True so the thread doesn't block process
         # exit on Ctrl+C (the worker's blocking subprocess calls are
         # generally non-cancellable from outside; we accept that the
         # current step may finish unfinished if the user hard-quits).
         def _run() -> None:
             try:
-                _worker(msg, ack_msg_id)
+                _worker(msg, ack_msg_id, start_gen)
             finally:
                 _worker_lock.release()
 
@@ -1211,6 +1379,7 @@ def run_daemon() -> int:
         max_steps=int(_max_steps_cfg) if _max_steps_cfg is not None else 200,
         step_check_interval=int(_interval_cfg) if _interval_cfg is not None else 30,
         confirm_each=bool(tg_cfg.get("confirm_each", False)),
+        bot_username=str(me.get("username") or "") or None,
     )
 
     # Callback router: step_* check-in buttons → step controller,
@@ -1223,13 +1392,21 @@ def run_daemon() -> int:
             return
         _handle_skill_callback(bot, cb)
 
-    # Bypass the trigger_prefix filter ONLY for the user who started a
-    # task that's currently waiting on a text-kind ask_user — and only
-    # for THEM, not for every participant in a group chat. Without this
-    # narrowing, other group members' chat traffic would also bypass
-    # the prefix filter, get routed to the dispatcher, and produce
-    # noisy "task already running" / "no allowed_chat_ids" replies.
-    def _ask_text_active(chat_id: int, sender_id: int) -> bool:
+    # Bypass the trigger_prefix filter for two cases:
+    #   1. Active text-kind ask_user from this exact sender — they're
+    #      answering a question, not starting a task.
+    #   2. Slash commands (/new, /status, /help, etc.) — these are
+    #      chat-control commands that should always work even when
+    #      `trigger_prefix: "openseer:"` is configured. Without this,
+    #      `/new` would be silently dropped because it doesn't start
+    #      with the prefix, and the user couldn't reset session
+    #      memory at all in prefixed setups.
+    # Sender-narrowed for case 1 to avoid leaking unrelated group-chat
+    # traffic past the prefix filter.
+    def _bypass_prefix(chat_id: int, sender_id: int,
+                       text: str | None = None) -> bool:
+        if text and text.lstrip().startswith("/"):
+            return True
         with _active_lock:
             ctrl = _active_ask_controllers.get(chat_id)
         return (
@@ -1240,7 +1417,7 @@ def run_daemon() -> int:
 
     try:
         bot.poll(on_msg, on_callback=_on_callback,
-                 bypass_prefix=_ask_text_active)
+                 bypass_prefix=_bypass_prefix)
     except KeyboardInterrupt:
         pass
     print("daemon: stopped.")

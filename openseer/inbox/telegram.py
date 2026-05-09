@@ -336,7 +336,7 @@ class TelegramBot:
 
     def poll(self, on_message: Callable[[TelegramMessage], None],
              on_callback: Callable[[TelegramCallback], None] | None = None,
-             bypass_prefix: Callable[[int, int], bool] | None = None) -> None:
+             bypass_prefix: Callable[..., bool] | None = None) -> None:
         """Long-poll forever. Blocks until stop() is called or process dies.
 
         Calls `on_message(msg)` for each NEW message that:
@@ -441,9 +441,21 @@ class TelegramBot:
 
                 if self.trigger_prefix:
                     sender_id = int(sender.get("id", 0))
-                    skip_prefix = bool(
-                        bypass_prefix and bypass_prefix(chat_id, sender_id)
-                    )
+                    # Pass the raw text too so the bypass hook can let
+                    # slash commands (/new, /status, etc.) through even
+                    # when they don't have the configured prefix.
+                    if bypass_prefix:
+                        try:
+                            skip_prefix = bool(
+                                bypass_prefix(chat_id, sender_id, text)
+                            )
+                        except TypeError:
+                            # Backwards-compat with older 2-arg hook.
+                            skip_prefix = bool(
+                                bypass_prefix(chat_id, sender_id)
+                            )
+                    else:
+                        skip_prefix = False
                     if not skip_prefix:
                         if not text.startswith(self.trigger_prefix):
                             continue

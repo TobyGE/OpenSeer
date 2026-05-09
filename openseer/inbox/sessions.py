@@ -81,6 +81,18 @@ class ChatSessions:
             del buf[:-MAX_PER_CHAT]
             self._save()
 
+    def clear(self, chat_id: int | str) -> int:
+        """Drop all session memory for a chat. Returns the count of
+        entries that were removed (0 if there were none). Used by the
+        daemon's `/new` slash command so users can start fresh without
+        carrying prior task context into the next message."""
+        key = str(chat_id)
+        with self._lock:
+            removed = len(self._data.get(key) or [])
+            self._data.pop(key, None)
+            self._save()
+        return removed
+
     def render_context(self, chat_id: int | str) -> str:
         """Format prior turns into a session_context block the agent loop
         understands. Returns "" if no history."""

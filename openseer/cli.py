@@ -82,6 +82,14 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return run_repl()
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    """Print system status: provider logins, TCC permissions, Telegram
+    config. Used by the macOS GUI's setup wizard (calls with --json)
+    and as a quick CLI diagnostic for users."""
+    from . import check as _check
+    return _check.main(json_out=bool(args.json))
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     return run_setup()
 
@@ -109,6 +117,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup = sub.add_parser("setup", help="Guided one-time onboarding")
     p_setup.set_defaults(func=cmd_setup)
 
+    p_check = sub.add_parser(
+        "check",
+        help="Print system status (auth, permissions, telegram). Add --json for the GUI.",
+    )
+    p_check.add_argument("--json", action="store_true",
+                         help="Emit a JSON blob instead of human summary")
+    p_check.set_defaults(func=cmd_check)
+
     p_task = sub.add_parser("task", help="Run the agent on a one-off task")
     _add_task_args(p_task)
     p_task.set_defaults(func=cmd_task)
@@ -135,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "check", "-h", "--help"}
 
 
 def main() -> None:

@@ -38,36 +38,49 @@ final class OpenSeerEnv: ObservableObject {
         }
         binaryPath = path
 
-        // `openseer auth status` prints the current auth state and exits 0
-        // if logged in / not expired, non-zero otherwise. We use exit code
-        // as the gate; output goes into authSummary for display.
-        let result = await CLI.run(path: path, args: ["auth", "status"])
-        authSummary = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        provider = readConfigProvider() ?? ""
+        // Use the new provider-aware `openseer check --json` instead
+        // of `openseer auth status` (which only checks Codex /
+        // OpenAI). Codex flagged that an Anthropic-only user
+        // completing the wizard would still be bounced back to
+        // setup because auth status exits non-zero for them. With
+        // check --json we look at the SELECTED provider's login
+        // state and gate readiness on that one.
+        guard let blob = await StatusProbe.fetch(binary: path) else {
+            status = .error(
+                "Couldn't read system status (`openseer check --json` "
+                + "failed). Make sure the `openseer` CLI is installed and "
+                + "this `python -m openseer` import path works."
+            )
+            return
+        }
+        provider = blob.selectedProvider ?? ""
 
-        if result.exitCode == 0 {
+        // Build a one-line summary for the chat header.
+        let lines = [
+            "provider: \(blob.selectedProvider ?? "?")",
+            blob.providers.openai.loggedIn ? "openai: ✓" : "openai: ✗",
+            blob.providers.anthropic.loggedIn ? "claude: ✓" : "claude: ✗",
+        ]
+        authSummary = lines.joined(separator: " · ")
+
+        let providerOK: Bool
+        switch blob.selectedProvider {
+        case "anthropic": providerOK = blob.providers.anthropic.loggedIn
+        case "openai":    providerOK = blob.providers.openai.loggedIn
+        default:
+            // No selected provider yet (first run) — needs setup.
+            providerOK = false
+        }
+        // Permissions are also a hard requirement: without
+        // Accessibility / Screen Recording the agent loop can't
+        // actually drive the Mac. Surface that as needsSetup too.
+        let permsOK = blob.permissions.accessibility
+            && blob.permissions.screenRecording
+        if providerOK && permsOK {
             status = .ready
         } else {
-            // exit 1 is usually "not logged in / expired" — treat as needsSetup.
-            // exit 2+ might be missing python deps; surface the message.
-            if result.exitCode == 1 {
-                status = .needsSetup
-            } else {
-                status = .error(
-                    "openseer auth status failed (exit \(result.exitCode)).\n"
-                    + result.stdout + result.stderr
-                )
-            }
+            status = .needsSetup
         }
-    }
-
-    /// Read the persisted provider from ~/.openseer/config.json. Best-effort.
-    private func readConfigProvider() -> String? {
-        let path = NSHomeDirectory() + "/.openseer/config.json"
-        guard let data = FileManager.default.contents(atPath: path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let p = obj["provider"] as? String else { return nil }
-        return p
     }
 
     /// Find `openseer` on $PATH. We try in order:

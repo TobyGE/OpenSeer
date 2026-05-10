@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openseer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Sees. Remembers. Acts. — a chat-first, memory-aware, computer-use agent for macOS."
 readme = "README.md"
 requires-python = ">=3.9"

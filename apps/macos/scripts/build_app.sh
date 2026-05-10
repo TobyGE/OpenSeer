@@ -130,10 +130,21 @@ echo "==> Ad-hoc codesigning (inside-out: every Mach-O, then bundle)"
 # launcher, the GUI binary, and finally the bundle.
 SIGN_ID="${OPENSEER_SIGN_IDENTITY:-}"
 SIGN_KEYCHAIN="${OPENSEER_SIGN_KEYCHAIN:-$HOME/Library/Keychains/openseer-signing.keychain-db}"
-SIGN_KEYCHAIN_PASSWORD="${OPENSEER_SIGN_KEYCHAIN_PASSWORD:-openseer-dev}"
+# Unlock password for the dev-only signing keychain. Required when
+# you maintain your own `openseer-signing.keychain-db` for ad-hoc
+# code signing — set it in your shell env, e.g.
+#   export OPENSEER_SIGN_KEYCHAIN_PASSWORD="$(security find-generic-password ...)"
+# We deliberately don't ship a default value here: GitHub's secret
+# scanner flags any hard-coded `*_PASSWORD="..."` literal, and (more
+# importantly) a default would invite users to commit a working unlock
+# string to their own forks. If your keychain doesn't need unlocking,
+# leave this variable unset and the unlock step is skipped.
+SIGN_KEYCHAIN_PASSWORD="${OPENSEER_SIGN_KEYCHAIN_PASSWORD:-}"
 if [[ -z "$SIGN_ID" ]]; then
     if [[ -f "$SIGN_KEYCHAIN" ]]; then
-        security unlock-keychain -p "$SIGN_KEYCHAIN_PASSWORD" "$SIGN_KEYCHAIN" 2>/dev/null || true
+        if [[ -n "$SIGN_KEYCHAIN_PASSWORD" ]]; then
+            security unlock-keychain -p "$SIGN_KEYCHAIN_PASSWORD" "$SIGN_KEYCHAIN" 2>/dev/null || true
+        fi
         KEYCHAIN_LIST=("$SIGN_KEYCHAIN")
         while IFS= read -r kc; do
             [[ -n "$kc" && "$kc" != "$SIGN_KEYCHAIN" ]] && KEYCHAIN_LIST+=("$kc")

@@ -82,6 +82,25 @@ def cmd_auth_login(args: argparse.Namespace) -> int:
             from .setup_wizard import run_claude_login
             return run_claude_login()
         from . import oauth_anthropic
+        # GUI uses --start / --finish so it can render the paste-
+        # back step natively. Plain `--provider anthropic` (no
+        # mode) keeps the interactive CLI flow.
+        mode = getattr(args, "mode", None)
+        if mode == "start":
+            return oauth_anthropic.run_login_start()
+        if mode == "finish":
+            # `--code` / `--verifier` were the original argv-based
+            # interface; they survive only for CLI testing where
+            # passing through `ps` is acceptable. The GUI now uses
+            # the stdin form so other local processes can't read
+            # the OAuth code/verifier from /proc-style argv views
+            # (codex P2).
+            if args.code and args.verifier:
+                return oauth_anthropic.run_login_finish(
+                    code=args.code, verifier=args.verifier,
+                    expected_state=args.state or None,
+                )
+            return oauth_anthropic.run_login_finish_from_stdin()
         return oauth_anthropic.run_login()
     # OpenAI: run the OAuth flow directly so users don't need the
     # Codex CLI installed. Falls through to codex CLI only if our
@@ -200,6 +219,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="(openai only) shell out to `codex login` instead of "
              "the built-in OAuth flow. Requires the Codex CLI.",
     )
+    # Two-step Anthropic flow for GUI consumers. CLI users can ignore
+    # these — bare `--provider anthropic` does the interactive flow.
+    p_login.add_argument(
+        "--mode", choices=["start", "finish"],
+        help="(anthropic only) `start` opens the browser and prints "
+             "{state,verifier,url} on stdout; `finish` exchanges a "
+             "user-pasted code for tokens.",
+    )
+    p_login.add_argument("--code", help="(anthropic --mode=finish) "
+                                       "code from the success page")
+    p_login.add_argument("--verifier", help="(anthropic --mode=finish) "
+                                           "code_verifier from --mode=start")
+    p_login.add_argument("--state", help="(anthropic --mode=finish, "
+                                        "optional) expected state for "
+                                        "CSRF check")
     p_login.set_defaults(func=cmd_auth_login)
     sub_auth.add_parser("logout", help="Wipe local tokens").set_defaults(func=cmd_auth_logout)
 

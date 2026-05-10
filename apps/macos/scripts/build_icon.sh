@@ -22,10 +22,23 @@ fi
 rm -rf "$ICONSET"
 mkdir -p "$ICONSET"
 
+# Flatten any transparency onto solid white so the icon doesn't
+# float over the user's wallpaper in Dock/Finder. Round-trip via
+# JPEG: `sips -s format jpeg` discards alpha and composites onto
+# white, then we convert back to PNG. Pure macOS-toolchain — no
+# Pillow / ImageMagick dependency, so a clean build host (which
+# may not have the bundled-python venv yet) can still run this
+# (codex P2).
+FLAT="$APP_ROOT/Resources/.AppIcon-flat.png"
+TMP_JPG="$APP_ROOT/Resources/.AppIcon-flat.jpg"
+sips -s format jpeg "$SRC"     --out "$TMP_JPG" >/dev/null
+sips -s format png  "$TMP_JPG" --out "$FLAT"   >/dev/null
+rm -f "$TMP_JPG"
+
 # (size, filename)
 gen() {
     local size=$1 name=$2
-    sips -z "$size" "$size" "$SRC" --out "$ICONSET/$name" >/dev/null
+    sips -z "$size" "$size" "$FLAT" --out "$ICONSET/$name" >/dev/null
 }
 
 gen 16   icon_16x16.png
@@ -40,7 +53,7 @@ gen 512  icon_512x512.png
 # We only have a 512 master; 1024 would just be an upscale, skip it.
 
 iconutil -c icns "$ICONSET" -o "$OUT"
-rm -rf "$ICONSET"
+rm -rf "$ICONSET" "$FLAT"
 
 echo "Wrote $OUT"
 ls -lh "$OUT"

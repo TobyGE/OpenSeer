@@ -70,10 +70,95 @@ final class SetupViewModel: ObservableObject {
         await probe()
     }
 
-    /// `openseer auth login --provider anthropic` — claude CLI's
-    /// browser-based OAuth (`claude auth login` under the hood).
-    /// If `claude` isn't installed the call returns non-zero and
-    /// the next probe surfaces it via `anthropic.error`.
+    /// Two-step Anthropic OAuth so the GUI can render the
+    /// paste-back UI itself (claude.com only registers a hosted
+    /// callback, no localhost). Returns nil on failure to start.
+    @Published var anthropicVerifier: String? = nil
+    @Published var anthropicState: String? = nil
+    @Published var anthropicError: String? = nil
+    /// The auth URL — shown in the GUI's phase-2 view as a "browser
+    /// didn't open? click here" link. Surfaced even on success so
+    /// the user can recover when Launch Services / default-browser
+    /// is misconfigured (codex P2).
+    @Published var anthropicAuthURL: String? = nil
+    @Published var anthropicBrowserOpened: Bool = true
+
+    /// Step 1: launch the browser via the Python module and capture
+    /// state + verifier. Stash them on the model for step 2.
+    func startAnthropicLogin() async -> Bool {
+        anthropicError = nil
+        let r = await CLI.run(path: binary,
+                              args: ["auth", "login",
+                                     "--provider", "anthropic",
+                                     "--mode", "start"])
+        guard r.exitCode == 0 else {
+            anthropicError = "Couldn't start login: " +
+                (r.stderr.isEmpty ? r.stdout : r.stderr)
+            return false
+        }
+        // Last non-empty line of stdout is the JSON blob.
+        let line = r.stdout
+            .split(separator: "\n")
+            .last { !$0.isEmpty }
+            .map(String.init) ?? ""
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let v = obj["verifier"] as? String,
+              let s = obj["state"] as? String else {
+            anthropicError = "Couldn't parse login start payload."
+            return false
+        }
+        anthropicVerifier = v
+        anthropicState = s
+        anthropicAuthURL = obj["url"] as? String
+        anthropicBrowserOpened = (obj["opened"] as? Bool) ?? true
+        return true
+    }
+
+    /// Step 2: hand the pasted code to Python for token exchange,
+    /// then refresh status. Returns true on success.
+    ///
+    /// Secrets (auth code + PKCE verifier) are passed via stdin —
+    /// not argv — so other local processes can't read them via
+    /// `ps`/Activity Monitor.
+    func finishAnthropicLogin(code: String) async -> Bool {
+        guard let verifier = anthropicVerifier else {
+            anthropicError = "No verifier stashed — start the login first."
+            return false
+        }
+        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        var payload: [String: String] = ["code": trimmed,
+                                         "verifier": verifier]
+        if let s = anthropicState { payload["state"] = s }
+        guard let stdinData = try? JSONSerialization.data(
+            withJSONObject: payload) else {
+            anthropicError = "Couldn't serialise login payload."
+            return false
+        }
+        let r = await CLI.run(
+            path: binary,
+            args: ["auth", "login", "--provider", "anthropic",
+                   "--mode", "finish"],
+            stdin: stdinData,
+        )
+        if r.exitCode != 0 {
+            anthropicError = r.stdout.isEmpty ? r.stderr : r.stdout
+            return false
+        }
+        anthropicVerifier = nil
+        anthropicState = nil
+        anthropicError = nil
+        anthropicAuthURL = nil
+        anthropicBrowserOpened = true
+        await probe()
+        return true
+    }
+
+    /// Compatibility alias kept so existing callers (and the
+    /// non-interactive `openseer auth login --provider anthropic`
+    /// CLI path used outside the GUI) still work. The GUI itself
+    /// no longer uses this.
     func runAnthropicLogin() async {
         _ = await CLI.run(path: binary,
                           args: ["auth", "login", "--provider", "anthropic"])

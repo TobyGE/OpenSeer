@@ -18,7 +18,8 @@ enum CLI {
         let stderr: String
     }
 
-    static func run(path: String, args: [String]) async -> Result {
+    static func run(path: String, args: [String],
+                    stdin: Data? = nil) async -> Result {
         await withCheckedContinuation { (cont: CheckedContinuation<Result, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let task = Process()
@@ -27,8 +28,12 @@ enum CLI {
                 task.environment = childEnvironment()
                 let outPipe = Pipe()
                 let errPipe = Pipe()
+                let inPipe = Pipe()
                 task.standardOutput = outPipe
                 task.standardError = errPipe
+                if stdin != nil {
+                    task.standardInput = inPipe
+                }
                 do {
                     try task.run()
                 } catch {
@@ -37,6 +42,10 @@ enum CLI {
                         stderr: "spawn failed: \(error)"
                     ))
                     return
+                }
+                if let data = stdin {
+                    inPipe.fileHandleForWriting.write(data)
+                    try? inPipe.fileHandleForWriting.close()
                 }
                 task.waitUntilExit()
                 let out = String(

@@ -130,6 +130,74 @@ def save_to_keychain(tokens: dict[str, Any]) -> None:
             f"keychain write failed: {r.stderr.strip() or r.stdout.strip()}")
 
 
+def run_login_start() -> int:
+    """GUI step-1: open the browser and emit state+verifier so the
+    GUI can hold them while it shows a "paste code" field. Prints
+    a single JSON line on stdout with `url`, `state`, `verifier`,
+    and `opened` (false when webbrowser.open returned False — the
+    GUI is expected to surface the URL for manual copy). Always
+    exits 0; the GUI decides whether to warn."""
+    url, state, verifier = build_auth_url()
+    opened = bool(webbrowser.open(url))
+    print(json.dumps({"url": url, "state": state, "verifier": verifier,
+                      "opened": opened}))
+    return 0
+
+
+def run_login_finish_from_stdin() -> int:
+    """GUI step-2 with secrets read from stdin instead of argv —
+    `ps`-visible argv would leak the auth code and code_verifier
+    to other processes on the same machine. Stdin format: a single
+    JSON object with keys `code`, `verifier`, optional `state`."""
+    raw = sys.stdin.read()
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        print(f"Couldn't parse stdin JSON: {e}")
+        return 1
+    code = obj.get("code") or ""
+    verifier = obj.get("verifier") or ""
+    state = obj.get("state") or None
+    if not code or not verifier:
+        print("Stdin JSON missing `code` and/or `verifier`.")
+        return 1
+    return run_login_finish(code=code, verifier=verifier,
+                            expected_state=state)
+
+
+def run_login_finish(code: str, verifier: str,
+                     expected_state: str | None = None) -> int:
+    """GUI step-2: exchange the code the user pasted in the GUI for
+    tokens, write the Keychain blob, return 0 on success.
+
+    We accept the code in either bare ("…") or "code#state" form —
+    the success page sometimes surfaces both joined with `#`. State
+    is optional but cross-checked against ``expected_state`` if both
+    are present."""
+    if "#" in code:
+        c, _, returned_state = code.partition("#")
+    else:
+        c, returned_state = code, ""
+    try:
+        tokens = exchange_code(c.strip(), verifier,
+                               state=returned_state.strip() or None,
+                               expected_state=expected_state)
+    except Exception as e:
+        print(f"Token exchange failed: {e}")
+        return 1
+    if not tokens.get("access_token"):
+        print(f"Token endpoint returned no access_token: {tokens!r}")
+        return 1
+    try:
+        save_to_keychain(tokens)
+    except Exception as e:
+        print(f"Saved tokens but couldn't write Keychain: {e}")
+        return 1
+    print(f"✓ Signed in. Tokens saved to macOS Keychain "
+          f"({KEYCHAIN_SERVICE}).")
+    return 0
+
+
 def run_login(timeout_s: int = 600, *, quiet: bool = False) -> int:
     """End-to-end CLI flow: open browser, prompt for code on stdin,
     exchange, write to Keychain. Returns 0 on success.

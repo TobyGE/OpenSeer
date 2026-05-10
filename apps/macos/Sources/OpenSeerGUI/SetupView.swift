@@ -308,9 +308,11 @@ private struct OpenAILoginView: View {
 private struct AnthropicLoginView: View {
     @EnvironmentObject var model: SetupViewModel
     @Binding var isLoggingIn: Bool
+    @State private var pastedCode: String = ""
+
     var body: some View {
         let st = model.status?.providers.anthropic
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             if st?.loggedIn == true {
                 Label("Claude Code: signed in", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.green)
@@ -319,24 +321,96 @@ private struct AnthropicLoginView: View {
                 }
                 Text("Token expires in \((st?.expiresInS ?? 0) / 60)m.")
                     .font(.caption).foregroundStyle(.tertiary)
+            } else if model.anthropicVerifier == nil {
+                phaseOne
             } else {
-                Label("Claude Code not signed in", systemImage: "person.crop.circle.badge.questionmark")
+                phaseTwo
+            }
+            if let err = model.anthropicError {
+                Text(err).font(.caption).foregroundStyle(.red)
+            } else if let err = st?.error {
+                Text(err).font(.caption).foregroundStyle(.red)
+            }
+        }
+    }
+
+    private var phaseOne: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Claude Code not signed in",
+                  systemImage: "person.crop.circle.badge.questionmark")
+                .foregroundStyle(.orange)
+            Text("Click Sign in — your browser will open to claude.com for OAuth. After approving, the page shows a code; paste it here. No `claude` CLI required.")
+                .font(.callout).foregroundStyle(.secondary)
+            Button("Sign in with Claude") {
+                Task {
+                    isLoggingIn = true
+                    _ = await model.startAnthropicLogin()
+                    isLoggingIn = false
+                }
+            }
+            .disabled(isLoggingIn)
+            .buttonStyle(.borderedProminent)
+        }
+    }
+
+    private var phaseTwo: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if model.anthropicBrowserOpened {
+                Label("Browser opened — paste the code from the success page",
+                      systemImage: "arrow.right.circle")
+                    .foregroundStyle(.blue)
+            } else {
+                Label("Browser couldn't open automatically",
+                      systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
-                Text("Click Sign in — your browser will open for OAuth. OpenSeer reuses the token Claude Code stores in macOS Keychain. Requires the `claude` CLI (`npm install -g @anthropic-ai/claude-code`).")
-                    .font(.callout).foregroundStyle(.secondary)
-                Button("Sign in with Claude") {
+            }
+            Text("After signing in at claude.com you'll land on a page that displays a long code (often formatted `abc…#xyz…`). Copy the WHOLE thing and paste here.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let url = model.anthropicAuthURL {
+                HStack(spacing: 4) {
+                    Text(model.anthropicBrowserOpened
+                         ? "Browser didn't open?"
+                         : "Open this URL manually:")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                    Button("Copy URL") {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString(url, forType: .string)
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                    Button("Open in browser") {
+                        if let u = URL(string: url) {
+                            NSWorkspace.shared.open(u)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .controlSize(.small)
+                }
+            }
+            HStack {
+                TextField("Paste code", text: $pastedCode)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(isLoggingIn)
+                Button("Submit") {
                     Task {
                         isLoggingIn = true
-                        await model.runAnthropicLogin()
+                        let ok = await model.finishAnthropicLogin(code: pastedCode)
+                        if ok { pastedCode = "" }
                         isLoggingIn = false
                     }
                 }
-                .disabled(isLoggingIn)
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(isLoggingIn || pastedCode.trimmingCharacters(in: .whitespaces).isEmpty)
                 .buttonStyle(.borderedProminent)
-                if let err = st?.error {
-                    Text(err).font(.caption).foregroundStyle(.red)
-                }
             }
+            Button("Cancel — start over") {
+                model.anthropicVerifier = nil
+                model.anthropicState = nil
+                model.anthropicError = nil
+                pastedCode = ""
+            }
+            .controlSize(.small)
         }
     }
 }

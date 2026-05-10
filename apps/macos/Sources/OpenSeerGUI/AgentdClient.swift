@@ -60,6 +60,12 @@ final class AgentdClient: NSObject {
 
     private var nextRequestId = 0
 
+    /// Lazily-spawned `openseer agentd` subprocess, kept so we can
+    /// later add a "Stop daemon" gesture if we want. Nil after the
+    /// rendezvous file is owned by some other (e.g. user-launched)
+    /// agentd we attached to.
+    private var spawnedDaemon: Process?
+
     enum AgentdError: Error, CustomStringConvertible {
         case noRendezvous(String)
         case connectionClosed(String)
@@ -247,6 +253,132 @@ final class AgentdClient: NSObject {
     }
 
     // MARK: - Probe (Task #1 deliverable)
+
+    // MARK: - High-level API
+
+    /// Ensure agentd is running and we have a live, authed
+    /// connection. Will (a) reuse an existing daemon if the
+    /// rendezvous responds, or (b) spawn `openseer agentd` if not.
+    /// Pass the resolved `openseer` binary path (same one
+    /// `OpenSeerEnv.binaryPath` exposes).
+    func ensureRunning(binary: String,
+                       startupTimeout: TimeInterval = 10) async throws {
+        // 1. If we're already connected and the socket is alive,
+        // we're done.
+        if task != nil {
+            do {
+                _ = try await sendRequest("ping", payload: [:])
+                return
+            } catch {
+                // Stale connection; reset and retry.
+                disconnect()
+            }
+        }
+        // 2. Rendezvous file present → try connecting to whatever
+        // daemon wrote it. If it doesn't answer the ping, treat the
+        // file as stale and overwrite by spawning fresh.
+        if FileManager.default.fileExists(
+            atPath: Self.rendezvousPath().path) {
+            do {
+                try await connect()
+                _ = try await sendRequest("ping", payload: [:])
+                return
+            } catch {
+                NSLog("[agentd] stale rendezvous, respawning: %@",
+                      "\(error)")
+                disconnect()
+                try? FileManager.default.removeItem(
+                    at: Self.rendezvousPath())
+            }
+        }
+        // 3. Spawn a fresh agentd. We don't supervise it past this
+        // process's lifetime — if the user quits OpenSeerGUI the
+        // daemon also goes. Future: detach via launchctl when we
+        // want it to keep serving telegram in the background.
+        try spawnDaemon(binary: binary)
+
+        // 4. Wait for the rendezvous file to appear, then connect.
+        let deadline = Date().addingTimeInterval(startupTimeout)
+        while Date() < deadline {
+            if FileManager.default.fileExists(
+                atPath: Self.rendezvousPath().path) {
+                try await connect()
+                _ = try await sendRequest("ping", payload: [:])
+                return
+            }
+            try await Task.sleep(nanoseconds: 120_000_000)
+        }
+        throw AgentdError.connectionClosed(
+            "daemon failed to start within \(Int(startupTimeout))s")
+    }
+
+    private func spawnDaemon(binary: String) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: binary)
+        proc.arguments = ["agentd"]
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONUNBUFFERED"] = "1"
+        proc.environment = env
+
+        // Pipe daemon stderr/stdout to a rotating log so users can
+        // tail it if something explodes; otherwise daemon noise
+        // would vanish.
+        let logURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".openseer/agentd.log")
+        FileManager.default.createFile(
+            atPath: logURL.path, contents: Data())
+        let logHandle = try FileHandle(forWritingTo: logURL)
+        proc.standardOutput = logHandle
+        proc.standardError = logHandle
+
+        try proc.run()
+        spawnedDaemon = proc
+        NSLog("[agentd] spawned pid=%d, log=%@",
+              proc.processIdentifier, logURL.path)
+    }
+
+    /// Start a task on the daemon. Returns the run_id immediately
+    /// after the ack; events flow through `onEvent` as the agent
+    /// produces them. `onEvent` will see at least one terminator
+    /// (`task_finished` or `task_failed`) at the end.
+    @discardableResult
+    func startTask(prompt: String,
+                   dryRun: Bool,
+                   sessionContext: String?,
+                   onEvent: @escaping ([String: Any]) -> Void)
+        async throws -> String {
+        var payload: [String: Any] = [
+            "task": prompt,
+            "dry_run": dryRun,
+        ]
+        if let ctx = sessionContext, !ctx.isEmpty {
+            payload["session_context"] = ctx
+        }
+        let ack = try await sendRequest("start_task", payload: payload)
+        guard let runId = ack["run_id"] as? String else {
+            throw AgentdError.badResponse(
+                "start_task ack missing run_id: \(ack)")
+        }
+        // Register the observer *after* the ack: any events the
+        // daemon emitted between our send and now are buffered in
+        // `pendingEvents` and replayed by observe().
+        observe(runId: runId, handler: onEvent)
+        return runId
+    }
+
+    /// Cancel a running task. Daemon writes the CANCEL sentinel +
+    /// asyncio-cancels the runner; the agent loop emits its own
+    /// task_finished(status="interrupted") in response.
+    func cancelTask(runId: String) async {
+        do {
+            _ = try await sendRequest(
+                "cancel_task", payload: ["run_id": runId])
+        } catch {
+            NSLog("[agentd] cancel failed: %@", "\(error)")
+        }
+    }
+
+    // MARK: - Smoke test
 
     /// Smoke test: connect, ping, start the stubbed task, wait for
     /// its two events, disconnect. Logs each step via NSLog so the

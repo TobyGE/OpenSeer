@@ -198,6 +198,57 @@ final class RunSession: ObservableObject, Identifiable {
         watcher?.start()
     }
 
+    /// Start a local task via the WebSocket daemon instead of a
+    /// per-task subprocess. The daemon stays warm across tasks, can
+    /// be talked to by multiple clients (voice orb + main window +
+    /// telegram), and exposes a control channel for cancel /
+    /// ask-user / barge-in. Events arrive over ws and are folded
+    /// into the same Turn pipeline as the subprocess path.
+    func startViaAgentd(prompt: String, dryRun: Bool,
+                        binary: String,
+                        sessionContext: String? = nil,
+                        onTraceFound: ((String) -> Void)? = nil) {
+        guard case .localPrompt = source else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await AgentdClient.shared.ensureRunning(binary: binary)
+                let runId = try await AgentdClient.shared.startTask(
+                    prompt: prompt,
+                    dryRun: dryRun,
+                    sessionContext: sessionContext
+                ) { [weak self] msg in
+                    Task { @MainActor in
+                        self?.ingestAgentdMessage(msg)
+                    }
+                }
+                self.traceId = runId
+                onTraceFound?(runId)
+            } catch {
+                self.errorMessage = "agentd: \(error)"
+                if self.status == .running { self.status = .fail }
+                NSLog("[run] startViaAgentd failed: %@", "\(error)")
+            }
+        }
+    }
+
+    /// Adapt the agentd ws message shape
+    /// `{type:"event", run_id, event:{type, step, data, timestamp}}`
+    /// into the same RunEvent the file-tail path consumes via
+    /// `ingestEventLine`.
+    private func ingestAgentdMessage(_ msg: [String: Any]) {
+        guard let evObj = msg["event"] as? [String: Any] else { return }
+        // RunEvent decodes from JSON; re-serialize the inner event.
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: evObj),
+              let ev = try? JSONDecoder().decode(RunEvent.self, from: data)
+        else {
+            NSLog("[run] bad agentd event: %@", "\(evObj)")
+            return
+        }
+        ingestEvent(ev)
+    }
+
     /// Attach to an existing trace dir (daemon-spawned runs, or
     /// historical replays). We don't have stdout for those — tail
     /// events.jsonl directly. The first event in the file is
@@ -228,6 +279,14 @@ final class RunSession: ObservableObject, Identifiable {
             FileManager.default.createFile(
                 atPath: cancelPath,
                 contents: "requested by GUI Stop button\n".data(using: .utf8))
+            // Also signal agentd directly — if this run is going
+            // through ws (no `stream` to terminate), the sentinel
+            // alone might not fire until the next outer-loop tick.
+            // cancel_task additionally cancels the asyncio worker
+            // so an in-flight LLM stream stops immediately.
+            Task { @MainActor in
+                await AgentdClient.shared.cancelTask(runId: tid)
+            }
         }
         if case .localPrompt = source {
             // Give the agent a moment to see the sentinel and emit

@@ -32,16 +32,28 @@ final class MainController: ObservableObject {
     }
 
     func submitTextPrompt(_ text: String) {
-        submitPrompt(text)
+        // Text submit still uses the legacy per-task subprocess
+        // path for now. WS Phase 2 migrates this too.
+        submitPrompt(text, transport: .subprocess)
     }
 
     func submitVoicePrompt(_ text: String) {
-        submitPrompt(text) { [weak self] answer in
+        // Voice prompts go through agentd: the orb needs a control
+        // channel for barge-in / ask-user / cancel, and a shared
+        // long-running Python process. Phase 1 wires that here; the
+        // subprocess fallback stays available if agentd can't start.
+        submitPrompt(text, transport: .agentd) { [weak self] answer in
             self?.voiceAnswer = answer
         }
     }
 
+    enum Transport {
+        case subprocess
+        case agentd
+    }
+
     private func submitPrompt(_ text: String,
+                              transport: Transport,
                               onFinalAnswer: ((String) -> Void)? = nil) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -69,10 +81,20 @@ final class MainController: ObservableObject {
         let s = RunSession(source: .localPrompt(text), binary: binary)
         s.onFinalAnswer = onFinalAnswer
         daemon.claimLocalPrompt(text)
-        s.startLocal(prompt: text, dryRun: dryRun,
-                     sessionContext: sessionCtx) {
+        let onTraceFound: (String) -> Void = {
             [weak daemon, prompt = text] traceId in
             daemon?.reserveLocalTrace(traceId, prompt: prompt)
+        }
+        switch transport {
+        case .subprocess:
+            s.startLocal(prompt: text, dryRun: dryRun,
+                         sessionContext: sessionCtx,
+                         onTraceFound: onTraceFound)
+        case .agentd:
+            s.startViaAgentd(prompt: text, dryRun: dryRun,
+                             binary: binary,
+                             sessionContext: sessionCtx,
+                             onTraceFound: onTraceFound)
         }
         let thread = daemon.addLocalRun(
             s, continueThread: continueThread?.id)

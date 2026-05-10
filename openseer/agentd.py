@@ -43,11 +43,15 @@ import secrets
 import signal
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import Any
 
 import websockets
+
+from .callbacks.base import Callback
+from .events import TaskEvent
 
 
 _DIR = Path.home() / ".openseer"
@@ -127,6 +131,83 @@ def _clear_rendezvous() -> None:
         pass
 
 
+# ─── agent → ws bridge ──────────────────────────────────────────────
+
+
+class WsStreamCallback(Callback):
+    """Forward every TaskEvent the agent loop emits to a WebSocket
+    client, in the same JSON shape clients already consume from
+    `events.jsonl`. The agent loop is synchronous (and runs in a
+    worker thread via asyncio.to_thread), so we hop back to the
+    asyncio loop with `run_coroutine_threadsafe`.
+
+    Wraps each event as:
+      {"type": "event", "run_id": <id>,
+       "event": {"type": ..., "timestamp": ..., "step": ..., "data": ...}}
+    """
+
+    name = "ws-stream"
+
+    def __init__(self, loop: asyncio.AbstractEventLoop,
+                 send_async: Any, run_id: str) -> None:
+        self.loop = loop
+        # send_async is a coroutine function (msg: dict) -> Coroutine
+        self.send_async = send_async
+        self.run_id = run_id
+
+    def on_event(self, ctx: dict[str, Any], event: TaskEvent) -> None:
+        if event is None:
+            return
+        msg = {
+            "type": "event",
+            "run_id": self.run_id,
+            "event": {
+                "type": event.type,
+                "timestamp": event.timestamp,
+                "step": event.step,
+                "data": _jsonable(event.data),
+            },
+        }
+        # The agent thread can't await directly. Schedule on the
+        # loop; we don't .result() it because we don't want to
+        # block the agent on slow clients.
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.send_async(msg), self.loop)
+        except RuntimeError:
+            # loop already closed (daemon shutting down) — drop the
+            # event, nothing useful to do.
+            pass
+
+
+def _jsonable(obj: Any) -> Any:
+    """Best-effort coercion of event payloads to JSON-safe primitives.
+
+    Most event data is already strings/ints/dicts of those, but
+    callbacks occasionally stuff Path / dataclass / set / bytes in.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (list, tuple, set)):
+        return [_jsonable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8", "replace")
+        except Exception:
+            return repr(obj)
+    # Dataclasses, models, etc.
+    if hasattr(obj, "__dict__"):
+        try:
+            return _jsonable(vars(obj))
+        except Exception:
+            return repr(obj)
+    return repr(obj)
+
+
 # ─── per-connection handler ─────────────────────────────────────────
 
 
@@ -200,24 +281,53 @@ class _Connection:
             return
 
         if t == "start_task":
-            # Phase 1 stub: synthesize a tiny event stream so the
-            # client wiring can be validated end-to-end. Phase 2 will
-            # replace this with a real agent.run() invocation.
-            run_id = "stub-" + uuid.uuid4().hex[:8]
+            # Generate the run_id (= agent's trace_id) here so we can
+            # ack the client BEFORE agent.run() starts producing
+            # events. The agent writes its `events.jsonl` under
+            # ~/.openseer/runs/<run_id>/, and cancel_task writes a
+            # CANCEL sentinel into that same dir — same convention
+            # the legacy subprocess path uses, so trace replay works
+            # uniformly.
+            run_id = uuid.uuid4().hex[:8]
             await self.send({
                 "type": "ack",
                 "request_id": rid,
                 "run_id": run_id,
             })
             self.tasks[run_id] = asyncio.create_task(
-                self._run_stub(run_id, msg.get("task", "")))
+                self._run_agent(
+                    run_id,
+                    task_text=msg.get("task", ""),
+                    dry_run=bool(msg.get("dry_run", False)),
+                    session_context=msg.get("session_context") or "",
+                    max_steps=int(msg.get("max_steps") or 200),
+                ))
             return
 
         if t == "cancel_task":
             target = msg.get("run_id")
-            task = self.tasks.pop(target, None) if target else None
-            if task is not None:
-                task.cancel()
+            # Two-pronged stop:
+            #   1. Drop the CANCEL sentinel — the agent's outer loop
+            #      checks for it before every step and exits with a
+            #      synthetic `terminate(status="interrupted")`.
+            #   2. Cancel the asyncio task too, in case the agent is
+            #      currently mid-API-call (LLM stream) and would
+            #      otherwise keep running until the request returns.
+            #      Note: pyautogui actions in flight won't be killed
+            #      by Task.cancel since they're inside to_thread —
+            #      the sentinel-on-outer-loop pathway is what
+            #      actually stops the work.
+            if target:
+                try:
+                    sentinel = (Path.home() / ".openseer" / "runs"
+                                / target / "CANCEL")
+                    sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    sentinel.write_text("cancelled via agentd\n")
+                except Exception as e:
+                    log.warning("cancel: couldn't write sentinel: %s", e)
+                task = self.tasks.pop(target, None)
+                if task is not None:
+                    task.cancel()
             await self.send({
                 "type": "ack",
                 "request_id": rid,
@@ -231,38 +341,68 @@ class _Connection:
             "error": f"unknown type: {t}",
         })
 
-    async def _run_stub(self, run_id: str, task: str) -> None:
-        await self.send({
-            "type": "event",
-            "run_id": run_id,
-            "event": {
-                "type": "task_started",
-                "step": 0,
-                "data": {"task": task, "trace_id": run_id},
-            },
-        })
+    async def _run_agent(self, run_id: str, *,
+                         task_text: str,
+                         dry_run: bool,
+                         session_context: str,
+                         max_steps: int) -> None:
+        """Run the real `agent.run()` in a worker thread and stream
+        every TaskEvent it emits back over this WebSocket via
+        WsStreamCallback. The default callback set (trajectory /
+        budget / safety / etc.) still runs alongside, so traces
+        still land in events.jsonl on disk for replay."""
+        # Import lazily — agent pulls in pyautogui, PyObjC, Pillow,
+        # the OAuth client, …; we don't want to drag that in at
+        # daemon startup when no task has been requested yet.
+        from .agent import run as agent_run, _default_callbacks
+
+        out_dir = Path.home() / ".openseer" / "runs" / run_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        loop = asyncio.get_running_loop()
+        ws_cb = WsStreamCallback(loop, self.send, run_id)
+        # Reuse the same default set the CLI uses (trajectory /
+        # safety / budget / reflection / image-retention) so the on-
+        # disk trace + safety net behave identically; the ws stream
+        # is an additional observer.
+        cbs = _default_callbacks(quiet=True) + [ws_cb]
+
+        def _runner() -> None:
+            agent_run(
+                task_text,
+                max_steps=max_steps,
+                dry_run=dry_run,
+                out_dir=out_dir,
+                session_context=session_context,
+                callbacks=cbs,
+                quiet=True,
+            )
+
         try:
-            await asyncio.sleep(0.3)
+            await asyncio.to_thread(_runner)
         except asyncio.CancelledError:
+            # The CANCEL sentinel path already produced a
+            # task_finished(status="interrupted") via the agent
+            # loop's normal flow. Nothing extra to do here other
+            # than not re-raising as a crash.
+            log.info("run %s cancelled via Task.cancel", run_id)
+        except Exception as e:
+            tb = traceback.format_exc(limit=8)
+            log.exception("run %s crashed", run_id)
+            # Surface as task_failed so the client doesn't hang
+            # waiting on a terminal event. Mirrors the event the
+            # agent itself would have emitted if it caught the
+            # exception internally.
             await self.send({
                 "type": "event",
                 "run_id": run_id,
                 "event": {
-                    "type": "task_finished",
-                    "step": 1,
-                    "data": {"status": "interrupted"},
+                    "type": "task_failed",
+                    "data": {"error": str(e), "traceback": tb},
                 },
             })
-            return
-        await self.send({
-            "type": "event",
-            "run_id": run_id,
-            "event": {
-                "type": "task_finished",
-                "step": 1,
-                "data": {"status": "done", "reason": "(stub)"},
-            },
-        })
+        finally:
+            self.tasks.pop(run_id, None)
 
 
 # ─── server ────────────────────────────────────────────────────────

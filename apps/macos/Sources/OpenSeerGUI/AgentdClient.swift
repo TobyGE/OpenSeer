@@ -43,6 +43,21 @@ final class AgentdClient: NSObject {
     /// every event tagged with that run_id.
     private var eventHandlers: [String: ([String: Any]) -> Void] = [:]
 
+    /// Events that arrived for a run_id before its handler was
+    /// registered. This is essential: the daemon can (and for the
+    /// Phase 1 stub does) emit `task_started` before the caller
+    /// gets the start_task ack and calls observe() — without
+    /// buffering, the dispatcher would log those as unrouted and
+    /// drop them. Replayed in order on observe().
+    private var pendingEvents: [String: [[String: Any]]] = [:]
+
+    /// Run IDs we've seen a `task_finished` / `task_failed` for
+    /// before any handler was registered. When observe() is later
+    /// called for one of these IDs, we replay the buffer and then
+    /// immediately tear down the handler since no more events are
+    /// coming.
+    private var pendingTerminated: Set<String> = []
+
     private var nextRequestId = 0
 
     enum AgentdError: Error, CustomStringConvertible {
@@ -115,6 +130,8 @@ final class AgentdClient: NSObject {
         }
         pendingRequests.removeAll()
         eventHandlers.removeAll()
+        pendingEvents.removeAll()
+        pendingTerminated.removeAll()
     }
 
     // MARK: - Send / receive
@@ -150,12 +167,23 @@ final class AgentdClient: NSObject {
         }
     }
 
-    /// Register a handler for events tagged with `run_id`. Handler
-    /// is removed when a `task_finished` or `task_failed` event for
-    /// that run arrives.
+    /// Register a handler for events tagged with `run_id`. If
+    /// events arrived for this run_id before this call (very common
+    /// — the daemon often emits `task_started` between the
+    /// start_task ack and the caller's observe()), they're replayed
+    /// here in order. Handler is removed automatically when a
+    /// `task_finished` / `task_failed` event has been delivered.
     func observe(runId: String,
                  handler: @escaping ([String: Any]) -> Void) {
         eventHandlers[runId] = handler
+        if let buffered = pendingEvents.removeValue(forKey: runId) {
+            for msg in buffered {
+                handler(msg)
+            }
+        }
+        if pendingTerminated.remove(runId) != nil {
+            eventHandlers.removeValue(forKey: runId)
+        }
     }
 
     private func receiveLoop() async {
@@ -192,11 +220,21 @@ final class AgentdClient: NSObject {
     private func dispatch(_ msg: [String: Any]) {
         let type = msg["type"] as? String ?? ""
         if type == "event", let runId = msg["run_id"] as? String {
-            eventHandlers[runId]?(msg)
-            if let inner = msg["event"] as? [String: Any],
-               let et = inner["type"] as? String,
-               et == "task_finished" || et == "task_failed" {
-                eventHandlers.removeValue(forKey: runId)
+            let inner = msg["event"] as? [String: Any]
+            let et = inner?["type"] as? String
+            let terminator = (et == "task_finished" || et == "task_failed")
+            if let handler = eventHandlers[runId] {
+                handler(msg)
+                if terminator {
+                    eventHandlers.removeValue(forKey: runId)
+                }
+            } else {
+                // No handler registered yet — buffer for replay
+                // when observe(runId:) eventually catches up.
+                pendingEvents[runId, default: []].append(msg)
+                if terminator {
+                    pendingTerminated.insert(runId)
+                }
             }
             return
         }

@@ -343,6 +343,7 @@ private struct AnthropicLoginView: View {
 
 private struct PermissionsStepView: View {
     @EnvironmentObject var model: SetupViewModel
+    @State private var preflightFired = false
     var body: some View {
         let p = model.status?.permissions
         VStack(alignment: .leading, spacing: 12) {
@@ -354,9 +355,14 @@ private struct PermissionsStepView: View {
                 title: "Accessibility",
                 granted: p?.accessibility ?? false,
                 onRequest: {
+                    // Trigger BOTH the Swift-side and python-side
+                    // requests so OpenSeer.app itself AND the python
+                    // child both end up in the AX list. Without the
+                    // Swift request the user would have to click `+`
+                    // and browse to /Applications/OpenSeer.app to
+                    // add it manually.
+                    Permissions.requestAccessibility()
                     Task { await model.runPermissionRequest() }
-                    // Also open Settings — request runs in
-                    // background so the user doesn't have to wait.
                     Permissions.openSystemSettings(pane: .accessibility)
                 }
             )
@@ -364,6 +370,7 @@ private struct PermissionsStepView: View {
                 title: "Screen Recording",
                 granted: p?.screenRecording ?? false,
                 onRequest: {
+                    Permissions.requestScreenRecording()
                     Task { await model.runPermissionRequest() }
                     Permissions.openSystemSettings(pane: .screenRecording)
                 }
@@ -373,7 +380,42 @@ private struct PermissionsStepView: View {
                 Label("All permissions granted.", systemImage: "checkmark.seal.fill")
                     .foregroundStyle(.green)
                     .padding(.top, 4)
+            } else {
+                Divider().padding(.top, 6)
+                fallbackHelp
             }
+        }
+        .onAppear {
+            // Pre-register OpenSeer.app in BOTH Privacy lists the
+            // moment the user lands on this step, so by the time
+            // they hit Request the row already exists in System
+            // Settings — saves them the manual `+ → /Applications`
+            // dance the GUI was previously asking for. Idempotent.
+            // We only fire once per view appearance to avoid
+            // re-prompting on every refresh.
+            if !preflightFired {
+                preflightFired = true
+                _ = Permissions.requestAccessibility()
+                _ = Permissions.requestScreenRecording()
+            }
+        }
+    }
+
+    private var fallbackHelp: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Don't see OpenSeer in the Privacy list?")
+                .font(.caption.bold())
+            Text("Click the + button in System Settings, then drop OpenSeer.app from the Reveal Finder window below.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button {
+                if let url = Bundle.main.bundleURL as URL? {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+            } label: {
+                Label("Reveal OpenSeer.app in Finder",
+                      systemImage: "folder")
+            }
+            .controlSize(.small)
         }
     }
 

@@ -216,16 +216,42 @@ def _jsonable(obj: Any) -> Any:
 
 
 class _Connection:
-    """Bookkeeping for one client. Auth state, in-flight stub tasks."""
+    """Bookkeeping for one client. Auth state, in-flight tasks,
+    and pending ask_user round-trips."""
 
     def __init__(self, ws: Any, server: "Server"):
         self.ws = ws
         self.server = server
         self.authed = False
         self.tasks: dict[str, asyncio.Task] = {}
+        # request_id → future that resolves when the client posts a
+        # matching `user_reply`. Used by WsStreamCallback.ask_user
+        # to bridge from the synchronous agent thread to the async
+        # ws round-trip.
+        self.ask_user_waiters: dict[str, asyncio.Future] = {}
 
     async def send(self, msg: dict[str, Any]) -> None:
         await self.ws.send(json.dumps(msg, ensure_ascii=False))
+
+    async def run_ask_user(self, req_id: str, payload: dict[str, Any],
+                           timeout: float = 300.0) -> Any:
+        """Send an `ask_user` message to the client and await the
+        matching `user_reply`. The sync `ask_user(...)` callable
+        used by agent.run() bridges into this with
+        `asyncio.run_coroutine_threadsafe`. Returns the user's reply
+        (string for kind=text/choose, str for kind=confirm "Yes"/"No",
+        or None on timeout / client disconnect)."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self.ask_user_waiters[req_id] = fut
+        try:
+            await self.send(payload)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError,
+                websockets.exceptions.ConnectionClosed):
+            return None
+        finally:
+            self.ask_user_waiters.pop(req_id, None)
 
     async def run(self) -> None:
         try:
@@ -308,6 +334,24 @@ class _Connection:
                 ))
             return
 
+        if t == "user_reply":
+            # Reply to a server-initiated ask_user. The original
+            # ask_user's request_id is carried in `ask_id` here, not
+            # in `request_id` — the latter belongs to the
+            # user_reply's own ack flow, so we don't collide.
+            # Reply may be a string (text/choose), a "Yes"/"No"
+            # string for confirm, or null (user dismissed → agent
+            # treats as no-reply timeout).
+            ask = msg.get("ask_id")
+            fut = self.ask_user_waiters.pop(ask, None) if ask else None
+            if fut is not None and not fut.done():
+                fut.set_result(msg.get("reply"))
+            await self.send({
+                "type": "ack", "request_id": rid,
+                "delivered": ask,
+            })
+            return
+
         if t == "cancel_task":
             target = msg.get("run_id")
             # Two-pronged stop:
@@ -371,6 +415,40 @@ class _Connection:
         # is an additional observer.
         cbs = _default_callbacks(quiet=True) + [ws_cb]
 
+        # ask_user bridge: synchronous call (from the agent worker
+        # thread) → schedule coroutine on this asyncio loop →
+        # round-trip with the connected client → return the user's
+        # reply string (or None on timeout / disconnect).
+        conn = self
+
+        def ask_user_cb(question: str, kind: str,
+                        options: Any = None,
+                        attachments: Any = None) -> Any:
+            req_id = "ask-" + uuid.uuid4().hex[:8]
+            payload = {
+                "type": "ask_user",
+                "run_id": run_id,
+                "request_id": req_id,
+                "question": question,
+                "kind": kind,
+                "options": list(options or []),
+                "attachments": list(attachments or []),
+            }
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    conn.run_ask_user(req_id, payload), loop)
+            except RuntimeError:
+                # loop already shut down — agent will get None and
+                # convert to terminate(fail) per its own fallback.
+                return None
+            try:
+                # 5 minutes is enough for a human, short enough that
+                # an abandoned dialog eventually unblocks the agent.
+                return fut.result(timeout=300)
+            except Exception:
+                fut.cancel()
+                return None
+
         def _runner() -> None:
             agent_run(
                 task_text,
@@ -379,6 +457,7 @@ class _Connection:
                 out_dir=out_dir,
                 session_context=session_context,
                 callbacks=cbs,
+                ask_user=ask_user_cb,
                 quiet=True,
             )
 

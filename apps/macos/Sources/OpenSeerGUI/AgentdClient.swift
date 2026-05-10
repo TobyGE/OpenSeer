@@ -58,6 +58,22 @@ final class AgentdClient: NSObject {
     /// coming.
     private var pendingTerminated: Set<String> = []
 
+    /// run_id → handler that resolves an ask_user round-trip. The
+    /// handler receives the parsed server payload (question, kind,
+    /// options, request_id) and returns the user's reply
+    /// asynchronously. AgentdClient sends `user_reply` to the
+    /// daemon with that string.
+    var askUserHandler: ((AskUserRequest) async -> String?)? = nil
+
+    struct AskUserRequest: Equatable {
+        let runId: String
+        let requestId: String
+        let question: String
+        let kind: String         // "confirm" | "choose" | "text"
+        let options: [String]
+        let attachments: [String]
+    }
+
     private var nextRequestId = 0
 
     /// Lazily-spawned `openseer agentd` subprocess, kept so we can
@@ -225,6 +241,10 @@ final class AgentdClient: NSObject {
 
     private func dispatch(_ msg: [String: Any]) {
         let type = msg["type"] as? String ?? ""
+        if type == "ask_user" {
+            handleAskUser(msg)
+            return
+        }
         if type == "event", let runId = msg["run_id"] as? String {
             let inner = msg["event"] as? [String: Any]
             let et = inner?["type"] as? String
@@ -375,6 +395,56 @@ final class AgentdClient: NSObject {
                 "cancel_task", payload: ["run_id": runId])
         } catch {
             NSLog("[agentd] cancel failed: %@", "\(error)")
+        }
+    }
+
+    /// Handle an incoming ask_user from the daemon. Routes to the
+    /// askUserHandler, awaits its return, and posts a user_reply
+    /// back. If no handler is registered we reply with null which
+    /// the agent treats as "user didn't respond" and terminates.
+    private func handleAskUser(_ msg: [String: Any]) {
+        guard let runId = msg["run_id"] as? String,
+              let reqId = msg["request_id"] as? String else {
+            NSLog("[agentd] malformed ask_user: %@", "\(msg)")
+            return
+        }
+        let req = AskUserRequest(
+            runId: runId,
+            requestId: reqId,
+            question: msg["question"] as? String ?? "",
+            kind: msg["kind"] as? String ?? "text",
+            options: msg["options"] as? [String] ?? [],
+            attachments: msg["attachments"] as? [String] ?? []
+        )
+        guard let handler = askUserHandler else {
+            NSLog("[agentd] no askUserHandler — replying null for %@",
+                  req.requestId)
+            sendUserReply(requestId: req.requestId, reply: nil)
+            return
+        }
+        Task { @MainActor [weak self] in
+            let reply = await handler(req)
+            self?.sendUserReply(requestId: req.requestId, reply: reply)
+        }
+    }
+
+    private func sendUserReply(requestId: String, reply: String?) {
+        // `ask_id` carries the original ask_user's request_id;
+        // `request_id` on this user_reply message is allocated by
+        // sendRequest for the ack flow. Two distinct ids to avoid
+        // colliding the ask_user round-trip with the user_reply's
+        // own ack.
+        Task { @MainActor [weak self] in
+            do {
+                var payload: [String: Any] = ["ask_id": requestId]
+                if let reply { payload["reply"] = reply }
+                else        { payload["reply"] = NSNull() }
+                _ = try await self?.sendRequest(
+                    "user_reply", payload: payload)
+            } catch {
+                NSLog("[agentd] sending user_reply failed: %@",
+                      "\(error)")
+            }
         }
     }
 

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -13,6 +14,71 @@ final class MainController: ObservableObject {
     init(binary: String) {
         self.binary = binary
         self.daemon = DaemonController(binary: binary)
+        // Install the ask_user round-trip handler. The agentd
+        // daemon emits `ask_user` whenever the agent decides it
+        // needs a human in the loop (uncertain target, hard-to-
+        // reverse action, ambiguous instructions). We surface it
+        // as an NSAlert and post the reply back over ws.
+        AgentdClient.shared.askUserHandler = { [weak self] req in
+            await self?.respondToAskUser(req) ?? nil
+        }
+    }
+
+    /// Show a modal alert for an ask_user request and return the
+    /// user's reply (or nil if dismissed). Runs on the main thread.
+    private func respondToAskUser(_ req: AgentdClient.AskUserRequest)
+        async -> String?
+    {
+        let alert = NSAlert()
+        alert.messageText = "OpenSeer 想确认一下"
+        alert.informativeText = req.question
+        alert.alertStyle = .informational
+
+        var optionTitles: [String] = []
+        var textField: NSTextField? = nil
+
+        switch req.kind {
+        case "confirm":
+            optionTitles = ["Yes", "No"]
+        case "choose":
+            // NSAlert allows up to 3 buttons cleanly; truncate
+            // longer option lists. For lots-of-options we should
+            // build a custom sheet later — out of scope here.
+            optionTitles = Array(req.options.prefix(3))
+            if optionTitles.isEmpty { optionTitles = ["OK"] }
+        default:
+            // "text" — accept free-form input via accessory view.
+            optionTitles = ["Send", "Cancel"]
+            let tf = NSTextField(
+                frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+            tf.placeholderString = "Your reply…"
+            alert.accessoryView = tf
+            textField = tf
+        }
+        for title in optionTitles {
+            alert.addButton(withTitle: title)
+        }
+        // NSWindow.makeKeyAndOrderFront so the alert can grab
+        // focus on top of the floating voice orb panel.
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        // NSAlert maps the first 3 buttons to
+        // .alertFirstButtonReturn / .alertSecondButtonReturn /
+        // .alertThirdButtonReturn (1000/1001/1002).
+        let index = response.rawValue - NSApplication.ModalResponse
+            .alertFirstButtonReturn.rawValue
+        guard index >= 0, index < optionTitles.count else {
+            return nil
+        }
+        let chosen = optionTitles[index]
+        // text-kind Cancel → return nil (treated as timeout).
+        if req.kind == "text" {
+            if chosen == "Cancel" { return nil }
+            let entry = textField?.stringValue.trimmingCharacters(
+                in: .whitespacesAndNewlines) ?? ""
+            return entry.isEmpty ? nil : entry
+        }
+        return chosen
     }
 
     var selectedThread: ChatThread? {

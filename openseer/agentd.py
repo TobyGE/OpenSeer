@@ -268,9 +268,18 @@ class _Connection:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            # Cancel any in-flight stub tasks tied to this client.
+            # Cancel any in-flight tasks tied to this client.
             for t in self.tasks.values():
                 t.cancel()
+            # Resolve any pending ask_user waiters with None so the
+            # synchronous agent thread doesn't block waiting on a
+            # client that's gone (it would otherwise sit there for
+            # the full 300s timeout). Agent treats None as a
+            # no-reply and ends the task cleanly.
+            for fut in list(self.ask_user_waiters.values()):
+                if not fut.done():
+                    fut.set_result(None)
+            self.ask_user_waiters.clear()
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         t = msg.get("type")

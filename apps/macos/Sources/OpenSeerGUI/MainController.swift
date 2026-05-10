@@ -49,17 +49,24 @@ final class MainController: ObservableObject {
         default:
             // "text" — accept free-form input via accessory view.
             optionTitles = ["Send", "Cancel"]
-            let tf = NSTextField(
+            textField = NSTextField(
                 frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-            tf.placeholderString = "Your reply…"
-            alert.accessoryView = tf
-            textField = tf
+            textField?.placeholderString = "Your reply…"
         }
+
+        // Build the accessory view: any image attachments stacked
+        // vertically, then the text input (for kind=text). Without
+        // surfacing attachments, the user is asked to approve
+        // hard-to-reverse actions blind — a real bug codex flagged.
+        alert.accessoryView = buildAskUserAccessory(
+            attachments: req.attachments,
+            textField: textField)
+
         for title in optionTitles {
             alert.addButton(withTitle: title)
         }
-        // NSWindow.makeKeyAndOrderFront so the alert can grab
-        // focus on top of the floating voice orb panel.
+        // NSApp.activate so the alert grabs focus on top of the
+        // floating voice-orb panel.
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
         // NSAlert maps the first 3 buttons to
@@ -79,6 +86,63 @@ final class MainController: ObservableObject {
             return entry.isEmpty ? nil : entry
         }
         return chosen
+    }
+
+    /// Compose the NSAlert accessory view: load up to 3 attachments
+    /// as scaled NSImageViews stacked vertically; if a text field
+    /// was supplied (kind=text), append it below. Returns nil when
+    /// neither is needed so NSAlert uses its default layout.
+    private func buildAskUserAccessory(
+        attachments: [String],
+        textField: NSTextField?
+    ) -> NSView? {
+        let imagePaths = attachments
+            .prefix(3)
+            .filter { FileManager.default.fileExists(atPath: $0) }
+        if imagePaths.isEmpty && textField == nil { return nil }
+
+        let width: CGFloat = 360
+        let imageHeight: CGFloat = 200
+        let spacing: CGFloat = 8
+        let tfHeight: CGFloat = 24
+
+        var rows: [NSView] = []
+        for path in imagePaths {
+            guard let img = NSImage(contentsOfFile: path) else { continue }
+            let iv = NSImageView(
+                frame: NSRect(x: 0, y: 0, width: width, height: imageHeight))
+            iv.image = img
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.imageAlignment = .alignCenter
+            iv.wantsLayer = true
+            iv.layer?.cornerRadius = 6
+            iv.layer?.masksToBounds = true
+            iv.layer?.borderColor = NSColor.separatorColor.cgColor
+            iv.layer?.borderWidth = 1
+            rows.append(iv)
+        }
+        if let tf = textField { rows.append(tf) }
+
+        var totalHeight: CGFloat = 0
+        for (i, row) in rows.enumerated() {
+            let h = (row is NSTextField) ? tfHeight : imageHeight
+            if i > 0 { totalHeight += spacing }
+            totalHeight += h
+        }
+        let container = NSView(
+            frame: NSRect(x: 0, y: 0, width: width, height: totalHeight))
+        // Stack from top to bottom in AppKit-flipped coords (origin
+        // at bottom-left): iterate rows from last to first so the
+        // first attachment ends up at the top.
+        var y: CGFloat = totalHeight
+        for row in rows {
+            let h = (row is NSTextField) ? tfHeight : imageHeight
+            y -= h
+            row.frame = NSRect(x: 0, y: y, width: width, height: h)
+            container.addSubview(row)
+            y -= spacing
+        }
+        return container
     }
 
     var selectedThread: ChatThread? {

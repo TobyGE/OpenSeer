@@ -50,19 +50,45 @@ def run() -> int:
         else:
             summary.append(f"absent     {f}")
 
+    # Use PyObjC Security framework instead of `security
+    # delete-generic-password`. Delete doesn't take a password
+    # argument, so argv exposure isn't an issue here, but keeping
+    # the keychain path consistent with the OAuth save path
+    # simplifies things and lets us run without needing the
+    # `security` binary on $PATH.
+    try:
+        from Security import (  # type: ignore[import-untyped]
+            SecItemDelete, kSecClass, kSecClassGenericPassword,
+            kSecAttrService, errSecItemNotFound,
+        )
+    except ImportError:
+        SecItemDelete = None
     for svc in _KEYCHAIN_SERVICES:
-        r = subprocess.run(
-            ["security", "delete-generic-password", "-s", svc],
-            capture_output=True, text=True)
-        if r.returncode == 0:
-            summary.append(f"keychain wiped: {svc}")
-        else:
-            # 44 = item not found (expected when not signed in)
-            err = (r.stderr or r.stdout).strip()
-            if "could not be found" in err.lower():
-                summary.append(f"keychain absent: {svc}")
+        if SecItemDelete is None:
+            # Fallback to the CLI when the Security framework
+            # isn't bundled (older install / dev environment).
+            r = subprocess.run(
+                ["security", "delete-generic-password", "-s", svc],
+                capture_output=True, text=True)
+            if r.returncode == 0:
+                summary.append(f"keychain wiped: {svc}")
             else:
-                summary.append(f"keychain FAIL  {svc}: {err}")
+                err = (r.stderr or r.stdout).strip()
+                if "could not be found" in err.lower():
+                    summary.append(f"keychain absent: {svc}")
+                else:
+                    summary.append(f"keychain FAIL  {svc}: {err}")
+            continue
+        status = SecItemDelete({
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: svc,
+        })
+        if status == 0:
+            summary.append(f"keychain wiped: {svc}")
+        elif status == errSecItemNotFound:
+            summary.append(f"keychain absent: {svc}")
+        else:
+            summary.append(f"keychain FAIL  {svc}: OSStatus {status}")
 
     # Reset the .app bundle only. python-build-standalone registers
     # under `org.python.python`, which is SHARED with every other

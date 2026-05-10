@@ -104,7 +104,13 @@ def save_to_keychain(tokens: dict[str, Any]) -> None:
     """Write the token blob to macOS Keychain under
     ``Claude Code-credentials`` in the same JSON shape Claude Code
     itself stores, so ``openseer.anthropic_messages`` keeps working
-    without changes."""
+    without changes.
+
+    Uses the Security framework (PyObjC) directly — NOT
+    `/usr/bin/security add-generic-password`, which takes the
+    password as an argv parameter and would briefly expose the
+    OAuth tokens to other local processes via `ps`.
+    """
     expires_at_ms = int((time.time()
                          + (tokens.get("expires_in") or 3600)) * 1000)
     blob = {
@@ -116,18 +122,35 @@ def save_to_keychain(tokens: dict[str, Any]) -> None:
             "subscriptionType": tokens.get("subscription_type") or "",
         }
     }
-    payload = json.dumps(blob)
-    # `security add-generic-password -U` updates the existing entry
-    # if one is already present (otherwise it errors with -U missing).
-    cmd = ["security", "add-generic-password",
-           "-s", KEYCHAIN_SERVICE,
-           "-a", KEYCHAIN_SERVICE,   # account name (Claude Code uses same)
-           "-w", payload,
-           "-U"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
+    payload = json.dumps(blob).encode("utf-8")
+    try:
+        from Security import (  # type: ignore[import-untyped]
+            SecItemAdd, SecItemUpdate, SecItemDelete,
+            kSecClass, kSecClassGenericPassword,
+            kSecAttrService, kSecAttrAccount, kSecValueData,
+            errSecDuplicateItem,
+        )
+    except ImportError as e:
         raise RuntimeError(
-            f"keychain write failed: {r.stderr.strip() or r.stdout.strip()}")
+            "PyObjC Security framework not available. Install "
+            "`pyobjc-framework-Security`."
+        ) from e
+    query = {
+        kSecClass:       kSecClassGenericPassword,
+        kSecAttrService: KEYCHAIN_SERVICE,
+        kSecAttrAccount: KEYCHAIN_SERVICE,
+    }
+    add = dict(query)
+    add[kSecValueData] = payload
+    status, _ = SecItemAdd(add, None)
+    if status == errSecDuplicateItem:
+        # Already exists — update in place. SecItemUpdate takes the
+        # query dict and an "attributes to update" dict.
+        update = {kSecValueData: payload}
+        status = SecItemUpdate(query, update)
+    if status != 0:
+        raise RuntimeError(
+            f"Keychain write failed (Security OSStatus {status})")
 
 
 def run_login_start() -> int:

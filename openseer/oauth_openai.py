@@ -269,11 +269,29 @@ def _save_auth(tokens: dict[str, Any]) -> None:
             "%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime()),
     }
     AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write so a crash mid-flight can't leave a half-written
-    # auth.json that auth.py then fails to parse.
+    # Open with O_CREAT|O_WRONLY|O_TRUNC and explicit 0600 mode so
+    # the file is private from the moment it exists. Using
+    # `Path.write_text` then `os.chmod` would leave the file world-
+    # readable for the duration of the write, briefly exposing the
+    # token blob on multi-user systems with searchable home dirs
+    # (codex P2). We still write to a tmp file + atomic rename so
+    # a crash mid-flight can't leave a half-written auth.json.
     tmp = AUTH_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(out, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
+    fd = os.open(str(tmp),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        # `mode` on os.open only applies when the file is CREATED.
+        # If a stale tmp from a prior crash already exists with
+        # a looser mode, open(...) reuses it. Force 0600 via fchmod
+        # so we can never end up replacing auth.json with a
+        # world-readable mode (codex P2).
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(out, fh, indent=2)
+    except Exception:
+        try: os.unlink(str(tmp))
+        except OSError: pass
+        raise
     os.replace(tmp, AUTH_FILE)
 
 

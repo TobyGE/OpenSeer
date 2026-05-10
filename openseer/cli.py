@@ -26,7 +26,11 @@ from .setup_wizard import run_setup
 
 def _add_task_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("task", help="Natural-language task description")
-    ap.add_argument("--max-steps", type=int, default=20)
+    # 200 matches agent.run's default and the Telegram daemon. The
+    # old default of 20 was a leftover debug cap that silently
+    # truncated GUI/CLI runs that spawned `openseer task` without
+    # explicitly overriding it.
+    ap.add_argument("--max-steps", type=int, default=200)
     ap.add_argument("--execute", action="store_true",
                     help="Actually execute pyautogui actions (default: dry-run)")
     ap.add_argument("--confirm-each", action="store_true",

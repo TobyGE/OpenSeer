@@ -73,6 +73,17 @@ cp "$APP_ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$SWIFT_BIN" "$APP/Contents/MacOS/OpenSeerGUI"
 chmod +x "$APP/Contents/MacOS/OpenSeerGUI"
 
+# App icon — regenerate the .icns if the source has been updated
+# more recently, then drop it into Resources/.
+if [[ -f "$APP_ROOT/Resources/AppIcon-source.png" ]]; then
+    if [[ ! -f "$APP_ROOT/Resources/AppIcon.icns" \
+          || "$APP_ROOT/Resources/AppIcon-source.png" \
+              -nt "$APP_ROOT/Resources/AppIcon.icns" ]]; then
+        bash "$HERE/build_icon.sh"
+    fi
+    cp "$APP_ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/"
+fi
+
 echo "==> Copying bundled Python into Resources/python"
 cp -R "$PY_DIR" "$APP/Contents/Resources/python"
 

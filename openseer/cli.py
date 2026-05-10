@@ -42,6 +42,12 @@ def _add_task_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--external-grounder", default=None,
                     choices=["gpt55"],
                     help="Specialist grounder for reground[external:true]")
+    ap.add_argument("--session-context-file", default=None,
+                    help="Read prior-conversation context from FILE "
+                         "and inject it into the agent's first user "
+                         "message. The macOS GUI uses this when "
+                         "continuing a thread so the agent knows "
+                         "what 'do the same' refers to.")
 
 
 def cmd_task(args: argparse.Namespace) -> int:
@@ -55,9 +61,20 @@ def cmd_task(args: argparse.Namespace) -> int:
         print(msg)
         return 1
 
+    session_context = ""
+    if args.session_context_file:
+        try:
+            from pathlib import Path
+            session_context = Path(args.session_context_file
+                                   ).read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[task] couldn't read session context file: {e}")
+            # Don't abort — running without context is still useful.
+
     run(args.task, max_steps=args.max_steps, dry_run=not args.execute,
         confirm_each=args.confirm_each, sleep_between=args.sleep,
-        grounder=args.grounder, external_grounder=args.external_grounder)
+        grounder=args.grounder, external_grounder=args.external_grounder,
+        session_context=session_context)
     return 0
 
 

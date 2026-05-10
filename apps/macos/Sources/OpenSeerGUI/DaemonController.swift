@@ -111,9 +111,25 @@ final class DaemonController: ObservableObject {
     }
 
     /// ChatView calls this when the user submits a local prompt.
-    /// Each local Send creates its own thread (no continue-thread UX
-    /// in the composer yet; easy to lift later).
-    func addLocalRun(_ s: RunSession) -> ChatThread {
+    /// If `continueThread` is the id of an existing local thread
+    /// (the one the user has selected in the sidebar), the new run
+    /// is appended to it so successive prompts accumulate as turns
+    /// of the same conversation. Otherwise a fresh thread is
+    /// created. Telegram threads are never continued from a local
+    /// composer — those belong to the bot's chat_id.
+    func addLocalRun(_ s: RunSession,
+                     continueThread: String? = nil) -> ChatThread {
+        if let id = continueThread,
+           let existing = threads.first(where: {
+               $0.id == id && $0.kind == .local
+           }) {
+            existing.addRun(s)
+            // Bump @Published so SessionListView re-sorts (the
+            // newly-added run updates lastActivity, which is read
+            // off thread.runs).
+            objectWillChange.send()
+            return existing
+        }
         let id = "local:" + UUID().uuidString
         let t = ChatThread(id: id, kind: .local)
         t.addRun(s)

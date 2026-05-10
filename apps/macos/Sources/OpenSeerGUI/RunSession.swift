@@ -64,12 +64,35 @@ final class RunSession: ObservableObject, Identifiable {
     /// ``task_started`` event carries the prompt and TurnFolder
     /// renders it. Seeding here would create a duplicate bubble.
     func startLocal(prompt: String, dryRun: Bool,
+                    sessionContext: String? = nil,
                     onTraceFound: ((String) -> Void)? = nil) {
         guard case .localPrompt = source else { return }
         let runsDir = NSHomeDirectory() + "/.openseer/runs"
 
         var args = ["task", prompt]
         if !dryRun { args.append("--execute") }
+        // If the GUI is continuing an existing thread, write its
+        // prior-conversation summary to a tmp file and pass via
+        // --session-context-file. Args alone would put the (often
+        // long) summary in `ps`-visible argv. We use the system
+        // tmp dir (NOT runs/) so a crash mid-flight can't leave
+        // a non-directory entry under runs/ where loadRecentRuns
+        // would mis-classify it as a trace and tail forever
+        // (codex P2).
+        var contextFile: String? = nil
+        if let ctx = sessionContext, !ctx.isEmpty {
+            let tmp = NSTemporaryDirectory()
+                + "openseer-ctx-" + UUID().uuidString
+            do {
+                try ctx.write(toFile: tmp, atomically: true,
+                              encoding: .utf8)
+                contextFile = tmp
+                args.append(contentsOf: ["--session-context-file", tmp])
+            } catch {
+                NSLog("openseer: failed to write session context: %@",
+                      "\(error)")
+            }
+        }
         // Capture trace_id from the subprocess's own stdout so we
         // bind to OUR run dir, not "whichever symlink updated next"
         // (codex P2: in a daemon-running scenario, the global
@@ -99,6 +122,12 @@ final class RunSession: ObservableObject, Identifiable {
         } catch {
             errorMessage = "couldn't spawn openseer task: \(error)"
             status = .fail
+            // Spawn failed — the wait task that normally cleans up
+            // the tmp ctx file will never run. Clean up now so we
+            // don't leak a file per failed Send (codex P3).
+            if let p = contextFile {
+                try? FileManager.default.removeItem(atPath: p)
+            }
             return
         }
 
@@ -126,8 +155,12 @@ final class RunSession: ObservableObject, Identifiable {
         // We DON'T flip status to .done here on exit==0 — the
         // task_finished event is authoritative and may say
         // fail/cap/interrupted.
+        let ctxPath = contextFile
         Task { [weak self] in
-            guard let stream = self?.stream else { return }
+            guard let stream = self?.stream else {
+                if let p = ctxPath { try? FileManager.default.removeItem(atPath: p) }
+                return
+            }
             let exit = await stream.wait()
             await MainActor.run {
                 guard let self else { return }
@@ -137,6 +170,12 @@ final class RunSession: ObservableObject, Identifiable {
                         self.errorMessage = "openseer task exited with code \(exit)"
                     }
                 }
+            }
+            // Drop the tmp context file once the agent is done with
+            // it. Leaving it would leak a small file per continued
+            // turn into ~/.openseer/runs/.
+            if let p = ctxPath {
+                try? FileManager.default.removeItem(atPath: p)
             }
         }
     }

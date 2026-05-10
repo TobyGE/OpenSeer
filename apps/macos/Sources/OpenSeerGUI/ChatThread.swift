@@ -79,6 +79,56 @@ final class ChatThread: ObservableObject, Identifiable {
                 self?.objectWillChange.send()
             }
     }
+
+    /// Format prior runs into the same `RECENT SESSION CONTEXT`
+    /// block the Telegram daemon's ChatSessions injects, so a
+    /// continued thread's follow-up prompts give the agent the same
+    /// visibility the user assumes from the GUI grouping. Caps at
+    /// the most recent 5 runs to keep the prompt tight.
+    func renderSessionContext() -> String {
+        let prior = sortedRuns.suffix(5)
+        guard !prior.isEmpty else { return "" }
+        var lines = ["RECENT SESSION CONTEXT (read-only, prior tasks "
+                     + "in this conversation):"]
+        for run in prior {
+            let task = run.title
+                .replacingOccurrences(of: "\n", with: " ")
+            let status = describe(run.status)
+            let result = lastResult(of: run)
+                .replacingOccurrences(of: "\n", with: " ")
+                .prefix(140)
+            let summary = result.isEmpty
+                ? "\"\(task)\" → \(status)"
+                : "\"\(task)\" → \(status): \(result)"
+            lines.append("  - " + summary)
+        }
+        lines.append("END SESSION CONTEXT")
+        return lines.joined(separator: "\n")
+    }
+
+    private func describe(_ s: RunSession.Status) -> String {
+        switch s {
+        case .running: return "running"
+        case .done:    return "done"
+        case .fail:    return "fail"
+        case .cap:     return "cap"
+        case .interrupted: return "interrupted"
+        }
+    }
+
+    private func lastResult(of run: RunSession) -> String {
+        // Prefer terminate.reason (the model's user-facing reply);
+        // otherwise fall back to the last action's brief result.
+        for turn in run.turns.reversed() {
+            if let final = turn.finalOutput, !final.isEmpty {
+                return final
+            }
+            if let last = turn.actions.last, !last.result.isEmpty {
+                return last.result
+            }
+        }
+        return ""
+    }
 }
 
 /// Sidecar `chat.json` that the daemon writes alongside every run.

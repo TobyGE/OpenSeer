@@ -64,7 +64,11 @@ struct ChatView: View {
         daemon.threads.first { $0.id == selectedThreadID }
     }
     private var selectedRunningRun: RunSession? {
-        selectedThread?.runs.first { $0.status == .running }
+        // LAST running run, not first — when the user has submitted
+        // a follow-up prompt before the previous run finished, Stop
+        // should target the newly-spawned task, not the old one
+        // already mid-flight (codex P2).
+        selectedThread?.sortedRuns.last { $0.status == .running }
     }
 
     private var transcript: some View {
@@ -89,6 +93,16 @@ struct ChatView: View {
     }
     private var totalTurnCount: Int {
         selectedThread?.runs.reduce(0) { $0 + $1.turns.count } ?? 0
+    }
+
+    /// Composer caption text — adapts to whether the next Send will
+    /// continue the selected local thread or spawn a fresh one.
+    private var composerHint: String {
+        if let t = selectedThread, t.kind == .local {
+            return "⌘↩ to send · continuing this conversation · "
+                + "Compose ✏️ to start fresh"
+        }
+        return "⌘↩ to send · starts a new conversation"
     }
 
     private var emptyState: some View {
@@ -135,7 +149,7 @@ struct ChatView: View {
                     .controlSize(.small)
                     .toggleStyle(.switch)
                 Spacer()
-                Text("⌘↩ to send · each prompt starts a new session")
+                Text(composerHint)
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
@@ -145,13 +159,28 @@ struct ChatView: View {
     private func submit() {
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
+        // If the currently-selected thread is a local one, build
+        // a session_context block from its prior runs so the new
+        // task knows what "do the same" / "next one" refers to.
+        // Telegram threads can't be continued from the local
+        // composer; those spawn fresh threads.
+        let continueThread: ChatThread? = {
+            guard let cur = selectedThread, cur.kind == .local
+            else { return nil }
+            return cur
+        }()
+        let sessionCtx = continueThread?.renderSessionContext()
+
         let s = RunSession(source: .localPrompt(text),
                            binary: env.binaryPath ?? "/usr/local/bin/openseer")
         daemon.claimLocalPrompt(text)
-        s.startLocal(prompt: text, dryRun: dryRun) { [weak daemon, prompt = text] traceId in
+        s.startLocal(prompt: text, dryRun: dryRun,
+                     sessionContext: sessionCtx) {
+            [weak daemon, prompt = text] traceId in
             daemon?.reserveLocalTrace(traceId, prompt: prompt)
         }
-        let thread = daemon.addLocalRun(s)
+        let thread = daemon.addLocalRun(
+            s, continueThread: continueThread?.id)
         selectedThreadID = thread.id
         composerText = ""
     }

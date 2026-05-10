@@ -132,6 +132,15 @@ struct Sidebar: View {
                 confirmReset = true
             }
             .disabled(resettingNow)
+            // Phase 1 dev probe: clicks runs an end-to-end handshake
+            // against `openseer agentd`. Output goes to Console.app
+            // (filter: process == OpenSeerGUI, message contains
+            // "[agent​d] probe"). Hidden behind a debug icon — will
+            // be removed once the GUI actually uses the daemon.
+            navButton("Probe agentd",
+                      icon: "antenna.radiowaves.left.and.right") {
+                Task { await AgentdClient.shared.runProbe() }
+            }
         }
         .alert("Reset OpenSeer?", isPresented: $confirmReset) {
             Button("Cancel", role: .cancel) {}

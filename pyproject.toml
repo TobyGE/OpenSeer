@@ -26,6 +26,11 @@ classifiers = [
 dependencies = [
     "Pillow>=10.0",
     "pyautogui>=0.9.54",
+    # WebSocket server for `openseer agentd` — one long-running Python
+    # process that the GUI / voice orb / CLI / telegram all talk to,
+    # instead of every client spawning its own `openseer task`
+    # subprocess and tailing events.jsonl.
+    "websockets>=12.0",
     "pyobjc-framework-Quartz>=10.0; platform_system == 'Darwin'",
     "pyobjc-framework-Cocoa>=10.0; platform_system == 'Darwin'",
     "pyobjc-framework-ApplicationServices>=10.0; platform_system == 'Darwin'",

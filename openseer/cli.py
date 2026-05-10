@@ -174,6 +174,11 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     return run_daemon()
 
 
+def cmd_agentd(args: argparse.Namespace) -> int:
+    from .agentd import run_agentd
+    return run_agentd()
+
+
 def cmd_daemon_launcher(args: argparse.Namespace) -> int:
     from .daemon_launcher import main as launcher_main
     return launcher_main()
@@ -260,6 +265,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_daemon.set_defaults(func=cmd_daemon)
 
+    p_agentd = sub.add_parser(
+        "agentd",
+        help="WebSocket daemon (Phase 1 skeleton). One process, many clients.",
+    )
+    p_agentd.set_defaults(func=cmd_agentd)
+
     p_daemon_launcher = sub.add_parser(
         "daemon-launcher",
         help="Launch a Terminal-hosted daemon from launchd/watchdogs",
@@ -304,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
 
 
 def main() -> None:

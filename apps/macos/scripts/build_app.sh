@@ -169,7 +169,3 @@ du -sh "$APP" || true
 echo
 echo "Run it:"
 echo "    open \"$APP\""
-echo
-echo "Note: codex/claude CLIs still need to be installed separately"
-echo "(npm install -g @openai/codex / @anthropic-ai/claude-code) for"
-echo "the wizard's login flow; they're not bundled."

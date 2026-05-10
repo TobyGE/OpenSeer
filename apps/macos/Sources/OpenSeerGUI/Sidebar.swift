@@ -9,6 +9,8 @@ struct Sidebar: View {
     @Binding var showSettings: Bool
     @Binding var statusBlob: SystemStatus?
     var refreshStatus: () -> Void
+    @State private var confirmReset: Bool = false
+    @State private var resettingNow: Bool = false
 
     var body: some View {
         ScrollView {
@@ -107,10 +109,51 @@ struct Sidebar: View {
             navButton("Settings", icon: "gearshape") {
                 showSettings = true
             }
-            navButton("Re-run setup", icon: "wand.and.stars") {
-                env.markNeedsSetup()
+            navButton("Re-run setup",
+                      icon: resettingNow ? "hourglass" : "wand.and.stars") {
+                confirmReset = true
             }
+            .disabled(resettingNow)
         }
+        .alert("Reset OpenSeer?", isPresented: $confirmReset) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset", role: .destructive) {
+                Task { await runFactoryReset() }
+            }
+        } message: {
+            Text("Signs you out of OpenAI and Claude, clears the "
+                 + "Telegram bot token + per-chat session memory, "
+                 + "and resets the OpenSeer entry in macOS Privacy "
+                 + "(Accessibility / Screen Recording).\n\n"
+                 + "Not touched: SOUL.md, MEMORY.md, your saved "
+                 + "skills.\n\n"
+                 + "If you previously granted permissions to "
+                 + "\"Python\" in Privacy & Security, that entry "
+                 + "is shared with other Python tools and is left "
+                 + "intact — remove it manually in System Settings "
+                 + "if you want a fully clean slate.\n\n"
+                 + "The setup wizard opens afterward so you can "
+                 + "re-authenticate.")
+        }
+    }
+
+    @MainActor
+    private func runFactoryReset() async {
+        resettingNow = true
+        defer { resettingNow = false }
+        // Stop the daemon AND wait for it to exit BEFORE wiping
+        // config — otherwise the running process keeps the loaded
+        // bot token + chat sessions in memory and would happily
+        // reply to Telegram even though config.json is gone.
+        // SIGTERM unwind takes a moment; await it.
+        if daemon.isRunning {
+            await daemon.stopAndWait()
+        }
+        if let bin = env.binaryPath {
+            _ = await CLI.run(path: bin, args: ["reset"])
+        }
+        await env.refresh()
+        env.markNeedsSetup()
     }
 
     // ── helpers ────────────────────────────────────────────────────

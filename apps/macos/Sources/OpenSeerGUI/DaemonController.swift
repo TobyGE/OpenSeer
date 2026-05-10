@@ -88,6 +88,28 @@ final class DaemonController: ObservableObject {
         isRunning = false
     }
 
+    /// Stop the daemon AND block until the subprocess actually
+    /// exits. `stop()` only sends SIGTERM and clears state — the
+    /// caller (e.g. factory reset) needs to be sure no in-memory
+    /// bot token / session state can still write back to disk
+    /// after we wipe config files. Idempotent; safe to call when
+    /// already stopped.
+    func stopAndWait() async {
+        guard let s = stream else { stop(); return }
+        intentionalStop = true
+        daemonGen += 1
+        s.terminate()
+        // Drop the references so other code paths see "stopped",
+        // then await the wait() future on our local copy.
+        stream = nil
+        runsWatcher?.stop()
+        runsWatcher = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
+        isRunning = false
+        _ = await s.wait()
+    }
+
     /// ChatView calls this when the user submits a local prompt.
     /// Each local Send creates its own thread (no continue-thread UX
     /// in the composer yet; easy to lift later).

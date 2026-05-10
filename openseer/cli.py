@@ -130,6 +130,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     return _check.main(json_out=bool(args.json))
 
 
+def cmd_reset(args: argparse.Namespace) -> int:
+    """Factory-reset: wipe OAuth tokens, configs, TCC grants. Used
+    by the GUI's "Re-run setup" button."""
+    from . import reset as _reset
+    return _reset.run()
+
+
 def cmd_permissions_request(args: argparse.Namespace) -> int:
     """Trigger the macOS Accessibility + Screen-Recording prompts
     FROM THIS python process so it ends up in the relevant Privacy
@@ -174,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_check.add_argument("--json", action="store_true",
                          help="Emit a JSON blob instead of human summary")
     p_check.set_defaults(func=cmd_check)
+
+    sub.add_parser(
+        "reset",
+        help="Factory-reset: wipe OAuth tokens, configs, TCC grants",
+    ).set_defaults(func=cmd_reset)
 
     p_perm = sub.add_parser(
         "permissions",
@@ -240,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "check", "permissions", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
 
 
 def main() -> None:

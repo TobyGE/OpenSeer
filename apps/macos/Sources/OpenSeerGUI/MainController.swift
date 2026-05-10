@@ -32,9 +32,12 @@ final class MainController: ObservableObject {
     }
 
     func submitTextPrompt(_ text: String) {
-        // Text submit still uses the legacy per-task subprocess
-        // path for now. WS Phase 2 migrates this too.
-        submitPrompt(text, transport: .subprocess)
+        // Text submits go through agentd alongside voice (WS Phase 2).
+        // The legacy `.subprocess` path stays in code as an emergency
+        // fallback path — flip this back if agentd development
+        // regresses badly — and is removed wholesale in Phase 4 once
+        // the telegram + CLI consolidation has settled.
+        submitPrompt(text, transport: .agentd)
     }
 
     func submitVoicePrompt(_ text: String) {

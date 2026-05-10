@@ -20,6 +20,8 @@ final class RunSession: ObservableObject, Identifiable {
     @Published var status: Status = .running
     @Published var traceId: String? = nil
     @Published var errorMessage: String? = nil
+    @Published private(set) var finalAnswer: String? = nil
+    var onFinalAnswer: ((String) -> Void)? = nil
     /// When this session was created in the GUI. Used to order the
     /// session list (newest first). For historical daemon traces
     /// loaded at startup we override this from the run dir's mtime.
@@ -43,6 +45,7 @@ final class RunSession: ObservableObject, Identifiable {
     private var stream: CLI.StreamHandle?
     private var watcher: FileTail?
     private let binary: String
+    private var didNotifyFinalAnswer = false
 
     init(source: Source, binary: String) {
         self.source = source
@@ -275,6 +278,7 @@ final class RunSession: ObservableObject, Identifiable {
             let st = ev.data["status"]?.string ?? "done"
             status = (st == "done" ? .done
                       : st == "cap" ? .cap : .fail)
+            captureFinalAnswer()
         } else if ev.type == "task_failed" {
             status = .fail
             errorMessage = ev.data["error"]?.string
@@ -288,6 +292,19 @@ final class RunSession: ObservableObject, Identifiable {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         return obj["task"] as? String
+    }
+
+    private func captureFinalAnswer() {
+        guard !didNotifyFinalAnswer else { return }
+        for turn in turns.reversed() {
+            guard let final = turn.finalOutput,
+                  !final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { continue }
+            finalAnswer = final
+            didNotifyFinalAnswer = true
+            onFinalAnswer?(final)
+            return
+        }
     }
 }
 

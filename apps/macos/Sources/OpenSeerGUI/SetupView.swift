@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Multi-step setup wizard. Each step body now reads from
@@ -460,41 +461,125 @@ private struct PermissionsStepView: View {
             }
         }
         .onAppear {
-            // Pre-register OpenSeer.app in BOTH Privacy lists the
-            // moment the user lands on this step, so by the time
-            // they hit Request the row already exists in System
-            // Settings — saves them the manual `+ → /Applications`
-            // dance the GUI was previously asking for. Idempotent.
-            // We only fire once per view appearance to avoid
-            // re-prompting on every refresh.
             if !preflightFired {
                 preflightFired = true
-                _ = Permissions.requestAccessibility()
-                _ = Permissions.requestScreenRecording()
+                Task { @MainActor in
+                    await model.probe()
+                }
             }
         }
     }
 
     private var fallbackHelp: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("Don't see OpenSeer in the Privacy list?")
                 .font(.caption.bold())
-            Text("Click the + button in System Settings, then drop OpenSeer.app from the Reveal Finder window below.")
+            Text("Ad-hoc-signed builds (the default `build_app.sh` "
+                 + "output) get a fresh code-signing identity on every "
+                 + "rebuild. macOS' TCC database keys grants by that "
+                 + "identity, so a stale entry can block a fresh app "
+                 + "from showing up. Two ways out:")
                 .font(.caption).foregroundStyle(.secondary)
-            Button {
-                if let url = Bundle.main.bundleURL as URL? {
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
+
+            // Option 1 — manual `+` add.
+            VStack(alignment: .leading, spacing: 6) {
+                Text("1. Manually add OpenSeer.app")
+                    .font(.caption.bold())
+                if let path = Self.bundleAppPath() {
+                    pathBox(path)
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [URL(fileURLWithPath: path)])
+                    } label: {
+                        Label("Reveal OpenSeer.app in Finder",
+                              systemImage: "folder")
+                    }
+                    .controlSize(.small)
+                } else {
+                    Text("(running unbundled — relaunch via OpenSeer.app, "
+                         + "Accessibility grants don't stick to "
+                         + "`swift run` builds.)")
+                        .font(.caption2).foregroundStyle(.orange)
                 }
-            } label: {
-                Label("Reveal OpenSeer.app in Finder",
-                      systemImage: "folder")
+                Text("In Privacy → Accessibility / Screen Recording, click + and pick OpenSeer.app at the path above.")
+                    .font(.caption2).foregroundStyle(.secondary)
             }
-            .controlSize(.small)
+
+            // Option 2 — wipe stale TCC.
+            VStack(alignment: .leading, spacing: 6) {
+                Text("2. Reset stale TCC entries")
+                    .font(.caption.bold())
+                Text("If a stale OpenSeer entry already exists with the same bundle id, macOS won't add a fresh one. Run these in Terminal, then click Request again:")
+                    .font(.caption2).foregroundStyle(.secondary)
+                ResetCommandRow(
+                    command: "tccutil reset Accessibility \(Self.bundleId)")
+                ResetCommandRow(
+                    command: "tccutil reset ScreenCapture \(Self.bundleId)")
+            }
         }
     }
 
-    private func permissionRow(title: String, granted: Bool,
-                               onRequest: @escaping () -> Void) -> some View {
+    private func pathBox(_ path: String) -> some View {
+        HStack(spacing: 6) {
+            Text(path)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.background.tertiary)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+            CopyButton(value: path)
+        }
+    }
+
+    private static func bundleAppPath() -> String? {
+        let path = Bundle.main.bundlePath
+        return path.hasSuffix(".app") ? path : nil
+    }
+
+    private static var bundleId: String {
+        Bundle.main.bundleIdentifier ?? "com.openseer.OpenSeer"
+    }
+}
+
+private struct ResetCommandRow: View {
+    let command: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(command)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.background.tertiary)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+            CopyButton(value: command)
+        }
+    }
+}
+
+private struct CopyButton: View {
+    let value: String
+    @State private var copied = false
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(value, forType: .string)
+            copied = true
+            Task {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                await MainActor.run { copied = false }
+            }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+        }
+        .buttonStyle(.borderless)
+        .help(copied ? "Copied" : "Copy")
+    }
+}
+
+private func permissionRow(title: String, granted: Bool,
+                           onRequest: @escaping () -> Void) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: granted ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                 .foregroundStyle(granted ? .green : .orange)
@@ -507,13 +592,8 @@ private struct PermissionsStepView: View {
                     Text("Click Request — macOS will prompt and "
                          + "add OpenSeer to the Privacy list. Then "
                          + "flip the toggle and tap Refresh.\n\n"
-                         + "If OpenSeer is ALREADY in the list and "
-                         + "the toggle looks on, this build's "
-                         + "signature differs from the previous one "
-                         + "(every rebuild gets a new ad-hoc "
-                         + "signature). Click the – button to "
-                         + "remove OpenSeer from the list, then "
-                         + "click Request to add it back fresh.")
+                         + "If OpenSeer is already in the list and "
+                         + "the toggle looks on, click Refresh.")
                         .font(.caption).foregroundStyle(.secondary)
                     HStack(spacing: 8) {
                         Button("Request") { onRequest() }
@@ -535,7 +615,6 @@ private struct PermissionsStepView: View {
         .padding(10)
         .background(.background.secondary)
         .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
 }
 
 private struct TelegramStepView: View {

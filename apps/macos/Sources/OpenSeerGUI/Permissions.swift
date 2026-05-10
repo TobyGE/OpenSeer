@@ -43,7 +43,21 @@ enum Permissions {
     /// this once ensures the row exists for the user to toggle on.
     @discardableResult
     static func requestScreenRecording() -> Bool {
-        CGRequestScreenCaptureAccess()
+        let granted = CGRequestScreenCaptureAccess()
+        if !granted {
+            // Some macOS builds don't insert the app into Privacy >
+            // Screen Recording from CGRequestScreenCaptureAccess()
+            // alone. Touch the legacy capture path from the Swift
+            // app process as well so TCC records OpenSeer.app, not
+            // the bundled Python helper.
+            _ = CGWindowListCreateImage(
+                .null,
+                .optionOnScreenOnly,
+                kCGNullWindowID,
+                [.boundsIgnoreFraming]
+            )
+        }
+        return granted
     }
 
     /// Open System Settings directly to a TCC pane. Saves the user

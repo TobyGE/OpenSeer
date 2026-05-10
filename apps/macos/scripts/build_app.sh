@@ -110,6 +110,7 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RES="$HERE"
 export PYTHONPATH="$RES/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
 export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 exec "$RES/python/bin/python3" -m openseer.cli "$@"
 SHIM
@@ -127,8 +128,36 @@ echo "==> Ad-hoc codesigning (inside-out: every Mach-O, then bundle)"
 # the user toggles Accessibility on, AXIsProcessTrusted stays
 # false). We sign every Mach-O leaf first, then the python3
 # launcher, the GUI binary, and finally the bundle.
-SIGN_ID="-"   # ad-hoc
+SIGN_ID="${OPENSEER_SIGN_IDENTITY:-}"
+SIGN_KEYCHAIN="${OPENSEER_SIGN_KEYCHAIN:-$HOME/Library/Keychains/openseer-signing.keychain-db}"
+SIGN_KEYCHAIN_PASSWORD="${OPENSEER_SIGN_KEYCHAIN_PASSWORD:-openseer-dev}"
+if [[ -z "$SIGN_ID" ]]; then
+    if [[ -f "$SIGN_KEYCHAIN" ]]; then
+        security unlock-keychain -p "$SIGN_KEYCHAIN_PASSWORD" "$SIGN_KEYCHAIN" 2>/dev/null || true
+        KEYCHAIN_LIST=("$SIGN_KEYCHAIN")
+        while IFS= read -r kc; do
+            [[ -n "$kc" && "$kc" != "$SIGN_KEYCHAIN" ]] && KEYCHAIN_LIST+=("$kc")
+        done < <(security list-keychains -d user | tr -d ' "')
+        security list-keychains -d user -s "${KEYCHAIN_LIST[@]}" 2>/dev/null || true
+        SIGN_ID="$(
+            security find-identity -v -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null \
+                | awk -F'[ )]+' '/"OpenSeer Local Dev"/ { print $3; exit }'
+        )"
+    fi
+    if [[ -n "$SIGN_ID" ]]; then
+        :
+    elif security find-identity -v -p codesigning 2>/dev/null \
+        | grep -q '"OpenSeer Local Dev"'; then
+        SIGN_ID="OpenSeer Local Dev"
+    else
+        SIGN_ID="-"   # ad-hoc fallback
+    fi
+fi
+echo "==> Code signing identity: $SIGN_ID"
 SIGN_ARGS=(--force --sign "$SIGN_ID" --timestamp=none)
+if [[ "$SIGN_ID" != "-" && -f "$SIGN_KEYCHAIN" ]]; then
+    SIGN_ARGS+=(--keychain "$SIGN_KEYCHAIN")
+fi
 
 # 1) every .dylib / .so in the bundled Python tree + site-packages
 find "$APP/Contents/Resources" \

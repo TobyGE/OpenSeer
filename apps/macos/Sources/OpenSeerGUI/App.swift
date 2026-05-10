@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// SwiftUI app entry. Single window for now; we can split into a
@@ -11,8 +12,34 @@ struct OpenSeerApp: App {
             RootView()
                 .environmentObject(openseer)
                 .frame(minWidth: 960, minHeight: 600)
+                .onAppear {
+                    NSApp.activate(ignoringOtherApps: true)
+                    promoteMainWindowToFront()
+                }
         }
         .windowResizability(.contentSize)
+    }
+
+    /// Force the SwiftUI-created main window to make-key + order-front.
+    /// SwiftUI's saved-state restoration path occasionally creates the
+    /// window without bringing it forward, which manifests as "OpenSeer
+    /// is running but no window appears" on relaunch — the floating
+    /// voice orb panel is up and steals attention while the main
+    /// content window sits below other apps. We pick the first non-
+    /// panel window (the orb is an NSPanel with `.nonactivatingPanel`,
+    /// so isKind(of: NSPanel) excludes it) and explicitly raise it.
+    private func promoteMainWindowToFront() {
+        // Defer one runloop tick — SwiftUI hasn't necessarily inserted
+        // the window into NSApp.windows yet by the time .onAppear fires
+        // on the first redraw.
+        DispatchQueue.main.async {
+            for w in NSApp.windows where !w.isKind(of: NSPanel.self) {
+                if w.contentViewController != nil || w.contentView != nil {
+                    w.makeKeyAndOrderFront(nil)
+                    break
+                }
+            }
+        }
     }
 }
 
@@ -32,12 +59,28 @@ struct RootView: View {
             case .needsSetup:
                 SetupView()
             case .ready:
-                ChatView()
+                MainView(binary: env.binaryPath ?? "/usr/local/bin/openseer")
             case .error(let msg):
                 ErrorView(message: msg)
             }
         }
         .task { await env.refresh() }
+    }
+}
+
+struct MainView: View {
+    @StateObject private var controller: MainController
+
+    init(binary: String) {
+        _controller = StateObject(
+            wrappedValue: MainController(binary: binary))
+    }
+
+    var body: some View {
+        ChatView(controller: controller)
+            .onAppear {
+                FloatingVoiceOrbWindow.shared.show(controller: controller)
+            }
     }
 }
 

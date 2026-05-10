@@ -9,7 +9,7 @@ struct SystemStatus: Codable, Equatable {
     let version: Int
     let providers: Providers
     let selectedProvider: String?
-    let permissions: Permissions
+    var permissions: Permissions
     let telegram: Telegram
     let binaryPaths: BinaryPaths
 
@@ -83,16 +83,23 @@ extension SystemStatus.Telegram {
 /// on parse failure so callers can show an error rather than crash.
 @MainActor
 final class StatusProbe {
-    /// Whether the bundled-python CLI sees TCC permissions as
-    /// granted. The python child is the process that actually
-    /// captures the screen and drives mouse/keyboard, so its view
-    /// is authoritative — overriding from Swift would falsely
-    /// green-light a setup where only the .app is in the Privacy
-    /// list but the python child isn't.
+    /// Load provider/config status from Python, then replace TCC
+    /// permission booleans with probes from the Swift app process.
+    /// macOS presents privacy grants to the user as OpenSeer.app; the
+    /// bundled Python child can report a different identity and make
+    /// setup look stuck even after OpenSeer is granted.
     static func fetch(binary: String) async -> SystemStatus? {
         let r = await CLI.run(path: binary, args: ["check", "--json"])
         guard r.exitCode == 0 else { return nil }
         guard let data = r.stdout.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(SystemStatus.self, from: data)
+        guard var status = try? JSONDecoder().decode(SystemStatus.self,
+                                                     from: data) else {
+            return nil
+        }
+        status.permissions = .init(
+            accessibility: Permissions.accessibilityGranted(),
+            screenRecording: Permissions.screenRecordingGranted()
+        )
+        return status
     }
 }

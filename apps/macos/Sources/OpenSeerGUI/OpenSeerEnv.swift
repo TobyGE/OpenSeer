@@ -27,7 +27,21 @@ final class OpenSeerEnv: ObservableObject {
     private init() {}
 
     func refresh() async {
-        status = .loading
+        // CRITICAL: do NOT bounce status to .loading here on a
+        // periodic refresh — the RootView's `switch env.status`
+        // tears down MainView when status flips to .loading and
+        // rebuilds it on .ready, which resets the @StateObject
+        // MainController (and with it, selectedThreadID).
+        // Consequence: voice prompts arriving across a refresh
+        // boundary land in separate threads instead of continuing
+        // the same conversation. Only set .loading on the very
+        // first call, when we have no result yet to show.
+        if status == .ready || status == .needsSetup {
+            // keep current view alive; only update result fields
+            // and the final status at the end.
+        } else {
+            status = .loading
+        }
         guard let path = locateBinary() else {
             status = .error(
                 "Couldn't find the `openseer` CLI on $PATH. Install it "
@@ -72,19 +86,16 @@ final class OpenSeerEnv: ObservableObject {
         case "anthropic": providerOK = blob.providers.anthropic.loggedIn
         case "openai":    providerOK = blob.providers.openai.loggedIn
         default:
-            // No selected provider yet (first run) — needs setup.
             providerOK = false
         }
-        // Permissions are also a hard requirement: without
-        // Accessibility / Screen Recording the agent loop can't
-        // actually drive the Mac. Surface that as needsSetup too.
         let permsOK = blob.permissions.accessibility
             && blob.permissions.screenRecording
-        if providerOK && permsOK {
-            status = .ready
-        } else {
-            status = .needsSetup
-        }
+        let target: Status = (providerOK && permsOK) ? .ready : .needsSetup
+        // Skip the assignment when nothing changed — @Published
+        // emits objectWillChange even on equal values, which would
+        // re-run RootView.body and risk an identity churn that
+        // resets @StateObject.
+        if status != target { status = target }
     }
 
     /// Find `openseer`. We try in order:

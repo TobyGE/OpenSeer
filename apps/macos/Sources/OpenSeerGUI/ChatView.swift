@@ -7,44 +7,33 @@ import SwiftUI
 /// session and selects it (one OpenSeer task = one session).
 struct ChatView: View {
     @EnvironmentObject var env: OpenSeerEnv
-    @StateObject private var daemon: DaemonController
+    @ObservedObject var controller: MainController
     @State private var showSettings: Bool = false
     @State private var statusBlob: SystemStatus? = nil
     @State private var composerText: String = ""
-    @State private var dryRun: Bool = false
-    @State private var selectedThreadID: String? = nil
-
-    init() {
-        let bin = OpenSeerEnv.shared.binaryPath ?? "/usr/local/bin/openseer"
-        _daemon = StateObject(wrappedValue: DaemonController(binary: bin))
-    }
 
     var body: some View {
         // HSplitView is AppKit-backed: each child gets a real
         // draggable divider, and the layout respects min widths
         // even when the user resizes the window aggressively.
         HSplitView {
-            Sidebar(daemon: daemon,
+            Sidebar(daemon: controller.daemon,
                     showSettings: $showSettings,
                     statusBlob: $statusBlob,
                     refreshStatus: refreshStatus)
                 .frame(minWidth: 200, idealWidth: 240, maxWidth: 320)
-            SessionListView(daemon: daemon,
-                            selectedID: $selectedThreadID,
-                            onNew: { selectedThreadID = nil })
+            SessionListView(daemon: controller.daemon,
+                            selectedID: $controller.selectedThreadID,
+                            onNew: { controller.selectedThreadID = nil })
                 .frame(minWidth: 200, idealWidth: 260, maxWidth: 420)
             detailPane
                 .frame(minWidth: 360)
         }
         .task { await refreshStatusAsync() }
-        .onChange(of: daemon.threads.count) { _, _ in
+        .onChange(of: controller.daemon.threads.count) { _, _ in
             // Auto-select the most-recently-active thread on first
             // launch / right after a new run lands.
-            if selectedThreadID == nil,
-               let newest = daemon.threads
-                    .max(by: { $0.lastActivity < $1.lastActivity }) {
-                selectedThreadID = newest.id
-            }
+            controller.selectNewestThreadIfNeeded()
         }
         .sheet(isPresented: $showSettings) {
             SettingsSheet(statusBlob: $statusBlob,
@@ -61,14 +50,10 @@ struct ChatView: View {
     }
 
     private var selectedThread: ChatThread? {
-        daemon.threads.first { $0.id == selectedThreadID }
+        controller.selectedThread
     }
     private var selectedRunningRun: RunSession? {
-        // LAST running run, not first — when the user has submitted
-        // a follow-up prompt before the previous run finished, Stop
-        // should target the newly-spawned task, not the old one
-        // already mid-flight (codex P2).
-        selectedThread?.sortedRuns.last { $0.status == .running }
+        controller.selectedRunningRun
     }
 
     private var transcript: some View {
@@ -145,7 +130,7 @@ struct ChatView: View {
                 .keyboardShortcut(.return, modifiers: [.command])
             }
             HStack {
-                Toggle("Dry run (preview only)", isOn: $dryRun)
+                Toggle("Dry run (preview only)", isOn: $controller.dryRun)
                     .controlSize(.small)
                     .toggleStyle(.switch)
                 Spacer()
@@ -159,29 +144,7 @@ struct ChatView: View {
     private func submit() {
         let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        // If the currently-selected thread is a local one, build
-        // a session_context block from its prior runs so the new
-        // task knows what "do the same" / "next one" refers to.
-        // Telegram threads can't be continued from the local
-        // composer; those spawn fresh threads.
-        let continueThread: ChatThread? = {
-            guard let cur = selectedThread, cur.kind == .local
-            else { return nil }
-            return cur
-        }()
-        let sessionCtx = continueThread?.renderSessionContext()
-
-        let s = RunSession(source: .localPrompt(text),
-                           binary: env.binaryPath ?? "/usr/local/bin/openseer")
-        daemon.claimLocalPrompt(text)
-        s.startLocal(prompt: text, dryRun: dryRun,
-                     sessionContext: sessionCtx) {
-            [weak daemon, prompt = text] traceId in
-            daemon?.reserveLocalTrace(traceId, prompt: prompt)
-        }
-        let thread = daemon.addLocalRun(
-            s, continueThread: continueThread?.id)
-        selectedThreadID = thread.id
+        controller.submitTextPrompt(text)
         composerText = ""
     }
 

@@ -60,6 +60,24 @@ struct Sidebar: View {
                 permRow("Screen Recording",
                         ok: statusBlob?.permissions.screenRecording ?? false)
             }
+            HStack(spacing: 8) {
+                Button {
+                    _ = Permissions.requestAccessibility()
+                    _ = Permissions.requestScreenRecording()
+                    refreshStatus()
+                } label: {
+                    Label("Request", systemImage: "hand.raised.fill")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                Button {
+                    Permissions.openSystemSettings(pane: .accessibility)
+                } label: {
+                    Label("Open Settings", systemImage: "gearshape")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+            }
             Button {
                 refreshStatus()
             } label: {

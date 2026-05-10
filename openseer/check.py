@@ -99,12 +99,27 @@ def _anthropic_status() -> dict[str, Any]:
 
 
 def _selected_provider() -> str | None:
-    """Same resolution agent.run uses, surfaced for the GUI."""
-    try:
-        from .agent import _resolve_provider
-        return _resolve_provider()
-    except Exception:
-        return None
+    """Same provider resolution as agent.run, without importing agent.
+
+    `openseer check --json` must stay lightweight: the macOS app calls it
+    during startup before any CU task runs. Importing agent here pulls in
+    pyautogui/rubicon, which can fail inside the bundled Python even though
+    status probing itself does not need those modules.
+    """
+    import os
+    env = os.environ.get("OPENSEER_PROVIDER")
+    if env:
+        return env.strip().lower()
+    cfg_path = Path.home() / ".openseer" / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            v = (cfg.get("provider") or "").strip().lower()
+            if v:
+                return v
+        except Exception:
+            pass
+    return "openai"
 
 
 def _permissions() -> dict[str, bool]:

@@ -46,4 +46,4 @@ openseer = "openseer.cli:main"
 include = ["openseer*"]
 
 [tool.setuptools.package-data]
-openseer = ["skills/**/*.md"]
+openseer = ["skills/**/*.md", "voice_listen.swift"]

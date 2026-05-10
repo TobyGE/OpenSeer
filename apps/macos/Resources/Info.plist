@@ -39,5 +39,11 @@
     <string>OpenSeer reads on-screen UI elements (button text, labels) so the agent can decide what to click.</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>OpenSeer scripts apps via AppleEvents to switch focus and read window titles.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OpenSeer listens to your voice so spoken requests can be submitted as normal OpenSeer tasks.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>OpenSeer captures the screen so the agent can understand what you are looking at and operate visible UI.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>OpenSeer uses on-device speech recognition to convert spoken requests into task text.</string>
 </dict>
 </plist>

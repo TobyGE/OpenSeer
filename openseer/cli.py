@@ -17,8 +17,6 @@ import argparse
 import sys
 
 from . import auth as auth_mod
-from .agent import run
-from .repl import repl as run_repl
 from .setup_wizard import run_setup
 
 
@@ -51,6 +49,8 @@ def _add_task_args(ap: argparse.ArgumentParser) -> None:
 
 
 def cmd_task(args: argparse.Namespace) -> int:
+    from .agent import run
+
     # Provider-aware login check before running anything heavy. Older
     # code only checked Codex/ChatGPT OAuth, which rejected users on
     # Anthropic config — they got an "ChatGPT OAuth token" error even
@@ -136,6 +136,7 @@ def cmd_auth_logout(args: argparse.Namespace) -> int:
 # ────────────────────────────  argparse plumbing  ────────────────────────────
 
 def cmd_chat(args: argparse.Namespace) -> int:
+    from .repl import repl as run_repl
     return run_repl()
 
 
@@ -178,12 +179,17 @@ def cmd_daemon_launcher(args: argparse.Namespace) -> int:
     return launcher_main()
 
 
+def cmd_voice(args: argparse.Namespace) -> int:
+    from .voice import run_voice
+    return run_voice(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="openseer",
         description="OpenSeer — chat-first, memory-aware macOS computer-use agent",
     )
-    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,daemon,daemon-launcher,auth,setup}")
+    sub = ap.add_subparsers(dest="cmd", metavar="{chat,task,voice,daemon,daemon-launcher,auth,setup}")
 
     p_chat = sub.add_parser("chat", help="Interactive REPL (default if no args)")
     p_chat.set_defaults(func=cmd_chat)
@@ -218,6 +224,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_task = sub.add_parser("task", help="Run the agent on a one-off task")
     _add_task_args(p_task)
     p_task.set_defaults(func=cmd_task)
+
+    p_voice = sub.add_parser(
+        "voice",
+        help="Backend voice loop: listen, run a normal task, speak the final answer",
+    )
+    p_voice.add_argument("--once", action="store_true",
+                         help="Listen/run/speak once, then exit")
+    p_voice.add_argument("--listen-seconds", type=float, default=8.0,
+                         help="Seconds to record for each utterance")
+    p_voice.add_argument("--speak", action="store_true",
+                         help="Speak the final answer with macOS `say`")
+    p_voice.add_argument("--no-speak", action="store_true",
+                         help=argparse.SUPPRESS)
+    p_voice.add_argument("--locale", default=None,
+                         help="Speech recognition locale, e.g. zh-CN or en-US")
+    p_voice.add_argument("--debug-voice", action="store_true",
+                         help="Print partial transcripts from the speech helper")
+    p_voice.add_argument("--allow-server-recognition", action="store_true",
+                         help="Allow Apple's server-based Speech recognition "
+                              "when an on-device model is unavailable")
+    _add_task_args(p_voice)
+    # Voice supplies the task from speech, not argv.
+    for action in p_voice._actions:
+        if action.dest == "task":
+            action.nargs = "?"
+            action.default = ""
+            action.help = argparse.SUPPRESS
+            break
+    p_voice.set_defaults(func=cmd_voice)
 
     p_daemon = sub.add_parser(
         "daemon",
@@ -269,7 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "daemon", "daemon-launcher", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
 
 
 def main() -> None:

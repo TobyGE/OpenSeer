@@ -101,6 +101,7 @@ struct SettingsSheet: View {
 
 private struct GeneralPane: View {
     @EnvironmentObject var env: OpenSeerEnv
+    @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
     @State private var provider: String = ""
     @State private var saved: Bool = false
 
@@ -127,6 +128,17 @@ private struct GeneralPane: View {
                     }
                 }
                 .disabled(provider.isEmpty)
+            }
+            Section("Voice") {
+                Picker("Recognition language", selection: $voiceLocale) {
+                    Text("中文普通话").tag("zh-CN")
+                    Text("English").tag("en-US")
+                    Text("System default").tag("system")
+                }
+                .pickerStyle(.segmented)
+                Text("Chinese recognition may use Apple's server-based Speech service if the on-device language pack is not installed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("About") {
                 Text("OpenSeer is a chat-first, memory-aware computer-use agent for macOS. The Swift app is a thin shell on top of the existing `openseer` Python CLI.")

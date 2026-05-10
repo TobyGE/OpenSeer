@@ -1,0 +1,205 @@
+import AppKit
+import Combine
+import SwiftUI
+
+@MainActor
+final class FloatingVoiceOrbWindow {
+    static let shared = FloatingVoiceOrbWindow()
+
+    private var panel: VoiceOrbPanel?
+    private var hosting: NSHostingView<VoiceOrbWindowRoot>?
+    private var lockHandle: FileHandle?
+
+    private init() {}
+
+    func show(controller: MainController) {
+        guard acquireInstanceLockIfNeeded() else { return }
+        let root = VoiceOrbWindowRoot(
+            controller: controller,
+            onExpansionChange: { [weak self] expanded in
+                self?.resize(expanded: expanded)
+            }
+        )
+        if let panel, let hosting {
+            hosting.rootView = root
+            panel.orderFrontRegardless()
+            return
+        }
+
+        let hosting = NSHostingView(rootView: root)
+        hosting.frame = NSRect(origin: .zero, size: Self.collapsedSize)
+
+        let panel = VoiceOrbPanel(
+            contentRect: hosting.frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = hosting
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = false
+        panel.isMovableByWindowBackground = true
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .stationary,
+        ]
+
+        self.panel = panel
+        self.hosting = hosting
+        place(panel)
+        panel.orderFrontRegardless()
+    }
+
+    private static let collapsedSize = NSSize(width: 96, height: 96)
+    // Tall enough to hold the panel + step bubble + answer bubble +
+    // orb stack with fixed-height ScrollViews inside each. If your
+    // screen is small enough that this still pokes off-screen, you'll
+    // see the top bubble's content clipped — the orb stays put.
+    private static let expandedSize = NSSize(width: 360, height: 640)
+
+    private func acquireInstanceLockIfNeeded() -> Bool {
+        if lockHandle != nil { return true }
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".openseer", isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("voice-orb.lock")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: url) else {
+            return true
+        }
+        if flock(handle.fileDescriptor, LOCK_EX | LOCK_NB) == 0 {
+            lockHandle = handle
+            return true
+        }
+        try? handle.close()
+        return false
+    }
+
+    private func place(_ panel: NSPanel) {
+        guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        let size = panel.frame.size
+        let origin = NSPoint(
+            x: visible.maxX - size.width - 22,
+            y: visible.minY + 22
+        )
+        panel.setFrameOrigin(origin)
+    }
+
+    /// Two-state resize: collapsed (just the orb) or expanded (room
+    /// for panel + bubbles + orb). Anchor is the panel's bottom-right
+    /// corner, so the orb stays at the same screen position across
+    /// the switch.
+    private func resize(expanded: Bool) {
+        guard let panel else { return }
+        let newSize = expanded ? Self.expandedSize : Self.collapsedSize
+        let old = panel.frame
+        var frame = NSRect(
+            x: old.maxX - newSize.width,
+            y: old.minY,
+            width: newSize.width,
+            height: newSize.height
+        )
+        if let screen = panel.screen ?? NSScreen.screens.first ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            frame.origin.x = min(max(frame.origin.x, visible.minX + 8),
+                                 visible.maxX - newSize.width - 8)
+            // Clamp y so the orb (bottom-right) stays inside the
+            // visible area even when expandedSize is taller than the
+            // screen. The top will be clipped, not the orb.
+            frame.origin.y = max(frame.origin.y, visible.minY + 8)
+        }
+        panel.setFrame(frame, display: true, animate: true)
+    }
+}
+
+private final class VoiceOrbPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+private struct VoiceOrbWindowRoot: View {
+    @ObservedObject var controller: MainController
+    let onExpansionChange: (Bool) -> Void
+    @State private var expanded = false
+    @StateObject private var liveObserver = LiveTurnObserver()
+
+    var body: some View {
+        VStack {
+            Spacer(minLength: 0)
+            HStack {
+                Spacer(minLength: 0)
+                VoiceOrbView(
+                    isTaskRunning: controller.selectedRunningRun != nil,
+                    spokenAnswer: controller.voiceAnswer,
+                    liveStep: liveObserver.current,
+                    onSubmit: controller.submitVoicePrompt,
+                    onAnswerConsumed: { controller.voiceAnswer = nil },
+                    isWindowExpanded: $expanded
+                )
+            }
+        }
+        .padding(10)
+        .frame(width: expanded ? 360 : 96,
+               height: expanded ? 640 : 96)
+        .background(Color.black.opacity(0.001))
+        .onChange(of: expanded) { _, newValue in
+            onExpansionChange(newValue)
+        }
+        .onChange(of: controller.selectedRunningRun?.id) { _, _ in
+            liveObserver.bind(to: controller.selectedRunningRun)
+        }
+        .task {
+            liveObserver.bind(to: controller.selectedRunningRun)
+        }
+    }
+}
+
+/// Watches the currently-running RunSession's `turns.last` and republishes
+/// it as a flat `LiveStepInfo` value. Without this seam SwiftUI wouldn't
+/// see updates inside the nested ObservableObject — `controller.selected
+/// RunningRun?.turns` is two ObservableObjects deep, and only the outer
+/// one is bound. We rebind on every `selectedRunningRun` change so the
+/// orb tracks across thread switches.
+@MainActor
+final class LiveTurnObserver: ObservableObject {
+    @Published private(set) var current: LiveStepInfo? = nil
+    private weak var run: RunSession?
+    private var cancellable: AnyCancellable?
+
+    func bind(to run: RunSession?) {
+        guard run !== self.run else { return }
+        self.run = run
+        cancellable?.cancel()
+        guard let run else {
+            current = nil
+            return
+        }
+        cancellable = run.objectWillChange.sink { [weak self, weak run] _ in
+            DispatchQueue.main.async {
+                self?.current = Self.snapshot(from: run)
+            }
+        }
+        current = Self.snapshot(from: run)
+    }
+
+    private static func snapshot(from run: RunSession?) -> LiveStepInfo? {
+        guard let run else { return nil }
+        guard let last = run.turns.last(where: { !$0.isUserPrompt })
+        else { return nil }
+        let lastAction = last.actions.last
+        return LiveStepInfo(
+            step: last.step,
+            reflection: last.reflection,
+            thought: last.thought,
+            action: lastAction.map { "\($0.name) \($0.summary)" },
+            isFailed: run.status == .fail
+        )
+    }
+}

@@ -158,12 +158,16 @@ class WsStreamCallback(Callback):
     def on_event(self, ctx: dict[str, Any], event: TaskEvent) -> None:
         if event is None:
             return
+        # Field name MUST be `ts` (not `timestamp`) — clients
+        # consuming this stream decode it as the same `RunEvent`
+        # they use to parse events.jsonl, and that schema expects
+        # `ts`. Caught by codex review on 68b9bd6.
         msg = {
             "type": "event",
             "run_id": self.run_id,
             "event": {
                 "type": event.type,
-                "timestamp": event.timestamp,
+                "ts": event.timestamp,
                 "step": event.step,
                 "data": _jsonable(event.data),
             },
@@ -398,6 +402,8 @@ class _Connection:
                 "run_id": run_id,
                 "event": {
                     "type": "task_failed",
+                    "ts": time.time(),
+                    "step": None,
                     "data": {"error": str(e), "traceback": tb},
                 },
             })

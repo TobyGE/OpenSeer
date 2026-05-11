@@ -221,6 +221,7 @@ final class RunSession: ObservableObject, Identifiable {
     func startViaAgentd(prompt: String, dryRun: Bool,
                         binary: String,
                         sessionContext: String? = nil,
+                        backgroundMode: Bool = false,
                         onTraceFound: ((String) -> Void)? = nil) {
         guard case .localPrompt = source else { return }
         self.dryRun = dryRun
@@ -231,7 +232,8 @@ final class RunSession: ObservableObject, Identifiable {
                 let runId = try await AgentdClient.shared.startTask(
                     prompt: prompt,
                     dryRun: dryRun,
-                    sessionContext: sessionContext
+                    sessionContext: sessionContext,
+                    backgroundMode: backgroundMode
                 ) { [weak self] msg in
                     Task { @MainActor in
                         self?.ingestAgentdMessage(msg)

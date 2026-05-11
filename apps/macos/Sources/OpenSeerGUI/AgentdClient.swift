@@ -365,11 +365,13 @@ final class AgentdClient: NSObject {
     func startTask(prompt: String,
                    dryRun: Bool,
                    sessionContext: String?,
+                   backgroundMode: Bool = false,
                    onEvent: @escaping ([String: Any]) -> Void)
         async throws -> String {
         var payload: [String: Any] = [
             "task": prompt,
             "dry_run": dryRun,
+            "background_mode": backgroundMode,
         ]
         if let ctx = sessionContext, !ctx.isEmpty {
             payload["session_context"] = ctx

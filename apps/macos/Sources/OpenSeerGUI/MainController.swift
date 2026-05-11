@@ -292,14 +292,20 @@ final class MainController: ObservableObject {
         // pyautogui, NEVER call `activate` on the user's apps.
         if backgroundMode {
             let bg = "BACKGROUND MODE: the user wants this task done "
-                + "without stealing their mouse / keyboard. READ the "
-                + "`browser-background` skill before doing anything and "
-                + "use its AppleScript + injected-JS patterns. Do NOT "
-                + "use pyautogui clicks/keys/type. Do NOT call "
-                + "`activate` on any app. If you hit a captcha / "
-                + "vision-required UI, ask_user(kind=\"confirm\") with "
-                + "a screenshot and pause; the user will decide whether "
-                + "to escalate to foreground."
+                + "without stealing their mouse / keyboard / "
+                + "frontmost app. Clicks are AUTOMATICALLY routed to "
+                + "the target app via CGEventPostToPid by the "
+                + "executor — your normal `click` actions just work "
+                + "and don't disturb the user's cursor. Typing and "
+                + "keyboard focus are NOT routed yet though, so: do "
+                + "NOT call `activate`, and for browser-heavy flows "
+                + "consider `read_skill browser-background` to drive "
+                + "via AppleScript + injected JS instead of click-"
+                + "and-type. If you hit a captcha / vision-required "
+                + "UI you can't handle without focus, "
+                + "ask_user(kind=\"confirm\") with a screenshot and "
+                + "let the user decide whether to escalate to "
+                + "foreground."
             sessionCtx = ((sessionCtx ?? "") + (sessionCtx?.isEmpty == false
                 ? "\n\n" : "") + bg)
         }
@@ -320,6 +326,7 @@ final class MainController: ObservableObject {
             s.startViaAgentd(prompt: text, dryRun: dryRun,
                              binary: binary,
                              sessionContext: sessionCtx,
+                             backgroundMode: backgroundMode,
                              onTraceFound: onTraceFound)
         }
         let thread = daemon.addLocalRun(

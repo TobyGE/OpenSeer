@@ -523,8 +523,17 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
         return raw[:8500]
 
 
-def execute(action: Action, *, dry_run: bool = True) -> str:
-    """Execute one action. Returns a short result/error string for the next-turn prompt."""
+def execute(action: Action, *, dry_run: bool = True,
+            background_pid: int | None = None) -> str:
+    """Execute one action. Returns a short result/error string for the
+    next-turn prompt.
+
+    `background_pid`, when set, routes click events to that specific
+    process via `executor_bg.click_background` instead of through
+    pyautogui's global HID tap — the user's frontmost app and cursor
+    are NOT disturbed. Keyboard events (type, key) still use the
+    global path for now since keyboard focus routing is more involved.
+    """
     w, h = pyautogui.size()
     name = action.name
 
@@ -561,9 +570,27 @@ def execute(action: Action, *, dry_run: bool = True) -> str:
         if name == "click":
             count = max(1, int(action.count or 1))
             if not dry_run:
-                pyautogui.click(x, y, clicks=count, interval=0.06 if count > 1 else 0)
+                if background_pid is not None:
+                    # Background route: synthetic CGEvents posted to
+                    # the target pid only. User's cursor stays put.
+                    from . import executor_bg
+                    err = executor_bg.click_background(
+                        x, y, background_pid, count=count)
+                    if err:
+                        # Fall back to global click so the action at
+                        # least has a chance. The error is surfaced to
+                        # the model so it can decide to escalate.
+                        pyautogui.click(x, y, clicks=count,
+                                        interval=0.06 if count > 1 else 0)
+                        verb = "clicked" if count == 1 else f"{count}-clicked"
+                        return (f"{verb} ({x},{y}) [bg failed: {err}; fell back to foreground]"
+                                + (" [clamped]" if clamped else ""))
+                else:
+                    pyautogui.click(x, y, clicks=count,
+                                    interval=0.06 if count > 1 else 0)
             verb = "clicked" if count == 1 else f"{count}-clicked"
-            return f"{verb} ({x},{y})" + (" [clamped]" if clamped else "")
+            mode = "bg" if background_pid is not None else "fg"
+            return f"{verb} ({x},{y}) [{mode}]" + (" [clamped]" if clamped else "")
         if name == "scroll":
             amt = int(action.amount or 0)
             if not dry_run:

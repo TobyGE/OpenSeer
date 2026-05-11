@@ -340,6 +340,7 @@ class _Connection:
                     dry_run=bool(msg.get("dry_run", False)),
                     session_context=msg.get("session_context") or "",
                     max_steps=int(msg.get("max_steps") or 200),
+                    background_mode=bool(msg.get("background_mode", False)),
                 ))
             return
 
@@ -435,7 +436,8 @@ class _Connection:
                          task_text: str,
                          dry_run: bool,
                          session_context: str,
-                         max_steps: int) -> None:
+                         max_steps: int,
+                         background_mode: bool = False) -> None:
         """Run the real `agent.run()` in a worker thread and stream
         every TaskEvent it emits back over this WebSocket via
         WsStreamCallback. The default callback set (trajectory /
@@ -500,6 +502,7 @@ class _Connection:
                 session_context=session_context,
                 callbacks=cbs,
                 ask_user=ask_user_cb,
+                background_mode=background_mode,
                 quiet=True,
             )
 

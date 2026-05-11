@@ -762,6 +762,13 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         step_check_interval: int = 0,
         step_check=None,
         ask_user=None,
+        # When background_mode is True, clicks are routed to the target
+        # process via CGEventPostToPid instead of through pyautogui's
+        # global HID tap — the user's hardware cursor and frontmost app
+        # are NOT disturbed. Target pid is captured at run start from
+        # the frontmost app; the agent operates on that one specific
+        # process for the duration of the run.
+        background_mode: bool = False,
         quiet: bool = False) -> list[Step]:
     """Run the agent loop. Returns the list of steps."""
     # Each task gets a short trace_id; runs land under ~/.openseer/runs/<id>/
@@ -836,7 +843,20 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         "all_skills": all_skills,
         "skills_read_this_run": skills_read_this_run,
         "stream_full": _stream_full,
+        "background_mode": background_mode,
     }
+    # In background mode, seed the target pid from whatever app was
+    # frontmost when run() was entered (excluding our own process).
+    # The agent's `open_app` handler later overwrites this when it
+    # opens a fresh window, so this is just the bootstrap.
+    if background_mode:
+        try:
+            from .ax import active_app_pid as _aap
+            seed = _aap()
+            if seed and seed != _os.getpid():
+                ctx["target_pid"] = seed
+        except Exception:
+            pass
     def emit(t: str, **data) -> None:
         """Broadcast a typed event to every callback subscribed via on_event."""
         ev = TaskEvent(type=t, step=ctx.get("step_idx"), data=data)
@@ -1993,7 +2013,10 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
             emit(EventType.ACTION_STARTED, name=action.name,
                  chain_pos=chain_pos, chain_len=len(actions),
                  summary=_action_brief(action))
-            result = execute(action, dry_run=dry_run)
+            bg_pid = (ctx.get("target_pid") if ctx.get("background_mode")
+                      else None)
+            result = execute(action, dry_run=dry_run,
+                              background_pid=bg_pid)
             # If `open_app` succeeded, remember its pid as the AX target
             # for subsequent turns. Active_app_pid() falls back to this
             # when NSWorkspace reports OpenSeer's host terminal frontmost.

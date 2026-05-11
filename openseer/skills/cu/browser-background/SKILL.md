@@ -42,19 +42,35 @@ EOF
 
 Note **no `activate`** anywhere — that's the magic. The window opens in the background. Save the returned id (`id of newWin`) — all subsequent JS calls target this id explicitly so you never accidentally drive whatever window the user is actively using.
 
-If you need Safari instead (e.g. Chrome isn't installed):
+**Chrome is strongly preferred for background mode.** Its AppleScript dictionary exposes stable, persistent window `id` integers that survive navigation, tab moves, and window reorderings. Use Chrome whenever it's available (`bash` test: `command -v "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`).
+
+If only Safari is installed, you can fake stability by tagging the window via a sentinel URL **before** navigating to the real target. Safari's `name of document` is the page title and so is NOT stable after navigation, but a `data:` URL gives you a controlled, unique title for the bookkeeping step:
 
 ```bash
+# 1. Open a window pointed at a sentinel data: URL whose title is a UUID.
+osascript <<'EOF'
+set sentinel to "openseer-bg-" & (do shell script "uuidgen")
+tell application "Safari"
+  set newDoc to make new document with properties ¬
+    {URL:"data:text/html,<title>" & sentinel & "</title>"}
+end tell
+return sentinel
+EOF
+# Save the printed sentinel string — that's your window handle for
+# subsequent calls.
+
+# 2. Later: find the document by its (still-current) title.
 osascript <<'EOF'
 tell application "Safari"
-  set newDoc to make new document
-  set URL of newDoc to "<URL>"
-  return name of newDoc       -- Safari uses document name as the handle
+  set theDoc to (first document whose name is "openseer-bg-<uuid>")
+  set URL of theDoc to "<real URL>"
 end tell
 EOF
 ```
 
-Safari's window-id semantics differ slightly — refer by document name instead of id.
+The sentinel title sticks until you navigate to a real page. Once you do, you've already captured everything you need, so the window's identity no longer matters for THIS task — you operate on the document by its URL or by `front document` (the user isn't using Safari for anything else by assumption when we entered background mode in Safari).
+
+If even that's too fragile for your use case, **fall back to foreground mode** and tell the user "Safari background mode is unreliable; please install Chrome or run this in foreground."
 
 If the user already has Chrome open and is using it actively, opening a new window in the same app **may still flash a brief notification**. To be completely invisible, prefer using a browser the user isn't actively using right now (check via `osascript -e 'tell application "System Events" to name of first process whose frontmost is true'` and pick a different browser).
 

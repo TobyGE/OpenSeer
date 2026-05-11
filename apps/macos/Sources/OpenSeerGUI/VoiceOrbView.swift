@@ -265,6 +265,21 @@ struct VoiceOrbView: View {
                           : "Pause the agent so you can use the mouse/keyboard yourself.")
                 }
 
+                // Undo: one-tap "撤销刚才那一步". Submits a fixed
+                // prompt; the agent looks at the most recent
+                // producing step in session context and emits the
+                // inverse (cmd+z for type, cmd+[ for click-that-
+                // navigated, ask_user when ambiguous — see the
+                // "Undoing the previous step" block in the system
+                // prompt).
+                Button {
+                    onSubmit("撤销刚才那一步")
+                } label: {
+                    Label("Undo", systemImage: "arrow.uturn.backward")
+                }
+                .controlSize(.small)
+                .help("Ask the agent to revert the last action it took.")
+
                 Button {
                     commitNow()
                 } label: {

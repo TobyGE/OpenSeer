@@ -141,7 +141,15 @@ private struct VoiceOrbWindowRoot: View {
                     // an active task. Held vs running is then
                     // signaled separately via isTaskHeld for the
                     // Hold/Resume button label.
-                    isTaskRunning: controller.selectedRunningRun != nil
+                    //
+                    // Source-of-truth here is liveObserver, not
+                    // controller.selectedRunningRun, because the
+                    // observer subscribes directly to the run's
+                    // objectWillChange. MainController's @Published
+                    // fields don't fire on run.status transitions,
+                    // so reading status off the controller misses
+                    // the running↔held flip.
+                    isTaskRunning: liveObserver.runStatus == .running
                         || liveObserver.runStatus == .held,
                     isTaskHeld: liveObserver.runStatus == .held,
                     spokenAnswer: controller.voiceAnswer,
@@ -160,11 +168,17 @@ private struct VoiceOrbWindowRoot: View {
         .onChange(of: expanded) { _, newValue in
             onExpansionChange(newValue)
         }
-        .onChange(of: controller.selectedRunningRun?.id) { _, _ in
-            liveObserver.bind(to: controller.selectedRunningRun)
+        // Follow the *active* run (running OR held), not just
+        // .running. When the user presses Hand off and status
+        // flips to .held, selectedRunningRun goes nil — if we
+        // unbind there, runStatus clears and the Resume button
+        // disappears, leaving the run permanently paused with no
+        // GUI path back. (codex P1 on d684db8.)
+        .onChange(of: controller.selectedActiveRun?.id) { _, _ in
+            liveObserver.bind(to: controller.selectedActiveRun)
         }
         .task {
-            liveObserver.bind(to: controller.selectedRunningRun)
+            liveObserver.bind(to: controller.selectedActiveRun)
         }
     }
 }

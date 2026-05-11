@@ -16,6 +16,14 @@ final class RunSession: ObservableObject, Identifiable {
     }
     let source: Source
 
+    /// Whether this run was launched in dry-run mode (the agent
+    /// planned every action but the executor skipped the actual
+    /// pyautogui call). Used by ChatThread.lastProducingAction to
+    /// avoid telling follow-up runs "you typed X" when no typing
+    /// actually happened. Defaults to false; replayed traces don't
+    /// carry the flag, but historically those were executed runs.
+    var dryRun: Bool = false
+
     @Published var turns: [Turn] = []
     @Published var status: Status = .running
     @Published var traceId: String? = nil
@@ -75,6 +83,7 @@ final class RunSession: ObservableObject, Identifiable {
                     sessionContext: String? = nil,
                     onTraceFound: ((String) -> Void)? = nil) {
         guard case .localPrompt = source else { return }
+        self.dryRun = dryRun
         let runsDir = NSHomeDirectory() + "/.openseer/runs"
 
         var args = ["task", prompt]
@@ -214,6 +223,7 @@ final class RunSession: ObservableObject, Identifiable {
                         sessionContext: String? = nil,
                         onTraceFound: ((String) -> Void)? = nil) {
         guard case .localPrompt = source else { return }
+        self.dryRun = dryRun
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {

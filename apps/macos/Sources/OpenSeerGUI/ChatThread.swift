@@ -121,8 +121,13 @@ final class ChatThread: ObservableObject, Identifiable {
     /// something the user (or the OS) can observe — i.e. what an
     /// undo would have to reverse. Observation-only actions
     /// (screenshot, get_app_state, reground, read_skill, wait,
-    /// terminate) are skipped.
+    /// terminate) are skipped. Returns nil for dry-run sessions,
+    /// since the action was only planned — there's nothing to
+    /// undo and reporting it would mislead a follow-up like
+    /// "撤销刚才那一步" into reversing something that never happened
+    /// (codex P2 on 4d0b3c7).
     private func lastProducingAction(of run: RunSession) -> String? {
+        if run.dryRun { return nil }
         let observers: Set<String> = [
             "screenshot", "get_app_state", "reground", "read_skill",
             "wait", "terminate", "ask_user",

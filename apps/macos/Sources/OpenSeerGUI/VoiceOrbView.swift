@@ -188,7 +188,11 @@ struct VoiceOrbView: View {
                     stopLoop()
                     withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
                         isOpen = false
-                        isWindowExpanded = displayedAnswer != nil
+                        // All non-orb chrome is gated on isOpen now,
+                        // so the window must collapse with it —
+                        // leaving expanded:true would keep a 360x640
+                        // invisible NSPanel intercepting clicks.
+                        isWindowExpanded = false
                     }
                 } label: {
                     Image(systemName: "xmark")
@@ -439,14 +443,34 @@ struct VoiceOrbView: View {
         // input.transcript), the post-roll lands into draftText via
         // .onChange(of: input.transcript). If they HAVE edited, we
         // keep their version.
+        // Remember whether the user had already diverged from
+        // SFSpeech's transcript at submit time. Need this AFTER
+        // the await — by then draftText may have been updated by
+        // onChange (if no divergence) or might still hold the
+        // user's edit (if there was divergence).
+        let userEdited = draftText != lastSeenTranscript
         let userDraft = draftText
         commitTask = Task { @MainActor in
-            _ = await input.stopAndAwaitFinal(
+            let finalFromSpeech = await input.stopAndAwaitFinal(
                 timeout: finalTranscriptTimeoutS)
-            // Read draftText again after the await — onChange may
-            // have advanced it with the post-roll. Fall back to the
-            // snapshot if SwiftUI hasn't propagated yet.
-            let candidate = draftText.isEmpty ? userDraft : draftText
+            // Picking the right text after the await:
+            //   - if the user manually edited, their draft wins
+            //     (SwiftUI's onChange will NOT overwrite a
+            //     user-edited draftText, by design)
+            //   - otherwise prefer SFSpeech's post-roll final
+            //     directly (codex P2 fix: don't rely on the
+            //     onChange having propagated before this
+            //     continuation resumes — it isn't guaranteed in
+            //     the same MainActor turn, so the final
+            //     syllable would otherwise drop)
+            let candidate: String
+            if userEdited {
+                candidate = userDraft
+            } else if !finalFromSpeech.isEmpty {
+                candidate = finalFromSpeech
+            } else {
+                candidate = draftText.isEmpty ? userDraft : draftText
+            }
             let text = candidate
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let repeatedTooSoon = text == lastSubmitted

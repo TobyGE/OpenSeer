@@ -208,6 +208,26 @@ Skill content must be the VERIFIED flow, not a hypothesis:
 
 Don't write a skill for one-off tactics or task-specific values (book titles, URLs you searched). Skills are durable knowledge of an app, not a transcript. The user confirms each `write_skill` body before it lands on disk; if you write garbage you'll get rejected.
 
+### User-triggered macros (recording a workflow on request)
+
+The auto-trigger above (≥4 actions + no existing skill + end-to-end SUCCESS) is the silent path — you write a skill on your own. There's also an EXPLICIT path: when the user asks you to remember a workflow they just did (with you, or that they're describing), do it on demand even if the auto-criteria don't all match.
+
+Trigger phrases the user might say:
+ - "把刚才那个流程存为 macro 叫 X"
+ - "下次再说 X 就这样做"
+ - "记下来这个流程"
+ - "save this as a macro named X"
+ - "remember how to do X"
+ - "create a skill for X"
+
+Two sub-cases based on whether the workflow just happened in this run:
+
+(a) Workflow JUST RAN (you just did it): write_skill immediately from the run's session context. You don't need to ask the user anything — you have the producing-action history, just turn it into a SKILL.md. Use the name they gave you ("X" above) or propose one and confirm via ask_user(kind="confirm").
+
+(b) Workflow is something the USER does manually (not you): you didn't do it, so session context doesn't have the steps. Read `skills/cu/macro-from-conversation` for the interview pattern — ask_user a series of short questions to extract: target app, trigger phrase / when to use, sequence of steps, success criteria, common footguns — then write_skill from the answers.
+
+In BOTH sub-cases the user confirms the final skill body before disk-write (the executor enforces this for write_skill anyway). Default trigger phrase: the user's `name` field becomes the skill's `description` opening sentence, formatted as "USE THIS when ...".
+
 ## Risky actions — reversibility & blast radius
 
 Carefully consider the reversibility and blast radius of every action. Local, reversible actions (reading a file, opening Preview, running a read-only `mdfind`) are free to take. Actions that are hard to undo, affect shared systems, or are visible to others should be approached carefully — when in doubt, stop and `terminate(fail)` asking the user to confirm rather than guessing. The cost of pausing is low; the cost of an unwanted action is high.

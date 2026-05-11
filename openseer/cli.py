@@ -229,6 +229,11 @@ def cmd_agentd(args: argparse.Namespace) -> int:
     return run_agentd()
 
 
+def cmd_mcp_serve(args: argparse.Namespace) -> int:
+    from .mcp_server import run_mcp_server
+    return run_mcp_server()
+
+
 def cmd_daemon_launcher(args: argparse.Namespace) -> int:
     from .daemon_launcher import main as launcher_main
     return launcher_main()
@@ -317,9 +322,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_agentd = sub.add_parser(
         "agentd",
-        help="WebSocket daemon (Phase 1 skeleton). One process, many clients.",
+        help="WebSocket daemon. One process, many clients.",
     )
     p_agentd.set_defaults(func=cmd_agentd)
+
+    # MCP server — expose OpenSeer's primitives (screenshot / click /
+    # type / key / scroll / open_app / get_app_state) as MCP tools
+    # over stdio, so Codex CLI / Claude Code / Cursor can drive
+    # macOS automation without running OpenSeer's own agent loop.
+    # Configured per-host (e.g. Codex's `mcp.toml` or Claude Code's
+    # settings.json) as `openseer mcp serve`.
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="MCP server entry — expose OpenSeer tools to Codex / Claude Code / Cursor.",
+    )
+    sub_mcp = p_mcp.add_subparsers(dest="mcp_cmd", metavar="{serve}")
+    sub_mcp.required = True
+    p_mcp_serve = sub_mcp.add_parser(
+        "serve",
+        help="Run an MCP server on stdio. Don't invoke directly; let your MCP host spawn it.",
+    )
+    p_mcp_serve.set_defaults(func=cmd_mcp_serve)
 
     p_daemon_launcher = sub.add_parser(
         "daemon-launcher",
@@ -365,7 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
 
 
 def main() -> None:

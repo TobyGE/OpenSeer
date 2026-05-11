@@ -43,11 +43,11 @@ If MEMORY.md doesn't have one, ALWAYS `ask_user(kind="text", question="Which Not
    wait amount=2
    ```
 
-3. Refresh AX:
+3. Refresh AX. **Don't hard-code the browser app** — `open` used the user's default, which could be Safari / Chrome / Arc / Brave / Edge / something else. Refresh against whichever's frontmost now:
    ```
-   get_app_state app="Google Chrome"
+   get_app_state
    ```
-   The Notion editor surfaces as a giant AXTextArea (single role for the whole canvas). Most navigation in the page itself uses keyboard, not click — clicking specific blocks is brittle.
+   The Notion editor surfaces as a giant AXTextArea (single role for the whole canvas) regardless of which browser. Most navigation in the page itself uses keyboard, not click — clicking specific blocks is brittle.
 
 4. Move focus to the END of the page so you don't overwrite existing content:
    ```

@@ -2,8 +2,11 @@
 name: notion-web
 description: Add quick notes / todos / pasted content to Notion via the logged-in browser web app. Use this whenever the user says "加到 Notion" / "save to Notion" / "记到 Notion 里".
 family: cu
+# `apps` is AND-gated by the skill loader — listing all five
+# browsers would require all five installed. Safari ships on every
+# Mac, so we gate on it and let the body mention the alternatives.
 requires:
-  apps: ['Google Chrome', 'Safari', 'Arc', 'Brave Browser', 'Microsoft Edge']
+  apps: ['Safari']
 ---
 
 # Notion (web) handoff

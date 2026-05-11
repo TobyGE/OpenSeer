@@ -2,8 +2,12 @@
 name: browser-background
 description: Drive a browser via AppleScript + injected JavaScript instead of pyautogui — no mouse / keyboard / focus stealing. Use this when the user asks for "在后台 / background / 别打扰我 / 我要继续用电脑" or when the task is browser-only and would otherwise lock them out for minutes. Works on Chrome, Safari, Arc, Edge.
 family: cu
+# `requires.apps` is AND-gated by the skill loader. Safari ships on
+# every Mac, so we gate on it and let the body cover Chrome / Arc /
+# Edge alternatives (any installed browser works at runtime via
+# `tell application "<name>"`).
 requires:
-  apps: ['Google Chrome']
+  apps: ['Safari']
 ---
 
 # Browser in the background
@@ -22,19 +26,37 @@ Lets you do most browser tasks (open URL, click, fill form, read content, naviga
 
 ## Open a dedicated window the agent owns
 
-```bash
-open -na "Google Chrome" --args --new-window "<URL>"
-```
-
-`-n` forces a new instance (or in single-instance mode, a new window). `--args --new-window` is the Chrome-specific flag. The new window becomes window 1; older user windows shift to window 2+. The user's tabs are untouched.
-
-To find your window id reliably (in case the user opened another window between your `open` and your next call):
+**DO NOT use `open -na "Google Chrome" --args --new-window`** in background mode — `open` brings the app forward and the new window steals focus, which is exactly what we promised the user we wouldn't do. Use AppleScript directly, which can create the window without activating:
 
 ```bash
-osascript -e 'tell application "Google Chrome" to id of window 1'
+# Open Chrome (or Safari / Arc / Edge) and capture the new window id
+# in one shot, without bringing the app forward.
+osascript <<'EOF'
+tell application "Google Chrome"
+  set newWin to make new window
+  set URL of active tab of newWin to "<URL>"
+  return id of newWin
+end tell
+EOF
 ```
 
-Save it. All subsequent JS calls target that id explicitly so you never accidentally drive the user's window.
+Note **no `activate`** anywhere — that's the magic. The window opens in the background. Save the returned id (`id of newWin`) — all subsequent JS calls target this id explicitly so you never accidentally drive whatever window the user is actively using.
+
+If you need Safari instead (e.g. Chrome isn't installed):
+
+```bash
+osascript <<'EOF'
+tell application "Safari"
+  set newDoc to make new document
+  set URL of newDoc to "<URL>"
+  return name of newDoc       -- Safari uses document name as the handle
+end tell
+EOF
+```
+
+Safari's window-id semantics differ slightly — refer by document name instead of id.
+
+If the user already has Chrome open and is using it actively, opening a new window in the same app **may still flash a brief notification**. To be completely invisible, prefer using a browser the user isn't actively using right now (check via `osascript -e 'tell application "System Events" to name of first process whose frontmost is true'` and pick a different browser).
 
 ## Run JS in a specific window
 

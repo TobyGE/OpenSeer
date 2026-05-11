@@ -44,33 +44,33 @@ Note **no `activate`** anywhere — that's the magic. The window opens in the ba
 
 **Chrome is strongly preferred for background mode.** Its AppleScript dictionary exposes stable, persistent window `id` integers that survive navigation, tab moves, and window reorderings. Use Chrome whenever it's available (`bash` test: `command -v "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`).
 
-If only Safari is installed, you can fake stability by tagging the window via a sentinel URL **before** navigating to the real target. Safari's `name of document` is the page title and so is NOT stable after navigation, but a `data:` URL gives you a controlled, unique title for the bookkeeping step:
+If only Safari is installed, background mode is **limited to single-shot tasks** that finish in one AppleScript invocation — Safari's AppleScript dictionary doesn't expose a window or document id that survives navigation, so multi-step automation has no safe way to re-find "the window I opened earlier" without potentially targeting the user's currently-active Safari window.
 
+What works one-shot in Safari background mode:
 ```bash
-# 1. Open a window pointed at a sentinel data: URL whose title is a UUID.
-osascript <<'EOF'
-set sentinel to "openseer-bg-" & (do shell script "uuidgen")
-tell application "Safari"
-  set newDoc to make new document with properties ¬
-    {URL:"data:text/html,<title>" & sentinel & "</title>"}
-end tell
-return sentinel
-EOF
-# Save the printed sentinel string — that's your window handle for
-# subsequent calls.
-
-# 2. Later: find the document by its (still-current) title.
+# Single AppleScript: open + navigate + do work + close, all in one
+# step where the document handle is local to the script.
 osascript <<'EOF'
 tell application "Safari"
-  set theDoc to (first document whose name is "openseer-bg-<uuid>")
-  set URL of theDoc to "<real URL>"
+  set newDoc to make new document
+  set URL of newDoc to "<URL>"
+  -- ... wait briefly, run JS, capture result, close ...
+  delay 2
+  set result to (do JavaScript "document.body.innerText.slice(0, 500)" in newDoc)
+  close newDoc
+  return result
 end tell
 EOF
 ```
 
-The sentinel title sticks until you navigate to a real page. Once you do, you've already captured everything you need, so the window's identity no longer matters for THIS task — you operate on the document by its URL or by `front document` (the user isn't using Safari for anything else by assumption when we entered background mode in Safari).
+What DOES NOT work reliably:
+- Multi-step Safari tasks where one `osascript` opens the window and a later `osascript` tries to re-find it. The user could open or close a Safari window in between and you'd target theirs.
 
-If even that's too fragile for your use case, **fall back to foreground mode** and tell the user "Safari background mode is unreliable; please install Chrome or run this in foreground."
+For anything more complex than open-do-close: **fall back to foreground mode**. Tell the user:
+
+> "I need multiple steps in this Safari window and Safari's AppleScript doesn't give me a stable handle. Either install Google Chrome (background mode works great there) or let me run this in foreground — I'll borrow your mouse for a few seconds."
+
+Then `ask_user(kind="choose", options=["Install Chrome later, run in foreground now", "Run in foreground now", "Cancel"])`.
 
 If the user already has Chrome open and is using it actively, opening a new window in the same app **may still flash a brief notification**. To be completely invisible, prefer using a browser the user isn't actively using right now (check via `osascript -e 'tell application "System Events" to name of first process whose frontmost is true'` and pick a different browser).
 

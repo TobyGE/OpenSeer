@@ -8,6 +8,12 @@ final class MainController: ObservableObject {
     @Published var dryRun: Bool = false
     @Published var voiceAnswer: String? = nil
 
+    /// One-shot session-context snippet captured at hotkey-press
+    /// time (frontmost app name, etc.). Consumed by the next
+    /// submitPrompt and cleared. Lets the user say a follow-up
+    /// like "翻译这段" without retyping which app they meant.
+    @Published var pendingHotkeyContext: String? = nil
+
     let daemon: DaemonController
     private let binary: String
 
@@ -22,6 +28,33 @@ final class MainController: ObservableObject {
         AgentdClient.shared.askUserHandler = { [weak self] req in
             await self?.respondToAskUser(req) ?? nil
         }
+        // Global cmd+option+O — open the voice orb + listen, with
+        // the currently frontmost app captured as session context.
+        GlobalHotkey.shared.install { [weak self] in
+            guard let self else { return }
+            if let ctx = FrontmostCapture.capture() {
+                self.recordHotkeyContext(ctx)
+            }
+            // Bring OpenSeer (and the orb's NSPanel) forward and
+            // post the open notification — VoiceOrbView listens.
+            NSApp.activate(ignoringOtherApps: true)
+            NotificationCenter.default.post(
+                name: .openVoiceOrb, object: nil)
+        }
+    }
+
+    func recordHotkeyContext(_ ctx: FrontmostContext) {
+        // Plain English so the agent's system prompt can pick it
+        // up naturally without a dedicated parser. The "your next
+        // instruction" framing nudges the model to apply the
+        // captured context to whatever the user says next instead
+        // of treating it as a separate task.
+        let bundleSuffix = ctx.bundleId.map { " (\($0))" } ?? ""
+        pendingHotkeyContext = "USER OPENED THE OPENSEER HOTKEY "
+            + "WHILE LOOKING AT: \(ctx.appName)\(bundleSuffix). "
+            + "Their next instruction is about whatever they were "
+            + "doing in that app — if you need to operate on it, "
+            + "switch focus there first (open_app or click)."
     }
 
     /// Show a modal alert for an ask_user request and return the
@@ -225,7 +258,16 @@ final class MainController: ObservableObject {
                 run.cancel()
             }
         }
-        let sessionCtx = continueThread?.renderSessionContext()
+        // Merge hotkey-time frontmost-app context into the thread's
+        // session context. One-shot — clear it after consuming so
+        // subsequent follow-ups don't keep pretending we're still
+        // looking at the same app.
+        var sessionCtx = continueThread?.renderSessionContext()
+        if let hk = pendingHotkeyContext, !hk.isEmpty {
+            sessionCtx = ((sessionCtx ?? "") + (sessionCtx?.isEmpty == false
+                ? "\n\n" : "") + hk)
+            pendingHotkeyContext = nil
+        }
 
         let s = RunSession(source: .localPrompt(text), binary: binary)
         s.onFinalAnswer = onFinalAnswer

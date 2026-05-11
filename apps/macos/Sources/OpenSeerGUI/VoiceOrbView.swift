@@ -166,6 +166,20 @@ struct VoiceOrbView: View {
             }
             isWindowExpanded = isOpen
         }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .openVoiceOrb)) { _ in
+            // Global cmd+option+O fired (or any other code path
+            // wants the orb visible + listening). Open the panel
+            // and start the listen loop if it isn't already on.
+            if !isOpen {
+                withAnimation(.spring(response: 0.26,
+                                       dampingFraction: 0.86)) {
+                    isOpen = true
+                    isWindowExpanded = true
+                }
+            }
+            if !autoListen { startLoop() }
+        }
         .onChange(of: spokenAnswer) { _, answer in
             guard let answer, !answer.isEmpty else { return }
             // Auto-open the panel so the new answer is immediately

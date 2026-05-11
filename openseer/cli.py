@@ -49,13 +49,7 @@ def _add_task_args(ap: argparse.ArgumentParser) -> None:
 
 
 def cmd_task(args: argparse.Namespace) -> int:
-    from .agent import run
-
-    # Provider-aware login check before running anything heavy. Older
-    # code only checked Codex/ChatGPT OAuth, which rejected users on
-    # Anthropic config — they got an "ChatGPT OAuth token" error even
-    # though their `provider` was set to anthropic. preflight() checks
-    # the right backend.
+    # Provider-aware login check before running anything heavy.
     ok, msg = auth_mod.preflight()
     if not ok:
         print(msg)
@@ -71,6 +65,39 @@ def cmd_task(args: argparse.Namespace) -> int:
             print(f"[task] couldn't read session context file: {e}")
             # Don't abort — running without context is still useful.
 
+    # Attach to a running agentd if one's reachable. That way `openseer
+    # task` shares the GUI's daemon (warm Python, in-memory caches,
+    # same skills loaded once) instead of spinning up a fresh agent
+    # process per CLI invocation. Falls back to direct execution if
+    # no daemon is running.
+    from .agentd_client import try_open, render_event_to_stdout
+    client = try_open()
+    if client is not None:
+        with client:
+            print("[cli] attached to running agentd")
+            exit_code = 0
+            for ev in client.run_task(
+                args.task,
+                dry_run=not args.execute,
+                session_context=session_context,
+            ):
+                if ev.get("type") == "_ack":
+                    print(f"[cli] run_id: {ev.get('run_id')}")
+                    continue
+                render_event_to_stdout(ev)
+                et = ev.get("type")
+                if et == "task_finished":
+                    status = (ev.get("data") or {}).get("status", "done")
+                    exit_code = 0 if status == "done" else 1
+                elif et == "task_failed":
+                    exit_code = 2
+            return exit_code
+
+    # Fallback: direct in-process agent.run(). Same path as before
+    # the agentd refactor; some flags (confirm_each, sleep,
+    # grounder, external_grounder) only work in this path right
+    # now — agentd doesn't yet thread them through.
+    from .agent import run
     run(args.task, max_steps=args.max_steps, dry_run=not args.execute,
         confirm_each=args.confirm_each, sleep_between=args.sleep,
         grounder=args.grounder, external_grounder=args.external_grounder,

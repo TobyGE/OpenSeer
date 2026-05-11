@@ -1,6 +1,6 @@
 ---
 name: applescript-reminders
-description: Create and manage Apple Reminders via osascript. Don't click the Reminders UI.
+description: Create / complete / list Apple Reminders via osascript. USE THIS for any todo-style request ("提醒我下午 3 点 X", "remind me to Y tomorrow", "加个 todo", "what reminders do I have today?"). Don't click the Reminders UI.
 family: bash
 requires:
   apps: ['Reminders']

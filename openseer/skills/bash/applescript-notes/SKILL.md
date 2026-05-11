@@ -1,6 +1,6 @@
 ---
 name: applescript-notes
-description: Create / append / read Apple Notes via osascript. Bypasses CU entirely; far faster and more reliable than driving the Notes window.
+description: Create / append / read Apple Notes via osascript. USE THIS for any "记一下 / save to Notes / 添加到 Notes / what did I note about X?" request. Bypasses CU entirely; far faster + more reliable than driving the Notes window. For richer structured content prefer Notion (notion-web skill); for fleeting plain text or daily-journal style content, Notes wins.
 family: bash
 requires:
   apps: ['Notes']

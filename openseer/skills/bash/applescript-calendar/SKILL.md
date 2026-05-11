@@ -1,6 +1,6 @@
 ---
 name: applescript-calendar
-description: Create and query Apple Calendar events via osascript. Bypasses the Calendar UI.
+description: Create / move / query Apple Calendar events via osascript. Bypasses the Calendar UI. USE THIS for any "加到日历 / schedule X / what's on my calendar?" request — far faster + more reliable than driving the Calendar.app window.
 family: bash
 requires:
   apps: ['Calendar']

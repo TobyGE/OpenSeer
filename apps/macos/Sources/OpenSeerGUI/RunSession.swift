@@ -363,9 +363,15 @@ final class RunSession: ObservableObject, Identifiable {
     }
 
     private func ingestEvent(_ ev: RunEvent) {
-        // Capture trace_id from task_started (first event of the run).
-        if ev.type == "task_started", let tid = ev.data["trace_id"]?.string {
-            traceId = tid
+        // Capture trace_id + dry_run from task_started (first event
+        // of the run). For attached / replayed traces this is how
+        // we recover the dry-run flag — startLocal/startViaAgentd
+        // set it directly, but DaemonController.loadRecentRuns and
+        // scanForNewRuns construct RunSessions that only attach via
+        // events.jsonl, so the event payload is the authority.
+        if ev.type == "task_started" {
+            if let tid = ev.data["trace_id"]?.string { traceId = tid }
+            if let dr = ev.data["dry_run"]?.bool   { dryRun  = dr  }
         }
         TurnFolder.apply(ev, to: &turns)
         if ev.type == "task_finished" {

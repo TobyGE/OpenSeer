@@ -37,7 +37,9 @@ class _Pending:
 
 
 class AgentdClient:
-    """Sync agentd client. Use via `with try_open(...) as client:`."""
+    """Sync agentd client. Construct with `try_open()` (which connects +
+    auths) and call `close()` when done. Don't use `with` —
+    `try_open` already entered the connection."""
 
     def __init__(self, host: str, port: int, token: str):
         self.url = f"ws://{host}:{port}"
@@ -45,20 +47,22 @@ class AgentdClient:
         self.ws: Any = None
         self._rid = 0
 
-    def __enter__(self) -> "AgentdClient":
+    def connect_and_auth(self) -> None:
+        """Called once by try_open(). Raises on failure; caller
+        catches and falls back to the direct path."""
         self.ws = connect(self.url, open_timeout=3.0)
         rid = self._send({"type": "auth", "token": self.token})
         ack = self._recv()
         if ack.get("type") != "ack" or ack.get("request_id") != rid:
             raise ConnectionError(f"agentd auth failed: {ack}")
-        return self
 
-    def __exit__(self, *_: Any) -> None:
+    def close(self) -> None:
         if self.ws is not None:
             try:
                 self.ws.close()
             except Exception:
                 pass
+            self.ws = None
 
     # ─── low-level ──────────────────────────────────────────────────
 
@@ -79,6 +83,7 @@ class AgentdClient:
     # ─── high-level ─────────────────────────────────────────────────
 
     def run_task(self, task: str, *, dry_run: bool,
+                 max_steps: int = 200,
                  session_context: str = "",
                  ask_user_via_stdin: bool = True
                  ) -> Iterator[dict[str, Any]]:
@@ -97,6 +102,7 @@ class AgentdClient:
             "type": "start_task",
             "task": task,
             "dry_run": dry_run,
+            "max_steps": max_steps,
         }
         if session_context:
             msg["session_context"] = session_context
@@ -193,12 +199,16 @@ def load_rendezvous() -> dict[str, Any]:
 
 
 def try_open(timeout: float = 2.0) -> Optional[AgentdClient]:
-    """Best-effort: open + auth an AgentdClient. Returns None on any
-    failure — caller falls back to direct agent.run()."""
+    """Best-effort: connect + auth an AgentdClient. Returns a ready-
+    to-use client on success, None on any failure (no rendezvous,
+    daemon dead, auth fail). Caller MUST call `close()` when done —
+    don't `with` it, the connection is already established here.
+    Falls back to direct agent.run() if None."""
     try:
         cfg = load_rendezvous()
         client = AgentdClient(cfg["host"], cfg["port"], cfg["token"])
-        return client.__enter__()
+        client.connect_and_auth()
+        return client
     except (FileNotFoundError, KeyError, OSError, TimeoutError,
             ConnectionError, ConnectionRefusedError,
             websockets.exceptions.WebSocketException,

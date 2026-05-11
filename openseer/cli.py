@@ -65,20 +65,41 @@ def cmd_task(args: argparse.Namespace) -> int:
             print(f"[task] couldn't read session context file: {e}")
             # Don't abort — running without context is still useful.
 
-    # Attach to a running agentd if one's reachable. That way `openseer
-    # task` shares the GUI's daemon (warm Python, in-memory caches,
-    # same skills loaded once) instead of spinning up a fresh agent
-    # process per CLI invocation. Falls back to direct execution if
-    # no daemon is running.
-    from .agentd_client import try_open, render_event_to_stdout
-    client = try_open()
+    # Attach to a running agentd if one's reachable. The GUI auto-
+    # spawns the daemon, so manual `openseer task` invocations get to
+    # share its warm Python / loaded skills / live state.
+    #
+    # But: agentd's start_task message only carries
+    # task / dry_run / max_steps / session_context today. The CLI
+    # flags confirm_each / sleep / grounder / external_grounder
+    # don't yet have a slot in the protocol. When the user actually
+    # uses one of those flags we fall back to the direct path
+    # rather than silently ignore them (codex P2 on e89ad0c). The
+    # alternative — adding all flags to the protocol — is the right
+    # long-term fix; this gate is the small-PR version.
+    flags_unsupported_by_agentd = (
+        args.confirm_each
+        or args.sleep != 0.0
+        or args.grounder != "gpt55"
+        or args.external_grounder is not None
+    )
+    client = None
+    if not flags_unsupported_by_agentd:
+        from .agentd_client import try_open
+        client = try_open()
     if client is not None:
-        with client:
+        # try_open already entered + authed; we own the connection
+        # and MUST close it (try/finally, NOT `with` — codex P3 on
+        # e89ad0c — the older form re-entered via `with`, opening a
+        # second socket and leaking the first).
+        try:
+            from .agentd_client import render_event_to_stdout
             print("[cli] attached to running agentd")
             exit_code = 0
             for ev in client.run_task(
                 args.task,
                 dry_run=not args.execute,
+                max_steps=args.max_steps,
                 session_context=session_context,
             ):
                 if ev.get("type") == "_ack":
@@ -92,11 +113,13 @@ def cmd_task(args: argparse.Namespace) -> int:
                 elif et == "task_failed":
                     exit_code = 2
             return exit_code
+        finally:
+            client.close()
 
-    # Fallback: direct in-process agent.run(). Same path as before
-    # the agentd refactor; some flags (confirm_each, sleep,
-    # grounder, external_grounder) only work in this path right
-    # now — agentd doesn't yet thread them through.
+    # Fallback: direct in-process agent.run(). Used when no daemon
+    # is running OR the user passed a flag agentd doesn't yet
+    # thread through (confirm_each / sleep / non-default
+    # grounder).
     from .agent import run
     run(args.task, max_steps=args.max_steps, dry_run=not args.execute,
         confirm_each=args.confirm_each, sleep_between=args.sleep,

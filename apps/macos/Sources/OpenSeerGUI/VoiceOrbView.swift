@@ -32,6 +32,20 @@ struct VoiceOrbView: View {
     @State private var displayedAnswer: String? = nil
     @State private var unexpectedRestartAt: Date = .distantPast
     @State private var unexpectedRestartBurst: Int = 0
+    /// What the user sees and edits in the transcript area. Sourced
+    /// from `input.transcript` while the user hasn't typed anything
+    /// different yet; once they edit, we stop overwriting and the
+    /// edited string is what Send / autoCommit submits.
+    @State private var draftText: String = ""
+    /// Last transcript value we copied into `draftText`. We treat
+    /// the buffer as "user-edited" iff `draftText != lastSeenTranscript`
+    /// — that's how we detect whether to keep overwriting from
+    /// SFSpeech (no) or leave the user's edits alone (yes).
+    @State private var lastSeenTranscript: String = ""
+    /// True while the user is focused on the editable transcript
+    /// field; autoCommit is paused so a 4.5s pause-to-think doesn't
+    /// auto-submit mid-edit.
+    @FocusState private var isEditingDraft: Bool
     private let autoCommitDelayNs: UInt64 = 4_500_000_000
     private let finalTranscriptTimeoutS: Double = 3.0
     /// Anti-storm gate for orb-driven restarts after SFSpeech aborts
@@ -44,22 +58,23 @@ struct VoiceOrbView: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 10) {
-            if isOpen { panel }
-            // While a task is running we show a live step bubble — the
-            // model's current thought + last action + reflection state
-            // — so the user gets the same "OpenSeer 正在做 X" feedback
-            // they'd see in the main chat window. The bubble is hidden
-            // once the task ends; the answerBubble takes over.
-            if isTaskRunning, let liveStep {
-                stepBubble(liveStep)
-            }
-            if let displayedAnswer, !displayedAnswer.isEmpty {
-                answerBubble(displayedAnswer)
+            // All non-orb chrome (panel, step bubble, answer bubble)
+            // is gated on `isOpen` so a single tap on the crystal
+            // ball collapses everything back to just-the-orb. Tap
+            // again to bring the panel + any pending bubbles back.
+            if isOpen {
+                panel
+                if isTaskRunning, let liveStep {
+                    stepBubble(liveStep)
+                }
+                if let displayedAnswer, !displayedAnswer.isEmpty {
+                    answerBubble(displayedAnswer)
+                }
             }
             Button {
                 withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
                     isOpen.toggle()
-                    isWindowExpanded = isOpen || displayedAnswer != nil
+                    isWindowExpanded = isOpen
                 }
                 isOpen ? startLoop() : stopLoop()
             } label: {
@@ -71,12 +86,10 @@ struct VoiceOrbView: View {
         }
         .onAppear {
             input.configure(localeID: voiceLocale)
-            isWindowExpanded = isOpen || displayedAnswer != nil
-                || (isTaskRunning && liveStep != nil)
+            isWindowExpanded = isOpen
         }
         .onChange(of: liveStep) { _, _ in
-            isWindowExpanded = isOpen || displayedAnswer != nil
-                || (isTaskRunning && liveStep != nil)
+            isWindowExpanded = isOpen
         }
         .onChange(of: voiceLocale) { _, newValue in
             input.configure(localeID: newValue)
@@ -86,8 +99,24 @@ struct VoiceOrbView: View {
             // partials that repeat the same string. Watching transcript
             // here would miss those, and a pause-to-think would commit
             // mid-utterance (codex P1).
-            guard autoListen, !input.transcript.isEmpty else { return }
+            //
+            // Pause auto-commit while the user is editing the text
+            // field — otherwise a slow 4.5s edit window would
+            // auto-submit before the user clicks Send.
+            guard autoListen, !input.transcript.isEmpty,
+                  !isEditingDraft else { return }
             scheduleCommit()
+        }
+        .onChange(of: input.transcript) { _, new in
+            // Track the recognizer's transcript into the editable
+            // buffer UNLESS the user has already taken over by
+            // typing/editing. Once draftText diverges from what we
+            // last copied (lastSeenTranscript), SFSpeech doesn't
+            // get to clobber the user's edits.
+            if draftText == lastSeenTranscript {
+                draftText = new
+            }
+            lastSeenTranscript = new
         }
         .onChange(of: input.unexpectedStopTick) { _, _ in
             // SFSpeech aborted its session on its own (cooldown err,
@@ -129,13 +158,16 @@ struct VoiceOrbView: View {
             if !running && autoListen && !input.isRecording {
                 startListeningIfIdle()
             }
-            isWindowExpanded = isOpen || displayedAnswer != nil
-                || (isTaskRunning && liveStep != nil)
+            isWindowExpanded = isOpen
         }
         .onChange(of: spokenAnswer) { _, answer in
             guard let answer, !answer.isEmpty else { return }
+            // Auto-open the panel so the new answer is immediately
+            // visible — otherwise a collapsed orb would silently
+            // accumulate answers the user never notices.
             withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
                 displayedAnswer = answer
+                if !isOpen { isOpen = true }
                 isWindowExpanded = true
             }
             if input.isRecording { input.stop() }
@@ -170,17 +202,29 @@ struct VoiceOrbView: View {
                 .foregroundStyle(statusColor)
                 .lineLimit(2)
 
-            ScrollView(.vertical, showsIndicators: true) {
-                Text(transcriptText)
+            // Editable transcript area. SFSpeech writes into draftText
+            // via .onChange(of: input.transcript); the user can fix
+            // recognition errors before hitting Send. Once they edit,
+            // auto-overwrite stops (see the onChange handler).
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $draftText)
                     .font(.callout)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .focused($isEditingDraft)
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 70)
+                if draftText.isEmpty {
+                    // Empty-state hint sits behind the TextEditor.
+                    // .allowsHitTesting(false) so clicks pass
+                    // through to the editor below.
+                    Text(transcriptText)
+                        .font(.callout)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 8)
+                        .allowsHitTesting(false)
+                }
             }
-            // Fixed height: each partial would otherwise reflow the
-            // outer panel and the orb would visibly hop. Internal
-            // ScrollView handles overflow.
-            .frame(height: 70)
-            .padding(10)
+            .padding(6)
             .background(.background.secondary)
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
@@ -200,7 +244,8 @@ struct VoiceOrbView: View {
                     Label("Send", systemImage: "paperplane.fill")
                 }
                 .controlSize(.small)
-                .disabled(input.transcript
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(draftText
                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
@@ -388,16 +433,21 @@ struct VoiceOrbView: View {
         utteranceTask?.cancel()
         utteranceTask = nil
         commitTask?.cancel()
-        let snapshot = input.transcript
-        // Wait for SFSpeech's actual `isFinal` callback rather than a
-        // fixed sleep — partial transcripts routinely miss the last
-        // word(s) until the post-roll lands ~1–3s after endAudio.
-        // 3s safety net; fall back to the partial snapshot if the
-        // final never arrives.
+        // Snapshot the user's draft right now. We still call
+        // stopAndAwaitFinal to drain the SFSpeech post-roll; if the
+        // user hasn't manually edited (draftText was tracking
+        // input.transcript), the post-roll lands into draftText via
+        // .onChange(of: input.transcript). If they HAVE edited, we
+        // keep their version.
+        let userDraft = draftText
         commitTask = Task { @MainActor in
-            let finalText = await input.stopAndAwaitFinal(
+            _ = await input.stopAndAwaitFinal(
                 timeout: finalTranscriptTimeoutS)
-            let text = (finalText.isEmpty ? snapshot : finalText)
+            // Read draftText again after the await — onChange may
+            // have advanced it with the post-roll. Fall back to the
+            // snapshot if SwiftUI hasn't propagated yet.
+            let candidate = draftText.isEmpty ? userDraft : draftText
+            let text = candidate
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let repeatedTooSoon = text == lastSubmitted
                 && Date().timeIntervalSince(lastSubmittedAt) < 2.5
@@ -408,7 +458,12 @@ struct VoiceOrbView: View {
             lastSubmitted = text
             lastSubmittedAt = Date()
             displayedAnswer = nil
+            // Clear the editable buffer + the tracking marker so
+            // the next utterance starts from scratch.
+            draftText = ""
+            lastSeenTranscript = ""
             input.resetTranscript()
+            isEditingDraft = false
             autoListen = true
             onSubmit(text)
             // Re-arm the mic immediately after submit so a follow-up

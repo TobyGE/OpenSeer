@@ -260,7 +260,14 @@ final class MainController: ObservableObject {
         // with the new message" behavior the user expects when they
         // talk over the agent.
         if let cur = continueThread {
-            for run in cur.runs where run.status == .running {
+            // Cancel both .running AND .held runs. A held run still
+            // has a worker thread (and possibly an in-flight LLM /
+            // action cycle that hasn't reached the HOLD check yet)
+            // — leaving it alone would let the previous agent
+            // continue while the new one starts, defeating barge-in
+            // (codex P2 on 55b6441).
+            for run in cur.runs
+                where run.status == .running || run.status == .held {
                 run.cancel()
             }
         }

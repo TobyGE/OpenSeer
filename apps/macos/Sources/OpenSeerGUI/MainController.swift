@@ -202,6 +202,12 @@ final class MainController: ObservableObject {
         else if run.status == .running { run.hold() }
     }
 
+    /// Stop the active run (Cancel). Used by the voice orb's Stop
+    /// button — different from Hand off, which only pauses.
+    func stopSelectedRun() {
+        selectedActiveRun?.cancel()
+    }
+
     func selectNewestThreadIfNeeded() {
         if selectedThreadID == nil,
            let newest = daemon.threads

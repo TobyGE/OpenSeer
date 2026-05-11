@@ -25,6 +25,9 @@ struct VoiceOrbView: View {
     let onAnswerConsumed: () -> Void
     /// Toggle the hand-off: if running → hold; if held → resume.
     let onHoldToggle: () -> Void
+    /// Stop the running task entirely (CANCEL sentinel + asyncio
+    /// task cancel). Visible only while a task is in progress.
+    let onStop: () -> Void
     @Binding var isWindowExpanded: Bool
 
     @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
@@ -277,6 +280,18 @@ struct VoiceOrbView: View {
                     .help(isTaskHeld
                           ? "Resume the agent; it'll re-read state on the next step."
                           : "Pause the agent so you can use the mouse/keyboard yourself.")
+
+                    // Stop: ends the current task entirely. Different
+                    // from Hand off (which only pauses) — Stop is
+                    // when the agent's going off the rails and we
+                    // want it to give up.
+                    Button(role: .destructive) {
+                        onStop()
+                    } label: {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .controlSize(.small)
+                    .help("End this task. The agent writes a terminate(fail) and exits cleanly.")
                 }
 
                 // Undo: one-tap "撤销刚才那一步". Submits a fixed

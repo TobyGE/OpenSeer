@@ -157,6 +157,7 @@ private struct VoiceOrbWindowRoot: View {
                     onSubmit: controller.submitVoicePrompt,
                     onAnswerConsumed: { controller.voiceAnswer = nil },
                     onHoldToggle: { controller.toggleHoldOnSelectedRun() },
+                    onStop: { controller.stopSelectedRun() },
                     isWindowExpanded: $expanded
                 )
             }

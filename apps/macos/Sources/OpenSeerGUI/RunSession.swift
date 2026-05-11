@@ -287,21 +287,28 @@ final class RunSession: ObservableObject, Identifiable {
     /// call. For daemon-spawned runs we can't kill the process
     /// (it's the daemon's worker thread, killing it would take down
     /// every other chat) — the sentinel is the only knob we have.
-    /// Hand-off: tell agentd to drop a HOLD sentinel. The agent
-    /// parks at the top of its next step. We don't optimistically
-    /// flip status to .held here — wait for the `agent_held` event
-    /// the agent itself emits, so the UI never lies about state.
+    /// Hand-off: tell agentd to drop a HOLD sentinel. Optimistically
+    /// flip status to .held immediately so the user sees the Resume
+    /// button right away — the agent's actual pause happens at the
+    /// top of its next step (could be 10-30s away while the current
+    /// step's capture/LLM/execute cycle finishes). The agent_held
+    /// event is then a no-op confirmation; agent_resumed / task_*
+    /// events still authoritatively override status afterward.
     func hold() {
         guard let tid = traceId, status == .running else { return }
+        status = .held
         Task { @MainActor in
             await AgentdClient.shared.holdTask(runId: tid)
         }
     }
 
-    /// Resume from hand-off: remove the HOLD sentinel and let the
-    /// agent re-read AX/screen on its next step.
+    /// Resume from hand-off: remove the HOLD sentinel. Optimistically
+    /// flip back to .running so the user gets immediate feedback;
+    /// the agent's actual resume happens within ~500ms (its outer
+    /// loop polls the HOLD sentinel every 500ms).
     func resume() {
         guard let tid = traceId, status == .held else { return }
+        status = .running
         Task { @MainActor in
             await AgentdClient.shared.resumeTask(runId: tid)
         }

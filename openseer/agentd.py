@@ -376,11 +376,16 @@ class _Connection:
                         hold_path.parent.mkdir(parents=True,
                                                 exist_ok=True)
                         hold_path.write_text("hand-off via agentd\n")
+                        log.info("hold sentinel written for run %s -> %s",
+                                 target, hold_path)
                     else:
                         try:
                             hold_path.unlink()
+                            log.info("hold sentinel removed for run %s",
+                                     target)
                         except FileNotFoundError:
-                            pass
+                            log.info("resume_task for %s but no HOLD file",
+                                     target)
                 except Exception as e:
                     log.warning("hold/resume sentinel failed: %s", e)
             await self.send({

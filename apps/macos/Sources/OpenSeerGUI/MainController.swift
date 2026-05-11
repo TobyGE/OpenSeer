@@ -7,6 +7,12 @@ final class MainController: ObservableObject {
     @Published var selectedThreadID: String? = nil
     @Published var dryRun: Bool = false
     @Published var voiceAnswer: String? = nil
+    /// Background mode — agent prefers AppleScript-based browser
+    /// automation over pyautogui so it doesn't steal mouse / keyboard
+    /// focus. User keeps using their Mac while the agent works. The
+    /// browser-background skill carries the patterns; we just nudge
+    /// the model via session context to prefer it.
+    @Published var backgroundMode: Bool = false
 
     /// One-shot session-context snippet captured at hotkey-press
     /// time (frontmost app name, etc.). Consumed by the next
@@ -280,6 +286,22 @@ final class MainController: ObservableObject {
             sessionCtx = ((sessionCtx ?? "") + (sessionCtx?.isEmpty == false
                 ? "\n\n" : "") + hk)
             pendingHotkeyContext = nil
+        }
+        // Background mode hint — read the browser-background skill
+        // first, prefer AppleScript browser automation over
+        // pyautogui, NEVER call `activate` on the user's apps.
+        if backgroundMode {
+            let bg = "BACKGROUND MODE: the user wants this task done "
+                + "without stealing their mouse / keyboard. READ the "
+                + "`browser-background` skill before doing anything and "
+                + "use its AppleScript + injected-JS patterns. Do NOT "
+                + "use pyautogui clicks/keys/type. Do NOT call "
+                + "`activate` on any app. If you hit a captcha / "
+                + "vision-required UI, ask_user(kind=\"confirm\") with "
+                + "a screenshot and pause; the user will decide whether "
+                + "to escalate to foreground."
+            sessionCtx = ((sessionCtx ?? "") + (sessionCtx?.isEmpty == false
+                ? "\n\n" : "") + bg)
         }
 
         let s = RunSession(source: .localPrompt(text), binary: binary)

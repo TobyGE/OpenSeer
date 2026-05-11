@@ -133,6 +133,11 @@ struct ChatView: View {
                 Toggle("Dry run (preview only)", isOn: $controller.dryRun)
                     .controlSize(.small)
                     .toggleStyle(.switch)
+                Toggle("Background (no focus)",
+                       isOn: $controller.backgroundMode)
+                    .controlSize(.small)
+                    .toggleStyle(.switch)
+                    .help("Prefer AppleScript browser automation; the agent won't move your mouse or steal focus. Works for browser-only tasks.")
                 Spacer()
                 Text(composerHint)
                     .font(.caption2).foregroundStyle(.tertiary)

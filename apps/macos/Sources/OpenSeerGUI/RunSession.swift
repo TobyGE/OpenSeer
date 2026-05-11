@@ -40,6 +40,11 @@ final class RunSession: ObservableObject, Identifiable {
 
     enum Status: Equatable {
         case running, done, fail, cap, interrupted
+        /// User pressed "换我 / Hand off" — agent is parked between
+        /// steps, waiting for the user to release it via resume().
+        /// Behaves like running for "is the task still alive"
+        /// purposes (the run will resume from where it left off).
+        case held
     }
 
     private var stream: CLI.StreamHandle?
@@ -272,6 +277,26 @@ final class RunSession: ObservableObject, Identifiable {
     /// call. For daemon-spawned runs we can't kill the process
     /// (it's the daemon's worker thread, killing it would take down
     /// every other chat) — the sentinel is the only knob we have.
+    /// Hand-off: tell agentd to drop a HOLD sentinel. The agent
+    /// parks at the top of its next step. We don't optimistically
+    /// flip status to .held here — wait for the `agent_held` event
+    /// the agent itself emits, so the UI never lies about state.
+    func hold() {
+        guard let tid = traceId, status == .running else { return }
+        Task { @MainActor in
+            await AgentdClient.shared.holdTask(runId: tid)
+        }
+    }
+
+    /// Resume from hand-off: remove the HOLD sentinel and let the
+    /// agent re-read AX/screen on its next step.
+    func resume() {
+        guard let tid = traceId, status == .held else { return }
+        Task { @MainActor in
+            await AgentdClient.shared.resumeTask(runId: tid)
+        }
+    }
+
     func cancel() {
         if let tid = traceId {
             let cancelPath = NSHomeDirectory()
@@ -341,6 +366,12 @@ final class RunSession: ObservableObject, Identifiable {
         } else if ev.type == "task_failed" {
             status = .fail
             errorMessage = ev.data["error"]?.string
+        } else if ev.type == "agent_held" {
+            // The user (or another client) toggled hand-off. Agent
+            // is parked between steps until we resume.
+            if status == .running { status = .held }
+        } else if ev.type == "agent_resumed" {
+            if status == .held { status = .running }
         }
         // Trigger SwiftUI redraw.
         objectWillChange.send()

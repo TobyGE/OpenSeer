@@ -398,6 +398,27 @@ final class AgentdClient: NSObject {
         }
     }
 
+    /// Hand-off: suspend the agent so the user can drive the
+    /// mouse/keyboard for a few steps. Agent re-reads AX/screen
+    /// state when resumed, so it picks up whatever changed.
+    func holdTask(runId: String) async {
+        do {
+            _ = try await sendRequest(
+                "hold_task", payload: ["run_id": runId])
+        } catch {
+            NSLog("[agentd] hold failed: %@", "\(error)")
+        }
+    }
+
+    func resumeTask(runId: String) async {
+        do {
+            _ = try await sendRequest(
+                "resume_task", payload: ["run_id": runId])
+        } catch {
+            NSLog("[agentd] resume failed: %@", "\(error)")
+        }
+    }
+
     /// Handle an incoming ask_user from the daemon. Routes to the
     /// askUserHandler, awaits its return, and posts a user_reply
     /// back. If no handler is registered we reply with null which

@@ -113,6 +113,7 @@ final class ChatThread: ObservableObject, Identifiable {
         case .fail:    return "fail"
         case .cap:     return "cap"
         case .interrupted: return "interrupted"
+        case .held:    return "paused (user)"
         }
     }
 

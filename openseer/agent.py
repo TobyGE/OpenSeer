@@ -854,6 +854,28 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                  action=stop_action.name, result=stop_step.result)
             break
 
+        # Hold sentinel — user pressed "换我 / Hand off", wants to
+        # operate the mouse + keyboard themselves for a few steps.
+        # Agent suspends until they release (HOLD removed) or
+        # abort (CANCEL touched). Re-emits AGENT_HELD once and
+        # AGENT_RESUMED on release so the UI can show a paused
+        # indicator and the next step re-reads AX / screen state
+        # to pick up what the user changed.
+        hold_path = out_dir / "HOLD"
+        if hold_path.exists():
+            emit(EventType.AGENT_HELD, message="paused — user has the mouse")
+            say(f"\n[agent] paused — waiting for user "
+                f"(remove {hold_path.name} to resume; touch CANCEL to abort)")
+            while hold_path.exists():
+                if cancel_path.exists():
+                    break    # CANCEL wins over HOLD
+                time.sleep(0.5)
+            if cancel_path.exists():
+                continue     # next iteration handles CANCEL
+            emit(EventType.AGENT_RESUMED,
+                 message="resumed — re-reading current state")
+            say(f"[agent] resumed")
+
         # budget / circuit-breakers can stop us before the next API call
         if not all(cb.on_should_continue(ctx) for cb in cbs):
             say(f"\n[agent] stopped by callback before step {sn}")

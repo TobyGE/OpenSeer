@@ -136,11 +136,19 @@ private struct VoiceOrbWindowRoot: View {
             HStack {
                 Spacer(minLength: 0)
                 VoiceOrbView(
-                    isTaskRunning: controller.selectedRunningRun != nil,
+                    // .held counts as "task in progress" for orb
+                    // semantics — barge-in, etc. still want to see
+                    // an active task. Held vs running is then
+                    // signaled separately via isTaskHeld for the
+                    // Hold/Resume button label.
+                    isTaskRunning: controller.selectedRunningRun != nil
+                        || liveObserver.runStatus == .held,
+                    isTaskHeld: liveObserver.runStatus == .held,
                     spokenAnswer: controller.voiceAnswer,
                     liveStep: liveObserver.current,
                     onSubmit: controller.submitVoicePrompt,
                     onAnswerConsumed: { controller.voiceAnswer = nil },
+                    onHoldToggle: { controller.toggleHoldOnSelectedRun() },
                     isWindowExpanded: $expanded
                 )
             }
@@ -170,6 +178,10 @@ private struct VoiceOrbWindowRoot: View {
 @MainActor
 final class LiveTurnObserver: ObservableObject {
     @Published private(set) var current: LiveStepInfo? = nil
+    /// Mirror of run.status. Republished on the outer ObservableObject
+    /// so a SwiftUI view binding to LiveTurnObserver re-renders when
+    /// the agent enters/leaves the .held state.
+    @Published private(set) var runStatus: RunSession.Status? = nil
     private weak var run: RunSession?
     private var cancellable: AnyCancellable?
 
@@ -179,14 +191,17 @@ final class LiveTurnObserver: ObservableObject {
         cancellable?.cancel()
         guard let run else {
             current = nil
+            runStatus = nil
             return
         }
         cancellable = run.objectWillChange.sink { [weak self, weak run] _ in
             DispatchQueue.main.async {
                 self?.current = Self.snapshot(from: run)
+                self?.runStatus = run?.status
             }
         }
         current = Self.snapshot(from: run)
+        runStatus = run.status
     }
 
     private static func snapshot(from run: RunSession?) -> LiveStepInfo? {

@@ -361,6 +361,34 @@ class _Connection:
             })
             return
 
+        if t in ("hold_task", "resume_task"):
+            # Hand-off: HOLD sentinel suspends the agent at the top
+            # of its next step. resume_task removes it. Same out-of-
+            # band sentinel pattern as CANCEL — fine-grained enough
+            # that pause/resume feel snappy without touching the
+            # agent's own state machine.
+            target = msg.get("run_id")
+            if target:
+                hold_path = (Path.home() / ".openseer" / "runs"
+                             / target / "HOLD")
+                try:
+                    if t == "hold_task":
+                        hold_path.parent.mkdir(parents=True,
+                                                exist_ok=True)
+                        hold_path.write_text("hand-off via agentd\n")
+                    else:
+                        try:
+                            hold_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                except Exception as e:
+                    log.warning("hold/resume sentinel failed: %s", e)
+            await self.send({
+                "type": "ack", "request_id": rid,
+                t.replace("_task", ""): target,
+            })
+            return
+
         if t == "cancel_task":
             target = msg.get("run_id")
             # Two-pronged stop:

@@ -15,10 +15,16 @@ struct LiveStepInfo: Equatable {
 
 struct VoiceOrbView: View {
     let isTaskRunning: Bool
+    /// Subset of `isTaskRunning` that says the run is parked
+    /// waiting for the user to release it (HOLD sentinel set on
+    /// disk). True only when isTaskRunning is also true.
+    let isTaskHeld: Bool
     let spokenAnswer: String?
     let liveStep: LiveStepInfo?
     let onSubmit: (String) -> Void
     let onAnswerConsumed: () -> Void
+    /// Toggle the hand-off: if running → hold; if held → resume.
+    let onHoldToggle: () -> Void
     @Binding var isWindowExpanded: Bool
 
     @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
@@ -242,6 +248,23 @@ struct VoiceOrbView: View {
                 .controlSize(.small)
                 .disabled(!input.isAvailable || input.isStarting)
 
+                // Hand-off: pause/resume the agent so the user can
+                // drive the mouse + keyboard themselves for a few
+                // steps. Only relevant while there's an active task.
+                if isTaskRunning {
+                    Button {
+                        onHoldToggle()
+                    } label: {
+                        Label(isTaskHeld ? "Resume" : "Hand off",
+                              systemImage: isTaskHeld
+                                ? "play.fill" : "hand.raised.fill")
+                    }
+                    .controlSize(.small)
+                    .help(isTaskHeld
+                          ? "Resume the agent; it'll re-read state on the next step."
+                          : "Pause the agent so you can use the mouse/keyboard yourself.")
+                }
+
                 Button {
                     commitNow()
                 } label: {
@@ -360,6 +383,9 @@ struct VoiceOrbView: View {
 
     private var transcriptText: String {
         if !input.transcript.isEmpty { return input.transcript }
+        if isTaskHeld {
+            return "Paused — you have the mouse. Press Resume when done."
+        }
         if isTaskRunning {
             return input.isRecording
                 ? "Listening… speak to interrupt."
@@ -370,6 +396,9 @@ struct VoiceOrbView: View {
     }
 
     private var statusText: String {
+        if isTaskHeld {
+            return "Hand-off — you drive. Resume when ready."
+        }
         if isTaskRunning {
             return input.isRecording
                 ? "Working — speak to interrupt and re-call."
@@ -383,6 +412,7 @@ struct VoiceOrbView: View {
 
     private var statusColor: Color {
         if input.error != nil { return .orange }
+        if isTaskHeld { return .yellow }
         if input.isRecording { return .red }
         if isTaskRunning { return .accentColor }
         return .secondary

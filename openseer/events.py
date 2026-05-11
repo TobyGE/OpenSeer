@@ -40,6 +40,10 @@ class EventType:
     ACTION_FINISHED = "action_finished"
     SAFETY_BLOCKED  = "safety_blocked"
     STEP_RECORDED   = "step_recorded"
+    # Hand-off: the user pressed "换我" / Hold; agent is suspended,
+    # waiting for the HOLD sentinel to disappear (or CANCEL to win).
+    AGENT_HELD      = "agent_held"
+    AGENT_RESUMED   = "agent_resumed"
     TASK_FINISHED   = "task_finished"
     TASK_FAILED     = "task_failed"
 

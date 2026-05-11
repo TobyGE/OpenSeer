@@ -184,6 +184,10 @@ struct SessionFooter: View {
                 Image(systemName: "pause.circle")
                     .foregroundStyle(.secondary)
                 Text("interrupted").font(.caption)
+            case .held:
+                Image(systemName: "hand.raised.fill")
+                    .foregroundStyle(.yellow)
+                Text("paused (user)").font(.caption)
             }
             if let tid = session.traceId {
                 Text("· \(tid.prefix(8))")

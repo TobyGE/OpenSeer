@@ -153,6 +153,22 @@ final class MainController: ObservableObject {
         selectedThread?.sortedRuns.last { $0.status == .running }
     }
 
+    /// Active = running OR held (the user took over but the run is
+    /// still alive). Used for hand-off button targeting.
+    var selectedActiveRun: RunSession? {
+        selectedThread?.sortedRuns.last {
+            $0.status == .running || $0.status == .held
+        }
+    }
+
+    /// Toggle hold/resume on whatever active run is selected. Called
+    /// from the voice orb's Hold/Resume button.
+    func toggleHoldOnSelectedRun() {
+        guard let run = selectedActiveRun else { return }
+        if run.status == .held { run.resume() }
+        else if run.status == .running { run.hold() }
+    }
+
     func selectNewestThreadIfNeeded() {
         if selectedThreadID == nil,
            let newest = daemon.threads

@@ -137,6 +137,7 @@ private struct SessionRow: View {
         case .fail:    return .orange
         case .cap:     return .gray
         case .interrupted: return .secondary
+        case .held:    return .yellow
         }
     }
 

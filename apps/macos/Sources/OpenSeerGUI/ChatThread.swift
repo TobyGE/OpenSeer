@@ -90,6 +90,13 @@ final class ChatThread: ObservableObject, Identifiable {
         guard !prior.isEmpty else { return "" }
         var lines = ["RECENT SESSION CONTEXT (read-only, prior tasks "
                      + "in this conversation):"]
+        // For the *most recent* run, also include the last producing
+        // action's name + summary. Undo / "redo with tweak" flows
+        // need to know what was actually done, not just whether the
+        // task succeeded — renderSessionContext used to only carry
+        // the final answer, leaving the agent guessing on follow-ups
+        // like "撤销刚才那一步" (codex P2 on 622f4d5).
+        let mostRecentId = prior.last?.id
         for run in prior {
             let task = run.title
                 .replacingOccurrences(of: "\n", with: " ")
@@ -97,13 +104,40 @@ final class ChatThread: ObservableObject, Identifiable {
             let result = lastResult(of: run)
                 .replacingOccurrences(of: "\n", with: " ")
                 .prefix(140)
-            let summary = result.isEmpty
+            var summary = result.isEmpty
                 ? "\"\(task)\" → \(status)"
                 : "\"\(task)\" → \(status): \(result)"
+            if run.id == mostRecentId,
+               let act = lastProducingAction(of: run) {
+                summary += "  [last producing action: \(act)]"
+            }
             lines.append("  - " + summary)
         }
         lines.append("END SESSION CONTEXT")
         return lines.joined(separator: "\n")
+    }
+
+    /// The most-recent action whose semantics actually changed
+    /// something the user (or the OS) can observe — i.e. what an
+    /// undo would have to reverse. Observation-only actions
+    /// (screenshot, get_app_state, reground, read_skill, wait,
+    /// terminate) are skipped.
+    private func lastProducingAction(of run: RunSession) -> String? {
+        let observers: Set<String> = [
+            "screenshot", "get_app_state", "reground", "read_skill",
+            "wait", "terminate", "ask_user",
+        ]
+        for turn in run.turns.reversed() where !turn.isUserPrompt {
+            for action in turn.actions.reversed() {
+                if observers.contains(action.name) { continue }
+                let summary = action.summary
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .prefix(80)
+                if summary.isEmpty { return action.name }
+                return "\(action.name) \(summary)"
+            }
+        }
+        return nil
     }
 
     private func describe(_ s: RunSession.Status) -> String {

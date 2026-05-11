@@ -577,14 +577,23 @@ def execute(action: Action, *, dry_run: bool = True,
                     err = executor_bg.click_background(
                         x, y, background_pid, count=count)
                     if err:
-                        # Fall back to global click so the action at
-                        # least has a chance. The error is surfaced to
-                        # the model so it can decide to escalate.
-                        pyautogui.click(x, y, clicks=count,
-                                        interval=0.06 if count > 1 else 0)
-                        verb = "clicked" if count == 1 else f"{count}-clicked"
-                        return (f"{verb} ({x},{y}) [bg failed: {err}; fell back to foreground]"
-                                + (" [clamped]" if clamped else ""))
+                        # DO NOT silently fall back to pyautogui.click
+                        # here — background_mode explicitly promised
+                        # the user we wouldn't move their cursor or
+                        # touch the frontmost app. Falling through to
+                        # foreground would break that contract every
+                        # time bg delivery hiccups (Quartz missing,
+                        # target pid died, AX policy reject). Surface
+                        # the error so the model can ask_user whether
+                        # to escalate to foreground for this step.
+                        # (codex P1 fix on f01f3b4.)
+                        return (f"ERROR: background click to pid={background_pid} "
+                                f"at ({x},{y}) failed: {err}. The user is in "
+                                f"background mode and doesn't want the cursor "
+                                f"moved — `ask_user(kind=\"confirm\", "
+                                f"question=\"Background click failed. Run in "
+                                f"foreground for this step?\")` before "
+                                f"retrying without background_pid.")
                 else:
                     pyautogui.click(x, y, clicks=count,
                                     interval=0.06 if count > 1 else 0)

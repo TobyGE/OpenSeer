@@ -63,24 +63,40 @@ except ImportError:
     _AVAILABLE = False
 
 
-# CGEventField numeric IDs from CGEventTypes.h. PyObjC exposes some of
-# these as named constants in older Quartz builds and others not; we
-# pull what we can and fall back to the documented integers.
+# CGEventField numeric IDs. PyObjC's Quartz module exposes most as
+# module-level constants — we use those when present, otherwise fall
+# back to the values documented in CGEventTypes.h. The fallbacks
+# below match the current macOS SDK (verified on macOS 14+):
+#
+#   kCGMouseEventClickState                                  = 1
+#   kCGEventTargetUnixProcessID                              = 40
+#   kCGMouseEventWindowUnderMousePointer                     = 91
+#   kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent = 92
+#
+# (codex review on f01f3b4 caught earlier guesses of 39/35/36 which
+# were either wrong constants or stale values from older SDKs.)
+#
+# `kCGWindowIDEventField` isn't a documented CGEventField; Peekaboo
+# stamps it via Swift's `.windowID` enum case which compiles to 51
+# in current SDKs. We pass 51 here as a best-effort — if the slot
+# isn't honored the other two windowUnder* fields still carry the
+# routing info the target dispatcher needs.
 def _field(name: str, fallback: int) -> int:
     try:
-        from Quartz import __dict__ as _qd
-        if name in _qd:
-            return int(_qd[name])
+        import Quartz as _q
+        val = getattr(_q, name, None)
+        if val is not None:
+            return int(val)
     except Exception:
         pass
     return fallback
 
 
-_FIELD_CLICK_STATE         = _field("kCGMouseEventClickState",                                       1)
-_FIELD_WINDOW_UNDER_PTR    = _field("kCGMouseEventWindowUnderMousePointer",                          35)
-_FIELD_WINDOW_UNDER_PTR_OK = _field("kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent",    36)
-_FIELD_TARGET_PID          = _field("kCGEventTargetUnixProcessID",                                   39)
-_FIELD_WINDOW_ID           = _field("kCGWindowIDEventField",                                         51)
+_FIELD_CLICK_STATE         = _field("kCGMouseEventClickState",                                        1)
+_FIELD_WINDOW_UNDER_PTR    = _field("kCGMouseEventWindowUnderMousePointer",                           91)
+_FIELD_WINDOW_UNDER_PTR_OK = _field("kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent",     92)
+_FIELD_TARGET_PID          = _field("kCGEventTargetUnixProcessID",                                    40)
+_FIELD_WINDOW_ID           = _field("kCGWindowIDEventField",                                          51)
 
 
 # Dictionary keys for CGWindowListCopyWindowInfo. PyObjC returns NSDictionary

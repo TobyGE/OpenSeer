@@ -20,10 +20,13 @@ Adapt to the conversation, but cover these in order:
 ```
 ask_user(
   kind="text",
-  question="What app + what should I call this macro? e.g. 'WeChat, send-good-morning'."
+  question="What app + what should I call this macro? Use a COMMA to separate them, e.g. 'Google Chrome, post-update' or 'Visual Studio Code, run-tests'."
 )
 ```
-Parse the reply: first token before comma or space is the app, the rest is the macro name. If ambiguous, ask_user once more for the missing piece.
+Parse the reply by splitting on the FIRST comma ONLY:
+  - everything before the comma (trimmed) = app name. **Don't split on spaces** — many real apps have multi-word names (`Google Chrome`, `Visual Studio Code`, `Microsoft Edge`, `微信读书`). Splitting on space here is the #1 way to write a SKILL.md that the loader silently drops because `requires.apps` points at a non-existent app.
+  - everything after the comma (trimmed) = macro name.
+If the user's reply has no comma, ask_user again with: "I didn't catch the split — please put a comma between the app name and the macro name. Example: 'Safari, save-link'."
 
 **2. The steps** (one question, multi-line answer):
 ```

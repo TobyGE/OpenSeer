@@ -300,6 +300,14 @@ def _handle(msg: dict, log: logging.Logger) -> None:
             })
         return
 
+    if method == "ping":
+        # MCP liveness check — spec requires we just return success
+        # with an empty result. Hosts like the MCP Inspector mark
+        # the server unhealthy and stop using it if we return
+        # method-not-found here.
+        _ok(req_id, {})
+        return
+
     # Stubs for protocol methods we don't implement yet; return
     # empty so the host doesn't error out asking for them.
     if method == "resources/list":

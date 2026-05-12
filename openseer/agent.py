@@ -851,7 +851,7 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
     # opens a fresh window, so this is just the bootstrap.
     if background_mode:
         try:
-            from .ax import active_app_pid as _aap
+            from openseer_ax import active_app_pid as _aap
             seed = _aap()
             if seed and seed != _os.getpid():
                 ctx["target_pid"] = seed
@@ -947,8 +947,8 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         # label rather than guessed pixel coords. On apps with no useful
         # AX (canvas-only / DRM'd / no permission) the list is empty and
         # the model falls back to coordinate clicks.
-        from .ax import (active_app_pid, dump_ax_tree, render_ax_for_prompt,
-                         _AX_AVAILABLE)
+        from openseer_ax import (active_app_pid, dump_ax_tree,
+                                 render_ax_for_prompt, _AX_AVAILABLE)
         ax_elems: list = []
         ax_block = ""
         if _AX_AVAILABLE:
@@ -1611,8 +1611,8 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
             # Doesn't touch the UI; the next turn's auto-screenshot will
             # still happen normally and give visual ground-truth.
             if action.name == "get_app_state":
-                from .ax import (active_app_pid, app_pid_by_name,
-                                 dump_ax_tree, render_ax_for_prompt)
+                from openseer_ax import (active_app_pid, app_pid_by_name,
+                                         dump_ax_tree, render_ax_for_prompt)
                 target = (action.app or "").strip()
                 if target:
                     target_pid = app_pid_by_name(target)
@@ -2023,7 +2023,7 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
             if (action.name == "open_app" and not dry_run
                     and not result.startswith("open -a") and action.app):
                 try:
-                    from .ax import app_pid_by_name as _pid_by_name
+                    from openseer_ax import app_pid_by_name as _pid_by_name
                     tp = _pid_by_name(action.app)
                     if tp:
                         ctx["target_pid"] = tp

@@ -212,8 +212,8 @@ def _tool_open_app(args: dict) -> list[dict]:
     },
 )
 def _tool_get_app_state(args: dict) -> list[dict]:
-    from .ax import (active_app_pid, app_pid_by_name, dump_ax_tree,
-                     render_ax_for_prompt)
+    from openseer_ax import (active_app_pid, app_pid_by_name, dump_ax_tree,
+                             render_ax_for_prompt)
     name = args.get("app")
     pid = app_pid_by_name(name) if name else active_app_pid()
     if not pid:

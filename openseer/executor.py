@@ -181,7 +181,7 @@ def _detect_frontmost_browser() -> str | None:
     browser is worse than asking the model to pass `app` explicitly.
     """
     try:
-        from .ax import active_app_pid
+        from openseer_ax import active_app_pid
         from AppKit import NSRunningApplication  # type: ignore[import-untyped]
         pid = active_app_pid()
         if not pid:

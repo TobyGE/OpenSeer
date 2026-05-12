@@ -48,7 +48,12 @@ Issues = "https://github.com/TobyGE/OpenSeer/issues"
 openseer = "openseer.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["openseer*"]
+# Includes both `openseer` (the main package) and `openseer_ax` (the
+# AX wrapper, lifted to its own top-level package so it can be used
+# standalone). They live in the same wheel for now; eventually
+# `openseer_ax` may move out to its own repo + PyPI release without
+# breaking callers thanks to the openseer/ax.py compatibility shim.
+include = ["openseer*", "openseer_ax*"]
 
 [tool.setuptools.package-data]
 openseer = ["skills/**/*.md", "voice_listen.swift"]

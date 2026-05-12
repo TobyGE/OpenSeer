@@ -393,15 +393,41 @@ class RunReflectionCallback(Callback):
             1 for s in history
             if getattr(s.action, "name", "") in ("click", "type", "key", "scroll", "open_app")
         )
+        # Bash / web_fetch actions whose cmd or url mentions the inferred
+        # site count as "substantive engagement" too. Without this,
+        # API-scraping flows (curl + python on youtube.com /
+        # api.example.com / raw.githubusercontent.com) have ui_actions = 0
+        # and never propose a skill — even when the run discovered a
+        # durable footgun like "the YouTube timedtext caption endpoint
+        # returns empty bytes; scrape shortDescription instead". Those
+        # are exactly the lessons users complain about repeating.
+        domain_bash_actions = 0
+        if site_domain:
+            for s in history:
+                name = getattr(s.action, "name", "")
+                if name not in ("bash", "web_fetch", "web_search"):
+                    continue
+                blob = " ".join([
+                    str(getattr(s.action, "cmd", "") or ""),
+                    str(getattr(s.action, "url", "") or ""),
+                    str(getattr(s.action, "query", "") or ""),
+                    str(s.result or "")[:2000],
+                ])
+                if site_domain in blob.lower():
+                    domain_bash_actions += 1
+        substantive_actions = ui_actions + domain_bash_actions
         existing_body = ""
         expected_skill_name = ""
         if target_skill is not None:
             expected_skill_name = target_skill.name
-            if ui_actions >= 4 or read_names:
+            if substantive_actions >= 4 or read_names:
                 existing_body = target_skill.path.read_text(encoding="utf-8")
-        elif site_domain and ui_actions >= 4:
+        elif site_domain and substantive_actions >= 4:
             expected_skill_name = canonical_site_skill_name(site_domain)
         elif app_name and ui_actions >= 4:
+            # No bash boost for app-only skills: those still need real UI
+            # evidence (clicks/types) since the durable knowledge for a
+            # native macOS app lives in its UI tree, not in a curl recipe.
             expected_skill_name = canonical_skill_name(app_name)
 
         skill_target = "none"

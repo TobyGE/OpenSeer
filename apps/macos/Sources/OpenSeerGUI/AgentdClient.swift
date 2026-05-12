@@ -376,10 +376,15 @@ final class AgentdClient: NSObject {
     private func terminateStaleDaemons() {
         let pgrep = Process()
         pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        // The space in the pattern keeps us from matching unrelated
-        // commands that just happen to contain "agentd" elsewhere
-        // (e.g. the macOS talagentd / gamecontrolleragentd helpers).
-        pgrep.arguments = ["-f", "openseer.cli agentd"]
+        // Match both forms the daemon can be launched as:
+        //   • console-script  → `/.../bin/openseer agentd`
+        //   • module entry    → `python3 -m openseer.cli agentd`
+        // Anchoring on `agentd$` keeps us from matching the macOS
+        // helpers `talagentd` / `gamecontrolleragentd` (no `openseer`
+        // in their argv anyway) and from matching incidental uses of
+        // the word "agentd" mid-command. Case-sensitive by design so
+        // the GUI binary itself (`OpenSeerGUI`) doesn't match.
+        pgrep.arguments = ["-f", "openseer.* agentd$"]
         let pipe = Pipe()
         pgrep.standardOutput = pipe
         pgrep.standardError = Pipe()    // swallow noise

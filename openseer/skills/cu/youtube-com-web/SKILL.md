@@ -35,24 +35,37 @@ timestamps that creators put in the description. That's enough to
 answer "what's this video about" for 95% of cases — the timestamps
 function as a free table of contents.
 
+When you send this as a `bash` action, paste the full snippet AS-IS
+and replace `__URL__` on the first python line with the actual video
+URL. The agent's bash runner has no `$1` to inherit, so positional
+argv-style `URL="$1"` won't work; embedding the URL into the python
+literal sidesteps that.
+
 ```bash
-URL="$1"   # https://www.youtube.com/watch?v=... or https://youtu.be/...
-curl -sL -A 'Mozilla/5.0' "$URL" |
-  python3 -c "
-import sys, re, html
-raw = sys.stdin.read()
+python3 - <<'PY'
+import urllib.request, re, html, json
+URL = "__URL__"   # ← https://www.youtube.com/watch?v=... or youtu.be/...
+req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
+raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+
 # Title — most reliable from <title>...</title>; ytInitialData
 # carries a 'title' too but its quoting is hairy.
-t = re.search(r'<title>(.*?)</title>', raw, re.S)
-title = html.unescape((t.group(1) if t else '').replace(' - YouTube', '').strip())
-# Description — the player response embeds the full description as
-# JSON. shortDescription preserves \\n escapes; decode them.
-d = re.search(r'\"shortDescription\":\"(.*?)\",\"', raw)
-desc = (d.group(1) if d else '').encode('utf-8').decode('unicode_escape')
-print('TITLE:', title)
-print('---')
+t = re.search(r"<title>(.*?)</title>", raw, re.S)
+title = html.unescape((t.group(1) if t else "").replace(" - YouTube", "").strip())
+
+# Description — the player response embeds the full description as a
+# JSON-encoded string. Decoding with json.loads on a re-quoted slice
+# is the only correct way to unescape it: it handles \\n, \\u4e2d for
+# CJK characters, escaped quotes, surrogate pairs, etc. The previous
+# attempt (`.encode('utf-8').decode('unicode_escape')`) corrupts
+# every non-ASCII byte by re-decoding already-UTF-8 bytes as latin1.
+m = re.search(r'"shortDescription":"((?:[^"\\]|\\.)*)"', raw)
+desc = json.loads('"' + m.group(1) + '"') if m else ""
+
+print("TITLE:", title)
+print("---")
 print(desc[:4000])
-"
+PY
 ```
 
 Then summarize from TITLE + first ~4k chars of description (which

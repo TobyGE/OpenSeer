@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Connection to the `openseer agentd` WebSocket daemon. Phase 1
@@ -333,6 +334,16 @@ final class AgentdClient: NSObject {
     }
 
     private func spawnDaemon(binary: String) throws {
+        // Singleton invariant: only one `openseer agentd` may run at
+        // a time. Multiple daemons each take their own AX /
+        // screen-recording locks and serialize on macOS's default 30s
+        // messaging timeout, surfacing as exactly-30s prep delay per
+        // agent step. Best-effort SIGTERM every other matching
+        // process before we spawn fresh; we don't wait for the OS
+        // to confirm exits because the rendezvous-file poll in
+        // `ensureRunning` already handles the startup race.
+        terminateStaleDaemons()
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binary)
         proc.arguments = ["agentd"]
@@ -355,6 +366,51 @@ final class AgentdClient: NSObject {
         spawnedDaemon = proc
         NSLog("[agentd] spawned pid=%d, log=%@",
               proc.processIdentifier, logURL.path)
+    }
+
+    /// Find every `openseer.cli agentd` python process and SIGTERM it.
+    /// Called before spawning to keep at most one daemon alive —
+    /// duplicates cause the AX-timeout contention described above.
+    /// pgrep is shipped with macOS and matches against the full
+    /// command line via `-f`, which catches our python -m form.
+    private func terminateStaleDaemons() {
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        // The space in the pattern keeps us from matching unrelated
+        // commands that just happen to contain "agentd" elsewhere
+        // (e.g. the macOS talagentd / gamecontrolleragentd helpers).
+        pgrep.arguments = ["-f", "openseer.cli agentd"]
+        let pipe = Pipe()
+        pgrep.standardOutput = pipe
+        pgrep.standardError = Pipe()    // swallow noise
+        do {
+            try pgrep.run()
+            pgrep.waitUntilExit()
+        } catch {
+            NSLog("[agentd] singleton: pgrep failed: %@", "\(error)")
+            return
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        let pids: [pid_t] = text.split(separator: "\n").compactMap {
+            pid_t($0.trimmingCharacters(in: .whitespaces))
+        }.filter { $0 != selfPid && $0 > 0 }
+        for pid in pids {
+            let rc = kill(pid, SIGTERM)
+            NSLog("[agentd] singleton: SIGTERM stale daemon pid=%d (rc=%d)",
+                  pid, rc)
+        }
+        // Tiny pause so the doomed daemons get a chance to release
+        // their AX / screen-recording locks before the fresh one
+        // grabs them. Empirically 150ms is plenty; we don't block
+        // longer because the rendezvous poll covers startup races
+        // and waitpid-style sync would need us to be each daemon's
+        // parent (most aren't, e.g. CLI-started ones reparent to
+        // launchd).
+        if !pids.isEmpty {
+            usleep(150_000)
+        }
     }
 
     /// Start a task on the daemon. Returns the run_id immediately

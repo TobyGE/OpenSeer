@@ -457,8 +457,8 @@ struct VoiceOrbView: View {
                 Image(systemName: "graduationcap.fill")
                     .foregroundStyle(.yellow)
                 Text(lesson.isNew
-                     ? "学到了 — 存为新 skill?"
-                     : "学到了 — 更新 \(lesson.skillName)?")
+                     ? "Learned something — save as a skill?"
+                     : "Learned something — update \(lesson.skillName)?")
                     .font(.caption.weight(.semibold))
                 Spacer()
                 Button { onDiscardLesson() } label: {

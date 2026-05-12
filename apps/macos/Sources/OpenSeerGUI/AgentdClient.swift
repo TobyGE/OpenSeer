@@ -194,8 +194,22 @@ final class AgentdClient: NSObject {
     /// events arrived for this run_id before this call (very common
     /// — the daemon often emits `task_started` between the
     /// start_task ack and the caller's observe()), they're replayed
-    /// here in order. Handler is removed automatically when a
-    /// `task_finished` / `task_failed` event has been delivered.
+    /// here in order.
+    ///
+    /// The handler is NOT removed when `task_finished` / `task_failed`
+    /// fires. Post-run events still belong to this run by run_id
+    /// (the reflection pass runs in `on_run_end` and emits
+    /// `skill_proposed` shortly after `task_finished`, and the
+    /// matching `skill_applied` / `skill_discarded` come back from
+    /// the daemon on user action). Auto-removing here meant those
+    /// trailing events landed in `pendingEvents` and never reached
+    /// the UI; the lesson chip silently never appeared.
+    ///
+    /// Memory: handlers persist for the life of this AgentdClient.
+    /// A long-running session that fires hundreds of runs accumulates
+    /// closures, but each is small and the entries get evicted on
+    /// disconnect. Future: add explicit `unobserve(runId:)` when
+    /// RunSession objects are torn down.
     func observe(runId: String,
                  handler: @escaping ([String: Any]) -> Void) {
         eventHandlers[runId] = handler
@@ -204,9 +218,11 @@ final class AgentdClient: NSObject {
                 handler(msg)
             }
         }
-        if pendingTerminated.remove(runId) != nil {
-            eventHandlers.removeValue(forKey: runId)
-        }
+        // We still want to clear the terminated-flag bookkeeping
+        // entry; it's only used to detect "terminator landed before
+        // observe registered" and a re-observe after that is
+        // pointless anyway — but the handler itself stays.
+        pendingTerminated.remove(runId)
     }
 
     private func receiveLoop() async {
@@ -252,9 +268,14 @@ final class AgentdClient: NSObject {
             let terminator = (et == "task_finished" || et == "task_failed")
             if let handler = eventHandlers[runId] {
                 handler(msg)
-                if terminator {
-                    eventHandlers.removeValue(forKey: runId)
-                }
+                // Intentionally NOT removing on terminator — the
+                // run's reflection pass fires `skill_proposed` from
+                // `on_run_end`, which the agent emits AFTER
+                // `task_finished`. Tearing the handler down here
+                // routed those trailing events into `pendingEvents`
+                // forever (nobody calls observe() again), so the
+                // lesson chip never appeared. See observe() doc for
+                // the new lifecycle.
             } else {
                 // No handler registered yet — buffer for replay
                 // when observe(runId:) eventually catches up.

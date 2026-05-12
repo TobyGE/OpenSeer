@@ -1407,7 +1407,12 @@ def run_daemon() -> int:
     # render_ax_for_prompt then flags the AX block with a [NOTE]
     # whenever it's dumping any of these. We don't block — sometimes
     # a task legitimately drives the terminal — we just annotate.
-    from . import ax as _ax_mod
+    # NB: must point at the canonical `openseer_ax` module (not the
+    # `openseer.ax` shim). render_ax_for_prompt resolves
+    # HOST_TERMINAL_PIDS from openseer_ax's own globals, so assigning
+    # through the shim would only mutate the shim's local re-export
+    # and leave the renderer reading stale state.
+    import openseer_ax as _ax_mod
     _ax_mod.HOST_TERMINAL_PIDS = _ax_mod._terminal_app_pids_in_ancestry()
 
     cfg = _load_config()

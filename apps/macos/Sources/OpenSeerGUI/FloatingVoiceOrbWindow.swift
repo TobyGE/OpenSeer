@@ -173,17 +173,19 @@ private struct VoiceOrbWindowRoot: View {
         .onChange(of: expanded) { _, newValue in
             onExpansionChange(newValue)
         }
-        // Follow the *active* run (running OR held), not just
-        // .running. When the user presses Hand off and status
-        // flips to .held, selectedRunningRun goes nil — if we
-        // unbind there, runStatus clears and the Resume button
-        // disappears, leaving the run permanently paused with no
-        // GUI path back. (codex P1 on d684db8.)
-        .onChange(of: controller.selectedActiveRun?.id) { _, _ in
-            liveObserver.bind(to: controller.selectedActiveRun)
+        // Follow `selectedOrbRun`, which extends "active run" to
+        // also include a recently-finished run that's still showing
+        // a skill-proposed chip or just-saved toast. The earlier
+        // codex P1 (d684db8) made us include .held alongside
+        // .running so the Resume button didn't vanish during hand-
+        // off; the present fix extends the same idea to the post-
+        // run reflection events (skill_proposed lands AFTER
+        // task_finished, when the run's status is already .done).
+        .onChange(of: controller.selectedOrbRun?.id) { _, _ in
+            liveObserver.bind(to: controller.selectedOrbRun)
         }
         .task {
-            liveObserver.bind(to: controller.selectedActiveRun)
+            liveObserver.bind(to: controller.selectedOrbRun)
         }
     }
 }

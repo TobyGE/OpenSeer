@@ -200,6 +200,22 @@ final class MainController: ObservableObject {
         }
     }
 
+    /// What the voice orb should be subscribed to. Prefers an active
+    /// run (so live step bubbles update), but falls back to the most
+    /// recent finished run that's still surfacing UI state — pending
+    /// skill proposal or its post-save toast. Without this fallback
+    /// the orb unbinds the moment `task_finished` fires and the
+    /// `skill_proposed` event the daemon emits a heartbeat later
+    /// lands in a RunSession nobody is observing.
+    var selectedOrbRun: RunSession? {
+        if let active = selectedActiveRun { return active }
+        let runs = selectedThread?.sortedRuns ?? []
+        return runs.reversed().first {
+            $0.pendingLesson != nil
+                || ($0.lastAppliedSkillName?.isEmpty == false)
+        }
+    }
+
     /// Toggle hold/resume on whatever active run is selected. Called
     /// from the voice orb's Hold/Resume button.
     func toggleHoldOnSelectedRun() {

@@ -24,6 +24,13 @@ from ..skills import (
 
 
 _SKILL_BLOCK_RE = re.compile(r"```skill-md\s*\n(.*?)\n```", re.DOTALL)
+# Extract the bulleted lesson-learned summary from the reflection
+# markdown so the GUI chip can show the user-facing reason without
+# having to ship them the full reflection text.
+_LESSON_BLOCK_RE = re.compile(
+    r"Lesson learned:\s*\n(.*?)(?:\n\s*Skill update:|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
 _APP_FROM_AX_RE = re.compile(r"accessibility tree\)\s+—\s+(.+)")
 _OPENED_APP_RE = re.compile(r"opened app ['\"](.+?)['\"]")
 _URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?:[/:?#]|$)")
@@ -127,6 +134,19 @@ def extract_skill_block(markdown: str) -> str | None:
     if not m:
         return None
     return m.group(1).strip() + "\n"
+
+
+def extract_lesson_block(markdown: str) -> str:
+    """Pull just the bulleted body under `Lesson learned:`.
+
+    Returned text drops the section header but keeps the `- ...`
+    bullets verbatim. Empty string when the model omitted the
+    section or produced something unparseable.
+    """
+    m = _LESSON_BLOCK_RE.search(markdown or "")
+    if not m:
+        return ""
+    return m.group(1).strip()
 
 
 def _action_summary(action: Any) -> str:
@@ -351,7 +371,22 @@ class RunReflectionCallback(Callback):
                 if self.verbose:
                     print(f"[reflection] could not write "
                           f"expected_skill.txt: {e}")
-            self._maybe_apply_skill(ctx, skill_body, trace_path)
+            # Stash the proposed skill body alongside the run so the
+            # voice orb's deferred apply_skill request can read it
+            # back after the agent loop has exited. The model already
+            # vetted the content during reflection — the GUI never
+            # needs to (and shouldn't) reproduce it.
+            try:
+                (out_dir / "proposed_skill.md").write_text(
+                    skill_body, encoding="utf-8",
+                )
+            except Exception as e:
+                if self.verbose:
+                    print(f"[reflection] could not write "
+                          f"proposed_skill.md: {e}")
+            lesson_text = extract_lesson_block(reflection)
+            self._maybe_apply_skill(ctx, skill_body, trace_path,
+                                    lesson_text=lesson_text)
 
     def _reflect(self, ctx: dict[str, Any], stream_full) -> str:
         history = ctx.get("history") or []
@@ -465,7 +500,9 @@ class RunReflectionCallback(Callback):
         text, _events, _usage = stream_full(payload)
         return text.strip()
 
-    def _maybe_apply_skill(self, ctx: dict[str, Any], skill_body: str, trace_path: Path) -> None:
+    def _maybe_apply_skill(self, ctx: dict[str, Any], skill_body: str,
+                           trace_path: Path,
+                           lesson_text: str = "") -> None:
         parsed = parse_skill_text(skill_body)
         if parsed is None:
             self._append_note(trace_path, "Skill apply skipped: proposed skill body has invalid frontmatter.")
@@ -486,6 +523,33 @@ class RunReflectionCallback(Callback):
             return
 
         if self.mode == "ask":
+            # GUI / voice-orb path: fire SKILL_PROPOSED and let the
+            # user click Save / Discard in the orb. The agentd WS
+            # handler picks up `apply_skill {run_id}` later, reads
+            # proposed_skill.md from disk, and writes via
+            # write_user_skill. We don't block here — the agent
+            # loop's worker thread needs to return so the daemon can
+            # serve the apply request on the same loop.
+            emit_event = ctx.get("_emit_event")
+            if callable(emit_event):
+                run_id = Path(ctx["out_dir"]).name
+                emit_event(
+                    "skill_proposed",
+                    run_id=run_id,
+                    skill_name=parsed.name,
+                    is_new=(self._find_existing_skill(ctx, parsed.name) is None),
+                    lesson=lesson_text,
+                    body=skill_body,
+                    bytes_=len(skill_body),
+                )
+                self._append_note(
+                    trace_path,
+                    f"Skill apply deferred: emitted SKILL_PROPOSED for "
+                    f"`{parsed.name}` ({len(skill_body)} bytes); waiting "
+                    f"for user.",
+                )
+                return
+            # CLI fallback: print preview + input() prompt.
             print()
             print(f"  ◌ proposed skill update: {parsed.name}")
             print(f"    bytes: {len(skill_body)}")
@@ -510,6 +574,11 @@ class RunReflectionCallback(Callback):
                 print(f"  ✓ updated skill {parsed.name} → {res.path}")
         else:
             self._append_note(trace_path, f"Skill apply skipped: {res.error}")
+
+    def _find_existing_skill(self, ctx: dict[str, Any], name: str) -> Any:
+        """Look up `name` in ctx's loaded skill groups; None if not found."""
+        skill_groups = ctx.get("skill_groups") or []
+        return find_skill(skill_groups, name)
 
     def _expected_skill_name(self, ctx: dict[str, Any], proposed_name: str) -> str:
         history = ctx.get("history") or []

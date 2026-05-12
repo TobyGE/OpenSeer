@@ -21,6 +21,15 @@ struct VoiceOrbView: View {
     let isTaskHeld: Bool
     let spokenAnswer: String?
     let liveStep: LiveStepInfo?
+    /// Post-run skill suggestion from the reflection pass. When
+    /// non-nil the orb shows a chip "学到了 — 看看 / 保存 / 算了";
+    /// tapping the chip opens `lessonSheet` with the full SKILL.md
+    /// preview. The daemon side holds the canonical body; this view
+    /// only owns the preview + buttons.
+    let pendingLesson: RunSession.ProposedLesson?
+    /// Briefly shown after a save confirms ("✓ saved foo-com-web").
+    /// MainController clears this after ~5s.
+    let lastAppliedSkillName: String?
     let onSubmit: (String) -> Void
     let onAnswerConsumed: () -> Void
     /// Toggle the hand-off: if running → hold; if held → resume.
@@ -28,7 +37,17 @@ struct VoiceOrbView: View {
     /// Stop the running task entirely (CANCEL sentinel + asyncio
     /// task cancel). Visible only while a task is in progress.
     let onStop: () -> Void
+    /// User accepted the proposed skill — write it to disk.
+    let onApplyLesson: () -> Void
+    /// User declined the proposed skill — drop the sidecar so it
+    /// can't be applied later.
+    let onDiscardLesson: () -> Void
     @Binding var isWindowExpanded: Bool
+
+    /// When true, the lesson chip expands into a sheet showing the
+    /// full SKILL.md body so the user can sanity-check what they're
+    /// about to save.
+    @State private var showLessonSheet: Bool = false
 
     @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
     @StateObject private var input = VoiceInput()
@@ -78,6 +97,11 @@ struct VoiceOrbView: View {
                 }
                 if let displayedAnswer, !displayedAnswer.isEmpty {
                     answerBubble(displayedAnswer)
+                }
+                if let pendingLesson {
+                    lessonChip(pendingLesson)
+                } else if let saved = lastAppliedSkillName, !saved.isEmpty {
+                    lessonSavedChip(saved)
                 }
             }
             Button {
@@ -423,6 +447,122 @@ struct VoiceOrbView: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .shadow(color: .black.opacity(0.16), radius: 14, y: 7)
+    }
+
+    private func lessonChip(
+        _ lesson: RunSession.ProposedLesson
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "graduationcap.fill")
+                    .foregroundStyle(.yellow)
+                Text(lesson.isNew
+                     ? "学到了 — 存为新 skill?"
+                     : "学到了 — 更新 \(lesson.skillName)?")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Button { onDiscardLesson() } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.bold))
+                }
+                .buttonStyle(.borderless)
+                .help("Dismiss without saving")
+            }
+            if !lesson.lesson.isEmpty {
+                Text(lesson.lesson)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 8) {
+                Button { showLessonSheet = true } label: {
+                    Label("Preview", systemImage: "doc.text")
+                }
+                .controlSize(.small)
+                Button { onApplyLesson() } label: {
+                    Label("Save", systemImage: "tray.and.arrow.down")
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(11)
+        .frame(width: 320, alignment: .leading)
+        .background(.regularMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.yellow.opacity(0.30), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .shadow(color: .black.opacity(0.16), radius: 14, y: 7)
+        .sheet(isPresented: $showLessonSheet) {
+            lessonPreviewSheet(lesson)
+        }
+    }
+
+    private func lessonSavedChip(_ name: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+            Text("Saved skill `\(name)`")
+                .font(.caption.weight(.semibold))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .frame(width: 320, alignment: .leading)
+        .background(.regularMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.green.opacity(0.30), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func lessonPreviewSheet(
+        _ lesson: RunSession.ProposedLesson
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "doc.text.fill")
+                Text(lesson.skillName).font(.headline.monospaced())
+                Spacer()
+                Text(lesson.isNew ? "NEW" : "UPDATE")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(lesson.isNew
+                                 ? Color.blue.opacity(0.18)
+                                 : Color.orange.opacity(0.18))
+                    .clipShape(Capsule())
+            }
+            Divider()
+            ScrollView(.vertical) {
+                Text(lesson.body)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 320)
+            HStack {
+                Button("Discard") {
+                    showLessonSheet = false
+                    onDiscardLesson()
+                }
+                Spacer()
+                Button("Cancel") { showLessonSheet = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    showLessonSheet = false
+                    onApplyLesson()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 560, height: 480)
     }
 
     private var transcriptText: String {

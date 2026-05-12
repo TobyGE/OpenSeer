@@ -46,6 +46,17 @@ class EventType:
     AGENT_RESUMED   = "agent_resumed"
     TASK_FINISHED   = "task_finished"
     TASK_FAILED     = "task_failed"
+    # Post-run reflection signals. SKILL_PROPOSED fires when the
+    # reflection pass identified a durable lesson and wrote a
+    # proposed SKILL.md to the run dir, but is waiting for the user
+    # to confirm before persisting. The GUI / voice orb shows a chip
+    # offering Save / Discard / Preview, and replies with
+    # `apply_skill` or `discard_skill` over the agentd WS. CLI users
+    # still get the in-process input() prompt fallback when no event
+    # bridge is wired up.
+    SKILL_PROPOSED  = "skill_proposed"
+    SKILL_APPLIED   = "skill_applied"
+    SKILL_DISCARDED = "skill_discarded"
 
 
 @dataclass

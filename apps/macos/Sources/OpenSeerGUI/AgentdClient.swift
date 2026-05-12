@@ -418,6 +418,30 @@ final class AgentdClient: NSObject {
         }
     }
 
+    /// Persist the SKILL.md the daemon's reflection pass parked at
+    /// `~/.openseer/runs/<runId>/proposed_skill.md`. The body itself
+    /// is on disk on the daemon side; this request just authorizes
+    /// the write. Returns the path the daemon wrote to on success.
+    @discardableResult
+    func applySkill(runId: String) async throws -> String {
+        let ack = try await sendRequest(
+            "apply_skill", payload: ["run_id": runId])
+        guard let path = ack["skill_path"] as? String else {
+            throw AgentdError.badResponse(
+                "apply_skill ack missing skill_path: \(ack)")
+        }
+        return path
+    }
+
+    /// Tell the daemon the user rejected the proposed skill — it
+    /// unlinks the sidecar so the suggestion can't be re-applied
+    /// after dismissal and emits a `skill_discarded` event so any
+    /// stale UI chips clear themselves.
+    func discardSkill(runId: String) async throws {
+        _ = try await sendRequest(
+            "discard_skill", payload: ["run_id": runId])
+    }
+
     /// Start a task on the daemon. Returns the run_id immediately
     /// after the ack; events flow through `onEvent` as the agent
     /// produces them. `onEvent` will see at least one terminator

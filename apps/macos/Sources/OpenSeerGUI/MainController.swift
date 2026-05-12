@@ -214,6 +214,62 @@ final class MainController: ObservableObject {
         selectedActiveRun?.cancel()
     }
 
+    /// Walk the currently-selected thread for a run holding a
+    /// `pendingLesson`. The proposal can land *after* task_finished
+    /// (post-run reflection lives in `on_run_end`), so the run is no
+    /// longer in `.running` state — but it's still the newest run
+    /// on the thread. We pick the latest non-nil-lesson run.
+    private func runWithPendingLesson() -> RunSession? {
+        let runs = selectedThread?.sortedRuns ?? []
+        return runs.reversed()
+            .first { $0.pendingLesson != nil }
+    }
+
+    /// User accepted the post-run skill suggestion. The daemon owns
+    /// the canonical body on disk; we just authorize the write over
+    /// the agentd WS and trust the inbound `skill_applied` event to
+    /// clear the chip on success.
+    func applyPendingLesson() {
+        guard let run = runWithPendingLesson(),
+              let pending = run.pendingLesson else { return }
+        Task { @MainActor in
+            do {
+                _ = try await AgentdClient.shared.applySkill(
+                    runId: pending.runId)
+                // The skill_applied event flips lastAppliedSkillName
+                // and clears pendingLesson; auto-clear the toast after
+                // a few seconds so the orb doesn't keep a stale chip.
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                if run.lastAppliedSkillName == pending.skillName {
+                    run.lastAppliedSkillName = nil
+                    run.objectWillChange.send()
+                }
+            } catch {
+                NSLog("[lesson] applySkill failed: %@", "\(error)")
+                // Leave the chip up so the user can retry; surface the
+                // error inline via the run's errorMessage so it's
+                // visible somewhere debuggable.
+                run.errorMessage = "Save skill failed: \(error)"
+                run.objectWillChange.send()
+            }
+        }
+    }
+
+    /// User dismissed the suggestion. Clear locally first (snappier
+    /// than waiting for the round-trip) and tell the daemon to drop
+    /// the proposed_skill.md sidecar so the same suggestion can't
+    /// re-appear on a stale reconnect.
+    func discardPendingLesson() {
+        guard let run = runWithPendingLesson(),
+              let pending = run.pendingLesson else { return }
+        run.pendingLesson = nil
+        run.objectWillChange.send()
+        Task { @MainActor in
+            try? await AgentdClient.shared.discardSkill(
+                runId: pending.runId)
+        }
+    }
+
     func selectNewestThreadIfNeeded() {
         if selectedThreadID == nil,
            let newest = daemon.threads

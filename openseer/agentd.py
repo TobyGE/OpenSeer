@@ -395,6 +395,109 @@ class _Connection:
             })
             return
 
+        if t in ("apply_skill", "discard_skill"):
+            # Post-run skill-acceptance round-trip. The reflection
+            # callback emits SKILL_PROPOSED and writes
+            # ~/.openseer/runs/<run_id>/proposed_skill.md to disk;
+            # the orb shows a chip; the user clicks Save or Discard;
+            # and the click lands here AFTER the agent's run() loop
+            # has already returned. So everything we need has to be
+            # reconstructable from disk — we can't trust ctx anymore.
+            target = msg.get("run_id")
+            if not target:
+                await self.send({
+                    "type": "error", "request_id": rid,
+                    "error": f"{t}: missing run_id",
+                })
+                return
+            run_dir = Path.home() / ".openseer" / "runs" / target
+            proposed_path = run_dir / "proposed_skill.md"
+            if t == "apply_skill":
+                if not proposed_path.exists():
+                    await self.send({
+                        "type": "error", "request_id": rid,
+                        "error": "no proposed skill for this run",
+                    })
+                    return
+                try:
+                    from .skills import (parse_skill_text,
+                                         write_user_skill)
+                    body = proposed_path.read_text(encoding="utf-8")
+                    parsed = parse_skill_text(body)
+                    if parsed is None:
+                        raise ValueError(
+                            "proposed_skill.md has invalid frontmatter")
+                    # Re-apply the same name guard the reflection
+                    # callback used in-process — the sidecar is the
+                    # body that was vetted, but a stale file could
+                    # otherwise be applied long after the fact.
+                    expected_path = run_dir / "expected_skill.txt"
+                    if expected_path.exists():
+                        expected = expected_path.read_text(
+                            encoding="utf-8").strip()
+                        if expected and parsed.name != expected:
+                            raise ValueError(
+                                f"proposed name `{parsed.name}` does not "
+                                f"match expected `{expected}`")
+                    res = write_user_skill(parsed.name, body,
+                                            dry_run=False)
+                    if not res.ok:
+                        raise ValueError(res.error or "write_user_skill failed")
+                    # Once the skill is on disk we no longer need
+                    # the sidecar; removing it doubles as an idempotency
+                    # guard so a double-click on Save can't write twice.
+                    try:
+                        proposed_path.unlink()
+                    except Exception:
+                        pass
+                    await self.send({
+                        "type": "ack", "request_id": rid,
+                        "skill_name": parsed.name,
+                        "skill_path": str(res.path),
+                    })
+                    await self.send({
+                        "type": "event", "run_id": target,
+                        "event": {
+                            "type": "skill_applied",
+                            "ts": time.time(),
+                            "step": None,
+                            "data": {
+                                "skill_name": parsed.name,
+                                "skill_path": str(res.path),
+                            },
+                        },
+                    })
+                except Exception as e:
+                    log.warning("apply_skill failed for %s: %s",
+                                 target, e)
+                    await self.send({
+                        "type": "error", "request_id": rid,
+                        "error": str(e),
+                    })
+                return
+            # discard_skill
+            try:
+                proposed_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.warning("discard_skill: couldn't unlink %s: %s",
+                             proposed_path, e)
+            await self.send({
+                "type": "ack", "request_id": rid,
+                "discarded": target,
+            })
+            await self.send({
+                "type": "event", "run_id": target,
+                "event": {
+                    "type": "skill_discarded",
+                    "ts": time.time(),
+                    "step": None,
+                    "data": {},
+                },
+            })
+            return
+
         if t == "cancel_task":
             target = msg.get("run_id")
             # Two-pronged stop:

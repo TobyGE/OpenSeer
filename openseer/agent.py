@@ -862,6 +862,12 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
         ev = TaskEvent(type=t, step=ctx.get("step_idx"), data=data)
         for cb in cbs:
             cb.on_event(ctx, ev)
+    # Expose emit through ctx so post-run callbacks (RunReflection,
+    # most notably) can broadcast their own typed events to the ws
+    # bridge / trajectory sink. Without this they'd have to either
+    # block on stdin (breaks for the daemon) or re-import the cbs
+    # list, which is a closure-local detail of this function.
+    ctx["_emit_event"] = emit
 
     def record_step(step) -> None:
         """Append a Step to history and fire BOTH the legacy on_step_recorded

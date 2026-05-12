@@ -30,6 +30,20 @@ final class RunSession: ObservableObject, Identifiable {
     @Published var errorMessage: String? = nil
     @Published private(set) var finalAnswer: String? = nil
     var onFinalAnswer: ((String) -> Void)? = nil
+
+    /// Post-run skill proposal awaiting the user's decision. Set when
+    /// the daemon emits `skill_proposed` (reflection identified a
+    /// durable lesson and wrote `proposed_skill.md` to the run dir);
+    /// cleared on `skill_applied` / `skill_discarded` or when the
+    /// session is replaced. The orb surfaces this as a "学到了 → 存为
+    /// skill?" chip — the read-only payload preview is shown in a
+    /// sheet on tap, and Save / Discard send back `apply_skill` /
+    /// `discard_skill` over the agentd WS.
+    @Published var pendingLesson: ProposedLesson? = nil
+    /// Name of the skill we most recently applied, kept around for ~5
+    /// seconds so the orb can flash a "saved: foo-com-web" toast
+    /// before the chip vanishes entirely.
+    @Published var lastAppliedSkillName: String? = nil
     /// When this session was created in the GUI. Used to order the
     /// session list (newest first). For historical daemon traces
     /// loaded at startup we override this from the run dir's mtime.
@@ -53,6 +67,16 @@ final class RunSession: ObservableObject, Identifiable {
         /// Behaves like running for "is the task still alive"
         /// purposes (the run will resume from where it left off).
         case held
+    }
+
+    /// One pending skill suggestion. `body` is the full SKILL.md the
+    /// model produced (frontmatter + body, validated server-side).
+    struct ProposedLesson: Equatable {
+        let runId: String
+        let skillName: String
+        let isNew: Bool        // create new vs update existing
+        let lesson: String     // bullet-form "Lesson learned" text
+        let body: String       // full SKILL.md preview
     }
 
     private var stream: CLI.StreamHandle?
@@ -397,6 +421,29 @@ final class RunSession: ObservableObject, Identifiable {
             if status == .running { status = .held }
         } else if ev.type == "agent_resumed" {
             if status == .held { status = .running }
+        } else if ev.type == "skill_proposed" {
+            // Reflection identified a durable lesson and dropped a
+            // proposed SKILL.md on disk. Surface a chip the user can
+            // tap to Save / Discard; AgentdClient.applySkill picks it
+            // up from disk later, so the body in the event is just
+            // for the preview sheet.
+            let runId = ev.data["run_id"]?.string ?? traceId ?? ""
+            let name = ev.data["skill_name"]?.string ?? ""
+            if !runId.isEmpty && !name.isEmpty {
+                pendingLesson = ProposedLesson(
+                    runId: runId,
+                    skillName: name,
+                    isNew: ev.data["is_new"]?.bool ?? true,
+                    lesson: ev.data["lesson"]?.string ?? "",
+                    body: ev.data["body"]?.string ?? "")
+            }
+        } else if ev.type == "skill_applied" {
+            // Daemon confirmed the write; flash a toast + clear chip.
+            lastAppliedSkillName = ev.data["skill_name"]?.string
+                ?? pendingLesson?.skillName
+            pendingLesson = nil
+        } else if ev.type == "skill_discarded" {
+            pendingLesson = nil
         }
         // Trigger SwiftUI redraw.
         objectWillChange.send()

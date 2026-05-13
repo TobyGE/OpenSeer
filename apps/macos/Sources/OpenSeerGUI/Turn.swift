@@ -13,7 +13,7 @@ struct Turn: Identifiable {
     /// usually share or refine the same plan.
     var thought: String = ""
     /// Status reflection token at the start of `thought`
-    /// (`[SUCCESS]`, `[INEFFECTIVE]`, `[REGRESSED]`, `[N/A]`).
+    /// (`[SUCCESS]`, `[INEFFECTIVE]`, `[REGRESSED]`, `[THINKING]`).
     var reflection: String = ""
     /// Brief one-liner per executed action in this turn.
     var actions: [Action] = []

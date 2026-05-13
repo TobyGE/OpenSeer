@@ -88,7 +88,7 @@ Every response is ONE JSON object. No prose, no markdown fences, no XML, no mult
   [SUCCESS]      it had the effect you expected
   [INEFFECTIVE]  no observable change
   [REGRESSED]    went the wrong way (modal popped, navigated wrong, etc.)
-  [N/A]          first turn, or non-UI action with no visible state to compare
+  [THINKING]     first turn, or non-UI action with no visible state to compare
 Then a colon, why, and `Next: <plan>`. Be honest — fake SUCCESS labels compound failure.
 
 ## Undoing the previous step

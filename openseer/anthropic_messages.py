@@ -160,7 +160,7 @@ def _to_anthropic_payload(openseer_payload: dict) -> dict:
         "\n"
         "FIELD RULES:\n"
         "  - `thought` (REQUIRED): one short sentence, ≤ 25 words. NOT a paragraph.\n"
-        "    Start with the reflection token: [SUCCESS|INEFFECTIVE|REGRESSED|N/A]\n"
+        "    Start with the reflection token: [SUCCESS|INEFFECTIVE|REGRESSED|THINKING]\n"
         "    Example: \"[SUCCESS] search results loaded. Next: click first 西游记.\"\n"
         "    NOT: long descriptions of what you see (the screenshot is enough).\n"
         "  - `action` XOR `actions` — one or the other.\n"
@@ -171,7 +171,7 @@ def _to_anthropic_payload(openseer_payload: dict) -> dict:
         '  {"thought":"<≤25w>","actions":[{"action":"...","..."}, ...]}\n'
         "\n"
         "CORRECT (copy this exact shape, brevity included):\n"
-        '  {"thought":"[N/A] first turn. Next: open 微信读书.",'
+        '  {"thought":"[THINKING] first turn. Next: open 微信读书.",'
         '"action":"open_app","app":"微信读书"}\n'
         "\n"
         "WRONG — every one of these will break parsing or stall:\n"

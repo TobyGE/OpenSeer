@@ -7,7 +7,7 @@ import SwiftUI
 /// diffing doesn't need to chase nested ObservableObjects.
 struct LiveStepInfo: Equatable {
     let step: Int
-    let reflection: String     // [SUCCESS] / [INEFFECTIVE] / [REGRESSED] / [N/A] / ""
+    let reflection: String     // [SUCCESS] / [INEFFECTIVE] / [REGRESSED] / [THINKING] / ""
     let thought: String
     let action: String?        // last executed action's summary
     let isFailed: Bool          // task_failed → render as red

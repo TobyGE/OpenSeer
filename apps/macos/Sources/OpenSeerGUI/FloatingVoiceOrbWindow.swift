@@ -19,6 +19,13 @@ final class FloatingVoiceOrbWindow {
     @discardableResult
     func toggle(controller: MainController) -> Bool {
         if let panel, panel.isVisible {
+            // Tear down listening + collapse VoiceOrbView's open
+            // state BEFORE hiding the panel. Without this, SFSpeech
+            // / VoiceInput stay live, recording invisibly, and the
+            // next utterance auto-submits a task the user can't see
+            // they were triggering (codex P1 on 8e9cb5e).
+            NotificationCenter.default.post(
+                name: .dismissVoiceOrb, object: nil)
             panel.orderOut(nil)
             return false
         }

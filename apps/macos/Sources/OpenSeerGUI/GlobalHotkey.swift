@@ -106,4 +106,11 @@ extension Notification.Name {
     /// via .onReceive and opens itself.
     static let openVoiceOrb = Notification.Name(
         "openseer.openVoiceOrb")
+    /// Posted when the hotkey is pressed while the orb is already
+    /// onscreen — tells VoiceOrbView to stop the listen loop and
+    /// collapse its open-state BEFORE the panel is orderedOut, so
+    /// SFSpeech/VoiceInput doesn't keep recording invisibly and
+    /// auto-submit a stray utterance after dismissal (codex P1).
+    static let dismissVoiceOrb = Notification.Name(
+        "openseer.dismissVoiceOrb")
 }

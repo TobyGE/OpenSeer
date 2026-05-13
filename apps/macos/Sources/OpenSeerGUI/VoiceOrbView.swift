@@ -180,7 +180,7 @@ struct VoiceOrbView: View {
         }
         .onReceive(NotificationCenter.default.publisher(
             for: .openVoiceOrb)) { _ in
-            // Global cmd+option+O fired (or any other code path
+            // Global cmd+option+S fired (or any other code path
             // wants the orb visible + listening). Open the panel
             // and start the listen loop if it isn't already on.
             if !isOpen {
@@ -191,6 +191,20 @@ struct VoiceOrbView: View {
                 }
             }
             if !autoListen { startLoop() }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .dismissVoiceOrb)) { _ in
+            // Hotkey-toggle dismissal: stop listening + collapse
+            // the open-state so SFSpeech doesn't keep recording
+            // after the panel is hidden. Match the same teardown
+            // path the X button uses (stopLoop + isOpen=false).
+            stopLoop()
+            if isOpen {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    isOpen = false
+                    isWindowExpanded = false
+                }
+            }
         }
         .onChange(of: spokenAnswer) { _, answer in
             guard let answer, !answer.isEmpty else { return }

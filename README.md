@@ -1,22 +1,41 @@
 # OpenSeer
 
-**An open-source Siri for macOS.** Press a hotkey, talk to your Mac,
-watch it drive your apps. Runs locally with your own LLM provider,
+**The next-generation Siri Apple promised — open-source, local-first,
+shipping today.** Press a hotkey, talk to your Mac, watch it drive
+your apps across windows. Runs locally with your own LLM provider,
 remembers what it learns, and gets better at the sites and apps you
 use the most.
 
 **Pre-alpha.** Working internals, reckless edges. It will literally
 take over your mouse and keyboard.
 
-## Why not just use Siri
+## The Siri Apple Intelligence promised
 
-Siri can set timers and open apps. It can't actually *do things* —
-follow a checkout flow on a website, scrub through a list and pick
-the highest-rated result, send a message in the right thread of the
-right group, summarize what's on the screen, or learn the quirks
-of an app you use daily.
+The WWDC 2024 pitch for the next Siri was:
 
-OpenSeer can.
+- Awareness of what's on your screen.
+- Cross-app action — chain things together without you tab-hopping.
+- Personal context — knows your stuff, your history, your habits.
+- Real multi-step tasks instead of one-shot commands.
+
+That Siri has been delayed twice and counting. OpenSeer is what
+that demo looked like, running on your Mac today:
+
+- **On-screen awareness** — every turn dumps the foreground app's
+  accessibility tree, so the agent clicks "the third row" by *name*
+  and *role*, not pixel-guessing from a screenshot.
+- **Cross-app, multi-step** — open one app, click through a flow on
+  another, run a shell command, fetch a page, hand back the result.
+  It chains.
+- **Personal context that compounds** — a `MEMORY.md` of things
+  you've confirmed (default payment, addresses, preferences) +
+  per-site / per-app skill cheat-sheets that *grow themselves* from
+  what worked the last few times you tried something.
+- **Honest about what it did** — every step records the screenshot
+  the model saw, the thought it had, the action it took, and the
+  result. You can inspect, replay, or hand off mid-run.
+- **Open source, your provider, your machine** — no Apple silicon
+  requirement, no Apple cloud, no waiting for a keynote.
 
 ## Install
 

@@ -438,9 +438,21 @@ final class RunSession: ObservableObject, Identifiable {
                     body: ev.data["body"]?.string ?? "")
             }
         } else if ev.type == "skill_applied" {
-            // Daemon confirmed the write; flash a toast + clear chip.
-            lastAppliedSkillName = ev.data["skill_name"]?.string
-                ?? pendingLesson?.skillName
+            // pendingLesson clears unconditionally — the skill IS on
+            // disk now whether the event arrived live or as part of
+            // a historical trace replay. But the "just saved" toast
+            // is meant to be momentary (5s window after the user
+            // clicked Save), so we gate it on event age: replayed
+            // historical events arrive with their original ts, which
+            // is minutes-to-days old. Without the gate, opening a
+            // thread that ever saved a skill would bind the orb
+            // forever to that finished run and show a stale toast.
+            // Codex P2 on 07fd147.
+            let age = Date().timeIntervalSince1970 - ev.ts
+            if age < 60 {
+                lastAppliedSkillName = ev.data["skill_name"]?.string
+                    ?? pendingLesson?.skillName
+            }
             pendingLesson = nil
         } else if ev.type == "skill_discarded" {
             pendingLesson = nil

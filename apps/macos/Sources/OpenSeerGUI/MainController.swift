@@ -252,14 +252,12 @@ final class MainController: ObservableObject {
             do {
                 _ = try await AgentdClient.shared.applySkill(
                     runId: pending.runId)
-                // The skill_applied event flips lastAppliedSkillName
-                // and clears pendingLesson; auto-clear the toast after
-                // a few seconds so the orb doesn't keep a stale chip.
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                if run.lastAppliedSkillName == pending.skillName {
-                    run.lastAppliedSkillName = nil
-                    run.objectWillChange.send()
-                }
+                // The 5s toast-clear is scheduled by RunSession's
+                // ingestEvent when it processes the inbound
+                // `skill_applied` event, so every code path
+                // (including a replayed-on-reload trace within the
+                // toast window) cleans itself up. We do nothing here
+                // on success — let the event stream drive the UI.
             } catch {
                 NSLog("[lesson] applySkill failed: %@", "\(error)")
                 // Leave the chip up so the user can retry; surface the

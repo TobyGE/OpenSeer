@@ -440,18 +440,30 @@ final class RunSession: ObservableObject, Identifiable {
         } else if ev.type == "skill_applied" {
             // pendingLesson clears unconditionally — the skill IS on
             // disk now whether the event arrived live or as part of
-            // a historical trace replay. But the "just saved" toast
-            // is meant to be momentary (5s window after the user
-            // clicked Save), so we gate it on event age: replayed
-            // historical events arrive with their original ts, which
-            // is minutes-to-days old. Without the gate, opening a
-            // thread that ever saved a skill would bind the orb
-            // forever to that finished run and show a stale toast.
-            // Codex P2 on 07fd147.
+            // a historical trace replay. The "just saved" toast on
+            // top of that is momentary by design (5s).
+            //
+            // The clear used to be scheduled by
+            // MainController.applyPendingLesson, but that path only
+            // runs on a live click. Reattaching to a recent trace
+            // replays the skill_applied event without ever calling
+            // applyPendingLesson, so the toast had nothing to turn
+            // it off and the orb stayed bound to the finished run
+            // indefinitely. Now ingestEvent owns the schedule —
+            // every code path that sets lastAppliedSkillName also
+            // schedules its expiry.
+            //
+            // Events older than 5s arrive already-expired, so we
+            // just skip the toast entirely; the 5s window is the
+            // budget for the whole feature anyway.
             let age = Date().timeIntervalSince1970 - ev.ts
-            if age < 60 {
-                lastAppliedSkillName = ev.data["skill_name"]?.string
+            let toastLifetime: TimeInterval = 5
+            if age < toastLifetime {
+                let name = ev.data["skill_name"]?.string
                     ?? pendingLesson?.skillName
+                lastAppliedSkillName = name
+                let remaining = toastLifetime - age
+                scheduleAppliedToastClear(after: remaining, skillName: name)
             }
             pendingLesson = nil
         } else if ev.type == "skill_discarded" {
@@ -459,6 +471,31 @@ final class RunSession: ObservableObject, Identifiable {
         }
         // Trigger SwiftUI redraw.
         objectWillChange.send()
+    }
+
+    /// Schedule a single-shot clear of `lastAppliedSkillName`.
+    /// Called from ingestEvent whenever the toast becomes visible
+    /// so every entry point (live save, replay of a recent event)
+    /// gets cleanup, not just the in-process click. The skillName
+    /// guard prevents an older scheduled clear from wiping a newer
+    /// toast if the user happens to save two skills back to back.
+    private func scheduleAppliedToastClear(after seconds: TimeInterval,
+                                           skillName: String?) {
+        guard seconds > 0 else {
+            lastAppliedSkillName = nil
+            objectWillChange.send()
+            return
+        }
+        let target = skillName
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self else { return }
+            if self.lastAppliedSkillName == target {
+                self.lastAppliedSkillName = nil
+                self.objectWillChange.send()
+            }
+        }
     }
 
     private func json2task(at path: String) -> String? {

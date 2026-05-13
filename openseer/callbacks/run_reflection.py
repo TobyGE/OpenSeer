@@ -280,27 +280,39 @@ def _infer_site_domain(history: list[Any], app_name: str,
 
     for s in history:
         a = s.action
-        # Argv-only fields are always trusted as web-signal sources.
-        argv_fields = [
-            getattr(a, "url", None),
-            getattr(a, "cmd", None),
-            getattr(a, "query", None),
-        ]
-        # Loose fields (thought / text / result / user_text) only feed
-        # the URL counts in browser mode. In strict empty-app mode they
-        # don't, but we still keep them in text_blobs for the
-        # SITE_ALIASES fallback at the bottom.
+        name = getattr(a, "name", "")
+        # Argv (action arguments) for URL detection varies per action:
+        # bash carries its command in `cmd`; web_fetch / read_page in
+        # `url` (with `text` as a fallback the executor accepts —
+        # codex P2 on 13b86b2); web_search in `query` / `text`.
+        # Anything outside this set has no argv we'd trust as a web
+        # anchor.
+        argv_fields: list = []
+        if name == "bash":
+            argv_fields = [getattr(a, "cmd", None)]
+        elif name in ("web_fetch", "read_page"):
+            argv_fields = [getattr(a, "url", None),
+                           getattr(a, "text", None)]
+        elif name == "web_search":
+            argv_fields = [getattr(a, "query", None),
+                           getattr(a, "text", None)]
+        # Loose fields (thought / result / user_text / non-web text)
+        # don't anchor sites in strict empty-app mode, but they still
+        # feed `text_blobs` so SITE_ALIASES below can match.
         loose_fields = [
-            getattr(a, "text", None),
             getattr(a, "thought", None),
             s.result or "",
             getattr(s, "user_text", "") or "",
         ]
+        if not argv_fields:
+            # Action isn't a recognised web action — only its `text`
+            # might still be useful in browser mode (e.g. a `type`
+            # action pasting a URL into the address bar).
+            loose_fields.append(getattr(a, "text", None))
         for value in loose_fields:
             text_blobs.append(str(value or ""))
         if strict_empty_app:
-            name = getattr(a, "name", "")
-            if name not in web_action_names:
+            if not argv_fields:
                 continue
             fields_for_count = argv_fields
         else:

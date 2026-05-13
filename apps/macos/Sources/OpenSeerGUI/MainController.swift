@@ -201,19 +201,21 @@ final class MainController: ObservableObject {
     }
 
     /// What the voice orb should be subscribed to. Prefers an active
-    /// run (so live step bubbles update), but falls back to the most
-    /// recent finished run that's still surfacing UI state — pending
-    /// skill proposal or its post-save toast. Without this fallback
-    /// the orb unbinds the moment `task_finished` fires and the
-    /// `skill_proposed` event the daemon emits a heartbeat later
-    /// lands in a RunSession nobody is observing.
+    /// run (so live step bubbles update), but otherwise just returns
+    /// the most recent run on the thread regardless of status.
+    ///
+    /// Why this — and not "most recent run with pendingLesson":
+    /// `skill_proposed` arrives AFTER `task_finished`, so at the
+    /// moment SwiftUI re-evaluates this property in response to the
+    /// status flip, `pendingLesson` is still nil. A "look for the
+    /// pendingLesson" rule would unbind here and miss the event
+    /// landing a heartbeat later. Binding to the last run instead
+    /// keeps the observer subscribed across the whole post-run
+    /// window, and the next start_task naturally replaces it via
+    /// the active-run path.
     var selectedOrbRun: RunSession? {
         if let active = selectedActiveRun { return active }
-        let runs = selectedThread?.sortedRuns ?? []
-        return runs.reversed().first {
-            $0.pendingLesson != nil
-                || ($0.lastAppliedSkillName?.isEmpty == false)
-        }
+        return selectedThread?.sortedRuns.last
     }
 
     /// Toggle hold/resume on whatever active run is selected. Called

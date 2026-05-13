@@ -470,19 +470,24 @@ def _validate_done(action: Action, history: list["Step"]) -> str | None:
 
     cited = action.verified_by_steps or []
     if not cited:
-        # Auto-fill path: the model emitted `terminate(done, reason=…)`
-        # without remembering verified_by_steps, but there ARE
-        # producing actions in history. Empirically the model forgets
-        # this field roughly a third of the time on multi-step
-        # research tasks, and the resulting "reject + re-emit" wastes
-        # a whole step (model call + screenshot + AX dump). The
-        # validator already knows the right answer — it's right there
-        # in `producing_in_history`. Fill it in instead of forcing a
-        # retry. We still reject when NO producing actions exist
-        # (the original safety: model can't claim done without any
-        # evidence at all), so this stays strict on the case that
-        # actually matters.
-        if producing_in_history:
+        # Auto-fill path: the model forgot verified_by_steps but
+        # has actually done producing work AND is signalling success
+        # in its reflection token. The validator already knows the
+        # right answer (it's in `producing_in_history`); filling it
+        # in skips a wasted re-emit step.
+        #
+        # Gating on `[SUCCESS]` is what keeps the contract honest:
+        # if the model wrote `[INEFFECTIVE]` / `[REGRESSED]` /
+        # `[THINKING]` on a terminate, it's NOT attesting that any
+        # prior step produced the answer — that's exactly the case
+        # we want to reject and make it cite explicitly (or, more
+        # often, keep working). Codex P2 on 4f0dbf3: an unrelated
+        # producing action (wrong-control click, opened the wrong
+        # app) would otherwise get auto-cited and let a hallucinated
+        # done slip through.
+        thought = (action.thought or "").strip()
+        success_reflected = thought.upper().startswith("[SUCCESS]")
+        if producing_in_history and success_reflected:
             idxs = [int(p.split("(")[0]) for p in producing_in_history]
             action.verified_by_steps = idxs
             return None

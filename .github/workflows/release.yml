@@ -5,6 +5,12 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: "Also publish artifacts to PyPI (Trusted Publishing). Tag pushes always publish; this flag only matters for manual runs."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -78,3 +84,35 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Tag pushes always publish; manual `workflow_dispatch` runs only
+    # publish when the `publish_pypi` input is set, per RELEASING.md.
+    # PyPI is irreversible (yank only) so the manual path stays opt-in.
+    if: >-
+      github.event_name == 'push'
+      || (github.event_name == 'workflow_dispatch'
+          && inputs.publish_pypi)
+    # PyPI Trusted Publishing matches the GitHub OIDC token against
+    # the (owner, repo, workflow, environment) the project trusts.
+    # RELEASING.md documents these as: TobyGE / OpenSeer /
+    # release.yml / pypi. The id-token: write permission is what
+    # lets the OIDC handshake happen.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/openseer/
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download distribution artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distribution
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

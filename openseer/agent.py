@@ -470,6 +470,22 @@ def _validate_done(action: Action, history: list["Step"]) -> str | None:
 
     cited = action.verified_by_steps or []
     if not cited:
+        # Auto-fill path: the model emitted `terminate(done, reason=…)`
+        # without remembering verified_by_steps, but there ARE
+        # producing actions in history. Empirically the model forgets
+        # this field roughly a third of the time on multi-step
+        # research tasks, and the resulting "reject + re-emit" wastes
+        # a whole step (model call + screenshot + AX dump). The
+        # validator already knows the right answer — it's right there
+        # in `producing_in_history`. Fill it in instead of forcing a
+        # retry. We still reject when NO producing actions exist
+        # (the original safety: model can't claim done without any
+        # evidence at all), so this stays strict on the case that
+        # actually matters.
+        if producing_in_history:
+            idxs = [int(p.split("(")[0]) for p in producing_in_history]
+            action.verified_by_steps = idxs
+            return None
         return ("`done` requires `verified_by_steps` listing prior step indices "
                 "where you actively produced this result. You provided none."
                 + suggestion)

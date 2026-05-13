@@ -245,39 +245,67 @@ def _infer_site_domain(history: list[Any], app_name: str,
     # knowledge belongs on the app skill, not on whatever domain
     # showed up incidentally.
     app_lc = (app_name or "").strip().lower()
-    if app_lc and app_lc not in _BROWSER_APPS:
+    is_browser = app_lc in _BROWSER_APPS
+    if app_lc and not is_browser:
         return ""
+    # Strict mode for empty-app tasks: only count URLs that appear in
+    # a *web-touching action's own arguments* (cmd / url / query).
+    # Without this, a bash that incidentally prints a URL — e.g. an
+    # error traceback mentioning docs.python.org — would pretend to
+    # be a "docs-python-org-web" task and propose updates to whatever
+    # existing skill matched. Browser mode keeps the broader scan
+    # because the active app already guarantees web context.
+    # (codex P2 on 760440a.)
+    strict_empty_app = not is_browser
+    web_action_names = {"bash", "web_fetch", "web_search", "read_page"}
     for pat, domain in _SITE_ALIASES:
         if pat.search(task_text or ""):
             return domain
     text_blobs = [task_text or ""]
     counts: dict[str, int] = {}
 
-    # Primary signal: URLs the agent loop actually probed via
-    # _browser_current_url() each turn. Step.user_text (which would
-    # contain the page-content block's URL line) isn't persisted on
-    # Step objects, and clicks don't carry their target URL on
-    # themselves, so without this list inference is effectively
-    # blind on most browser tasks.
-    for url in visited_urls or []:
-        for m in _URL_RE.finditer(str(url or "")):
-            domain = _domain_from_host(m.group(1))
-            if not domain or domain in _IGNORED_INFERENCE_DOMAINS:
-                continue
-            counts[domain] = counts.get(domain, 0) + 1
+    # Primary signal for browser flows: URLs the agent loop actually
+    # probed via `_browser_current_url()` each turn. Step.user_text
+    # (which would contain the page-content block's URL line) isn't
+    # persisted on Step objects, and clicks don't carry their target
+    # URL, so without this list inference is effectively blind on
+    # most browser tasks.
+    if is_browser:
+        for url in visited_urls or []:
+            for m in _URL_RE.finditer(str(url or "")):
+                domain = _domain_from_host(m.group(1))
+                if not domain or domain in _IGNORED_INFERENCE_DOMAINS:
+                    continue
+                counts[domain] = counts.get(domain, 0) + 1
 
     for s in history:
         a = s.action
-        fields = [
+        # Argv-only fields are always trusted as web-signal sources.
+        argv_fields = [
             getattr(a, "url", None),
-            getattr(a, "text", None),
             getattr(a, "cmd", None),
+            getattr(a, "query", None),
+        ]
+        # Loose fields (thought / text / result / user_text) only feed
+        # the URL counts in browser mode. In strict empty-app mode they
+        # don't, but we still keep them in text_blobs for the
+        # SITE_ALIASES fallback at the bottom.
+        loose_fields = [
+            getattr(a, "text", None),
             getattr(a, "thought", None),
             s.result or "",
             getattr(s, "user_text", "") or "",
         ]
-        for value in fields:
+        for value in loose_fields:
             text_blobs.append(str(value or ""))
+        if strict_empty_app:
+            name = getattr(a, "name", "")
+            if name not in web_action_names:
+                continue
+            fields_for_count = argv_fields
+        else:
+            fields_for_count = argv_fields + loose_fields
+        for value in fields_for_count:
             for m in _URL_RE.finditer(str(value or "")):
                 domain = _domain_from_host(m.group(1))
                 if not domain or domain in _IGNORED_INFERENCE_DOMAINS:

@@ -50,8 +50,18 @@ final class MainController: ObservableObject {
             if nowVisible {
                 if let ctx { self.recordHotkeyContext(ctx) }
                 NSApp.activate(ignoringOtherApps: true)
-                NotificationCenter.default.post(
-                    name: .openVoiceOrb, object: nil)
+                // Defer the `.openVoiceOrb` post one runloop tick.
+                // On the *first* hotkey after launch (or after a
+                // prior dismissal), toggle() builds the
+                // NSHostingView and SwiftUI registers VoiceOrbView's
+                // `.onReceive` only after the next mount pass — a
+                // synchronous post here can race and miss, leaving
+                // the orb visible but collapsed with no listening.
+                // (Codex P2 on v0.1.7.)
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(
+                        name: .openVoiceOrb, object: nil)
+                }
             }
         }
     }

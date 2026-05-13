@@ -281,16 +281,25 @@ def _infer_site_domain(history: list[Any], app_name: str,
     for s in history:
         a = s.action
         name = getattr(a, "name", "")
-        # Argv (action arguments) for URL detection varies per action:
-        # bash carries its command in `cmd`; web_fetch / read_page in
-        # `url` (with `text` as a fallback the executor accepts —
-        # codex P2 on 13b86b2); web_search in `query` / `text`.
+        # Argv (action arguments) for URL detection — match the
+        # executor's own field-acceptance rules per action so we
+        # don't anchor a domain on an arg the executor would have
+        # ignored:
+        #   bash        executor reads `cmd`
+        #   web_fetch   `action.url or action.text` (executor.py:736)
+        #   web_search  `action.query or action.text`
+        #   read_page   ONLY `action.url` — text is NOT a fallback
+        #               here (codex P2 on 9464205), so trusting
+        #               text would target a `<domain>-web` skill for
+        #               a page that was never actually fetched.
         # Anything outside this set has no argv we'd trust as a web
         # anchor.
         argv_fields: list = []
         if name == "bash":
             argv_fields = [getattr(a, "cmd", None)]
-        elif name in ("web_fetch", "read_page"):
+        elif name == "read_page":
+            argv_fields = [getattr(a, "url", None)]
+        elif name == "web_fetch":
             argv_fields = [getattr(a, "url", None),
                            getattr(a, "text", None)]
         elif name == "web_search":

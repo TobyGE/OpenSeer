@@ -34,18 +34,25 @@ final class MainController: ObservableObject {
         AgentdClient.shared.askUserHandler = { [weak self] req in
             await self?.respondToAskUser(req) ?? nil
         }
-        // Global cmd+option+O — open the voice orb + listen, with
-        // the currently frontmost app captured as session context.
+        // Global cmd+option+S — toggle the voice orb's visibility.
+        // Summon: shows the panel + captures the frontmost app as
+        // session context + posts the open notification so the orb
+        // starts listening. Dismiss: hides the panel entirely so it
+        // doesn't take screen space when the user isn't using it.
         GlobalHotkey.shared.install { [weak self] in
             guard let self else { return }
-            if let ctx = FrontmostCapture.capture() {
-                self.recordHotkeyContext(ctx)
+            // Capture frontmost BEFORE NSApp.activate flips the
+            // frontmost to OpenSeer itself. We only need it on the
+            // summon path; on dismiss the captured value is ignored.
+            let ctx = FrontmostCapture.capture()
+            let nowVisible = FloatingVoiceOrbWindow.shared
+                .toggle(controller: self)
+            if nowVisible {
+                if let ctx { self.recordHotkeyContext(ctx) }
+                NSApp.activate(ignoringOtherApps: true)
+                NotificationCenter.default.post(
+                    name: .openVoiceOrb, object: nil)
             }
-            // Bring OpenSeer (and the orb's NSPanel) forward and
-            // post the open notification — VoiceOrbView listens.
-            NSApp.activate(ignoringOtherApps: true)
-            NotificationCenter.default.post(
-                name: .openVoiceOrb, object: nil)
         }
     }
 

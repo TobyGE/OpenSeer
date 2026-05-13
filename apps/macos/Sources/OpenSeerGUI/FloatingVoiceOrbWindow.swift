@@ -12,6 +12,20 @@ final class FloatingVoiceOrbWindow {
 
     private init() {}
 
+    /// Toggle the floating orb's visibility. Returns `true` if the
+    /// panel is now visible, `false` if hidden. Called from the
+    /// global hotkey: same key summons and dismisses the orb so it
+    /// only occupies screen space when the user wants it there.
+    @discardableResult
+    func toggle(controller: MainController) -> Bool {
+        if let panel, panel.isVisible {
+            panel.orderOut(nil)
+            return false
+        }
+        show(controller: controller)
+        return true
+    }
+
     func show(controller: MainController) {
         guard acquireInstanceLockIfNeeded() else { return }
         let root = VoiceOrbWindowRoot(

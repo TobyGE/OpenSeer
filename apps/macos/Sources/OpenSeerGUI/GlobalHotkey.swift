@@ -1,7 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// System-wide cmd+option+O hotkey that wakes the voice orb from any
+/// System-wide cmd+option+S hotkey that toggles the voice orb from any
 /// app. Uses Carbon's RegisterEventHotKey because it's the only path
 /// that actually consumes the keystroke (NSEvent global monitor can
 /// observe but not block, so the focused app would also receive it).
@@ -15,7 +15,7 @@ final class GlobalHotkey {
 
     private init() {}
 
-    /// Install the handler + register cmd+option+O. Returns true on
+    /// Install the handler + register cmd+option+S. Returns true on
     /// success. Safe to call once at app launch; no-op on subsequent
     /// calls (we only register a single binding for now).
     @discardableResult
@@ -52,12 +52,11 @@ final class GlobalHotkey {
             return false
         }
 
-        // Cmd+Option+O. The user can rebind later by editing
-        // settings; the default avoids common system / app
-        // shortcuts but is still close enough to "O for OpenSeer"
-        // to be memorable.
+        // Cmd+Option+S. "S for Seer / Summon". Cmd+Option keeps
+        // us out of the cmd+S "save" namespace every app uses,
+        // and option-S isn't commonly bound either.
         let modifiers: UInt32 = UInt32(cmdKey | optionKey)
-        let keyCode: UInt32 = UInt32(kVK_ANSI_O)
+        let keyCode: UInt32 = UInt32(kVK_ANSI_S)
         // Signature is an OSType (FourCharCode) — any unique 32-bit
         // value will do. We use 'OSRH' = OpenSeer Hotkey so
         // collision with another app is essentially impossible.
@@ -73,7 +72,7 @@ final class GlobalHotkey {
             return false
         }
         hotKeyRef = ref
-        NSLog("[hotkey] registered cmd+option+O")
+        NSLog("[hotkey] registered cmd+option+S")
         return true
     }
 }

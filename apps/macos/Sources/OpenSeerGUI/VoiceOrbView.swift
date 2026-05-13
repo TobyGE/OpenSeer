@@ -711,7 +711,8 @@ struct VoiceOrbView: View {
             let repeatedTooSoon = text == lastSubmitted
                 && Date().timeIntervalSince(lastSubmittedAt) < 2.5
             guard !text.isEmpty, !repeatedTooSoon else {
-                if autoListen { startListeningIfIdle() }
+                // Empty / repeat: don't re-arm. The user can press
+                // Listen again if they meant to try once more.
                 return
             }
             lastSubmitted = text
@@ -723,13 +724,16 @@ struct VoiceOrbView: View {
             lastSeenTranscript = ""
             input.resetTranscript()
             isEditingDraft = false
-            autoListen = true
             onSubmit(text)
-            // Re-arm the mic immediately after submit so a follow-up
-            // utterance can interrupt the new task. Previously this
-            // only happened on isTaskRunning → false; with barge-in
-            // we want it now.
-            startListeningIfIdle()
+            // The submit either started a fresh task or triggered
+            // barge-in on a running one. Either way a task is now
+            // executing — match the "mic off during execution"
+            // policy explicitly. If isTaskRunning was already true
+            // (barge-in path), the onChange in body never sees a
+            // false→true edge and wouldn't call stopLoop on its own,
+            // so we do it here. The user must press Listen again to
+            // re-engage. (codex P2 from 6c7c55e.)
+            stopLoop()
         }
     }
 }

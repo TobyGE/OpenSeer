@@ -34,14 +34,14 @@ final class GlobalHotkey {
         let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             { (_, _, userData) -> OSStatus in
-                // Carbon callback runs on the main thread already
-                // but isn't declared @MainActor-safe; hop through
-                // DispatchQueue.main.async to be explicit.
+                // Carbon callback isn't declared @MainActor-safe;
+                // hop through a main-actor task instead of assuming
+                // isolation from a C callback.
                 guard let userData else { return noErr }
                 let hk = Unmanaged<GlobalHotkey>.fromOpaque(userData)
                     .takeUnretainedValue()
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated { hk.onTrigger() }
+                Task { @MainActor in
+                    hk.onTrigger()
                 }
                 return noErr
             },

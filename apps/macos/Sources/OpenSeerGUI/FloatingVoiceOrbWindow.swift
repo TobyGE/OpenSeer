@@ -52,7 +52,7 @@ final class FloatingVoiceOrbWindow {
 
         let panel = VoiceOrbPanel(
             contentRect: hosting.frame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
@@ -73,6 +73,7 @@ final class FloatingVoiceOrbWindow {
         self.panel = panel
         self.hosting = hosting
         place(panel)
+        NSApp.activate(ignoringOtherApps: true)
         panel.orderFrontRegardless()
     }
 

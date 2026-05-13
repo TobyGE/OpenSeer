@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 _PROTOCOL_VERSION = "2024-11-05"
 _SERVER_NAME = "openseer"
-_SERVER_VERSION = "0.1.7"
+_SERVER_VERSION = "0.1.8"
 
 
 # Tool registry — each entry has metadata for the host's `tools/list`

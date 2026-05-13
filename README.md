@@ -9,6 +9,27 @@ use the most.
 **Pre-alpha.** Working internals, reckless edges. It will literally
 take over your mouse and keyboard.
 
+Press `⌘⌥S` from anywhere and the orb floats in with the mic on:
+
+<p align="center">
+  <img src="docs/screenshots/orb-listening.png"
+       alt="Voice orb listening — title 'Voice', red 'Listening. Pause briefly to send.' status, transcript 'order ramen from ubereats', Pause / Undo / Send buttons."
+       width="520" />
+</p>
+
+Hit Send (or just pause briefly). The mic shuts off so ambient
+noise doesn't barge in, the orb shows its current step inline, and
+you can take over at any time with **Hand off** or **Stop**:
+
+<p align="center">
+  <img src="docs/screenshots/orb-working.png"
+       alt="Voice orb working — blue 'Working. Voice will resume when the task ends.' status, Listen / Hand-off / Stop / Undo / Send row, step-1 thought bubble: '[THINKING]: Need browse Uber Eats and collect options; purchase will require confirmation. Next: open Uber Eats in browser.' followed by '→ bash bash:'."
+       width="520" />
+</p>
+
+Press `⌘⌥S` again to dismiss the orb entirely — no invisible
+recording, no leftover panel.
+
 ## The Siri Apple Intelligence promised
 
 The WWDC 2024 pitch for the next Siri was:

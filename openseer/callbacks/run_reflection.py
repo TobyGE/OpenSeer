@@ -415,16 +415,22 @@ def _load_prior_run_digests(out_dir: Path, site_domain: str,
         matched = False
         if needle_site and needle_site in blob:
             matched = True
-        elif needle_app and needle_app in blob:
+        elif (not needle_site) and needle_app and needle_app in blob:
+            # App-only path: only valid when we don't have a more
+            # specific site target. A generic "Google Chrome" needle
+            # would otherwise pull every Chrome run (Gmail, GitHub,
+            # …) into an x.com reflection as if they were priors,
+            # contaminating the cross-run evidence. (Codex P2.)
             matched = True
         # transcript steps only carry action results
         # (`scrolled at (790,834)`), not AX text or URLs — so a
-        # scroll-only X run wouldn't match either needle even though
-        # it was clearly on x.com. Fall back to the run's
-        # `events.jsonl`, where every step emits a `prep_phase
-        # ax_done` event with the frontmost app in its `data`. This
-        # is cheap line-by-line — no JSON parse per line.
-        if not matched and (needle_site or needle_app):
+        # scroll-only X run wouldn't match by transcript blob alone.
+        # Fall back to the run's `events.jsonl`, where every step
+        # emits a `prep_phase ax_done` event whose payload contains
+        # the frontmost app name AND the AX header line for the
+        # active tab (which carries the site URL). Cheap line-by-
+        # line — no JSON parse per line.
+        if not matched:
             ev_path = p / "events.jsonl"
             if ev_path.exists():
                 try:
@@ -433,12 +439,36 @@ def _load_prior_run_digests(out_dir: Path, site_domain: str,
                             if "ax_done" not in line:
                                 continue
                             low = line.lower()
-                            if needle_app and needle_app in low:
-                                matched = True
-                                break
+                            # site_domain is the primary signal —
+                            # if it appears anywhere in the AX text
+                            # of any step, the run was on that site.
                             if needle_site and needle_site in low:
                                 matched = True
                                 break
+                            # Fall back to app-name only when there
+                            # is NO site_domain to filter on (native
+                            # macOS app task).
+                            if (not needle_site) and needle_app \
+                                    and needle_app in low:
+                                matched = True
+                                break
+                except OSError:
+                    pass
+        # Last-resort scan: step01-input.json contains the model's
+        # full prompt for the first turn, which includes the page-
+        # content block and AX dump — that's where URLs live for
+        # scroll-only browser runs whose action result strings don't
+        # carry them. The agent loop's `_browser_urls_visited` cache
+        # isn't persisted to events.jsonl today, so this is the only
+        # path for matching e.g. five scrolls on x.com.
+        if not matched and needle_site:
+            inp_path = p / "step01-input.json"
+            if inp_path.exists():
+                try:
+                    head = inp_path.read_text(
+                        encoding="utf-8", errors="replace")[:100_000]
+                    if needle_site in head.lower():
+                        matched = True
                 except OSError:
                     pass
         if not matched:

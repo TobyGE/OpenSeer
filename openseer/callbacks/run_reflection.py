@@ -232,7 +232,20 @@ def canonical_site_skill_name(domain: str) -> str:
 def _infer_site_domain(history: list[Any], app_name: str,
                        task_text: str = "",
                        visited_urls: list[str] | None = None) -> str:
-    if (app_name or "").strip().lower() not in _BROWSER_APPS:
+    # Site detection runs for two task shapes:
+    #   (a) browser-driven flows — app_name is Chrome / Safari / etc.
+    #       and URLs come from `_browser_current_url()`.
+    #   (b) bash / web_fetch / read_page flows — app_name is empty
+    #       because the task never opened a native app, but URLs
+    #       still show up in `action.cmd` / `action.url` / step
+    #       results. These earn site skills too (arxiv-org-web,
+    #       api-github-com-web, …).
+    # A non-empty app_name that ISN'T a browser still bails — that's
+    # a native-app task (WeChat, Calculator, …) and the durable
+    # knowledge belongs on the app skill, not on whatever domain
+    # showed up incidentally.
+    app_lc = (app_name or "").strip().lower()
+    if app_lc and app_lc not in _BROWSER_APPS:
         return ""
     for pat, domain in _SITE_ALIASES:
         if pat.search(task_text or ""):
@@ -428,19 +441,22 @@ class RunReflectionCallback(Callback):
             1 for s in history
             if getattr(s.action, "name", "") in ("click", "type", "key", "scroll", "open_app")
         )
-        # Bash / web_fetch actions whose cmd or url mentions the inferred
-        # site count as "substantive engagement" too. Without this,
-        # API-scraping flows (curl + python on youtube.com /
-        # api.example.com / raw.githubusercontent.com) have ui_actions = 0
+        # Web-touching actions whose cmd / url / result mentions the
+        # inferred site count as "substantive engagement". Without
+        # this, API-scraping / page-reading flows (curl + python on
+        # youtube.com, read_page on arxiv.org, …) have ui_actions=0
         # and never propose a skill — even when the run discovered a
         # durable footgun like "the YouTube timedtext caption endpoint
-        # returns empty bytes; scrape shortDescription instead". Those
-        # are exactly the lessons users complain about repeating.
+        # returns empty bytes; scrape shortDescription instead" or
+        # "bs4 isn't installed; use stdlib parsing on arXiv HTML".
+        # `read_page` matters here: agentd's HTML-fetch primitive
+        # doesn't ride through `bash` so it'd be excluded otherwise.
         domain_bash_actions = 0
         if site_domain:
             for s in history:
                 name = getattr(s.action, "name", "")
-                if name not in ("bash", "web_fetch", "web_search"):
+                if name not in ("bash", "web_fetch", "web_search",
+                                 "read_page"):
                     continue
                 blob = " ".join([
                     str(getattr(s.action, "cmd", "") or ""),

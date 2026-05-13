@@ -454,23 +454,46 @@ def _load_prior_run_digests(out_dir: Path, site_domain: str,
                                 break
                 except OSError:
                     pass
-        # Last-resort scan: step01-input.json contains the model's
-        # full prompt for the first turn, which includes the page-
-        # content block and AX dump — that's where URLs live for
-        # scroll-only browser runs whose action result strings don't
-        # carry them. The agent loop's `_browser_urls_visited` cache
-        # isn't persisted to events.jsonl today, so this is the only
-        # path for matching e.g. five scrolls on x.com.
+        # Last-resort scan: step01-input.json's user-input content
+        # (page-content block + AX dump). The full file ALSO has
+        # `instructions` (system prompt with the skill index — which
+        # mentions skill names like "x-com-web" or descriptions
+        # containing "x.com") plus session context from earlier
+        # tasks. Scanning the whole file would let any unrelated run
+        # match `x.com` just because the bundled skill catalog
+        # mentions it (codex P2 on 4bdee96). Restrict to the model
+        # input's user content, which is where the live page URL
+        # actually lives for browser runs.
         if not matched and needle_site:
             inp_path = p / "step01-input.json"
             if inp_path.exists():
                 try:
-                    head = inp_path.read_text(
-                        encoding="utf-8", errors="replace")[:100_000]
-                    if needle_site in head.lower():
+                    inp_data = json.loads(inp_path.read_text(
+                        encoding="utf-8"))
+                except (OSError, ValueError):
+                    inp_data = None
+                if isinstance(inp_data, dict):
+                    user_blob_parts: list[str] = []
+                    for item in inp_data.get("input") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("role") != "user":
+                            continue
+                        content = item.get("content")
+                        if isinstance(content, str):
+                            user_blob_parts.append(content)
+                        elif isinstance(content, list):
+                            for c in content:
+                                if not isinstance(c, dict):
+                                    continue
+                                if c.get("type") == "input_text":
+                                    user_blob_parts.append(
+                                        str(c.get("text") or ""))
+                    # Cap total scanned text so a giant page dump
+                    # doesn't blow this up; 100 KB is plenty.
+                    user_blob = " ".join(user_blob_parts)[:100_000]
+                    if needle_site in user_blob.lower():
                         matched = True
-                except OSError:
-                    pass
         if not matched:
             continue
         # Build a compact digest. Use the same fields the per-run

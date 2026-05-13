@@ -218,12 +218,17 @@ class TrajectoryCallback(Callback):
             "last_reason": (last.action.reason if last else None),
         }, indent=2, ensure_ascii=False))
 
-        # close streaming events.jsonl
-        if self._events_fh is not None:
-            try:
-                self._events_fh.close()
-            finally:
-                self._events_fh = None
+        # We intentionally do NOT close `events.jsonl` here. The
+        # RunReflection callback fires after us in the on_run_end
+        # pass and emits `skill_proposed` / `skill_applied` /
+        # `skill_discarded`, which need to land in the trace too so
+        # the orb can resurrect a pending chip on reconnect. Closing
+        # now drops those into a closed file handle and they vanish
+        # from disk (codex P2 on the v0.1.6 tag push). The fh is
+        # owned by this Callback instance and gets cleaned up when
+        # `cbs` goes out of scope at the end of `agent.run()` — file-
+        # descriptor lifetime is bounded by run duration, not by
+        # daemon lifetime.
 
         if self.verbose:
             print(f"\n[agent] wrote {out_dir / 'transcript.json'}")

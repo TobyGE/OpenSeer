@@ -178,18 +178,22 @@ struct VoiceOrbView: View {
             }
         }
         .onChange(of: isTaskRunning) { _, running in
-            // Barge-in: keep the mic open while a task is running so
-            // the user can interrupt. The next autoCommit (or Send
-            // button) calls back into MainController.submitPrompt,
-            // which cancels the in-flight run and re-calls the LLM
-            // with the new message + the interrupted run's state in
-            // the session context.
+            // When a task starts executing the mic goes silent. The
+            // user must press Listen to re-engage if they want to
+            // interrupt; pressing it and speaking triggers the same
+            // barge-in path that's always existed
+            // (MainController.submitPrompt cancels the in-flight run
+            // and re-calls the LLM with the new message + the
+            // interrupted run's state in the session context). The
+            // old "stay listening through the run" behavior caused
+            // accidental commits — coughing, the user's own thinking-
+            // out-loud, hands-free chatter — to silently kill running
+            // tasks.
             //
-            // When a task finishes (running -> false) and the mic
-            // *isn't* recording (e.g. user paused it manually), the
-            // existing auto-restart still kicks back in.
-            if !running && autoListen && !input.isRecording {
-                startListeningIfIdle()
+            // Stay off after the task finishes too; only the explicit
+            // Listen button re-arms the loop.
+            if running {
+                stopLoop()
             }
             isWindowExpanded = isOpen
         }
@@ -257,12 +261,29 @@ struct VoiceOrbView: View {
             // via .onChange(of: input.transcript); the user can fix
             // recognition errors before hitting Send. Once they edit,
             // auto-overwrite stops (see the onChange handler).
+            //
+            // IME (Pinyin / Kotoeri / etc.) gotcha: the orb's panel
+            // is a `.nonactivatingPanel`, so a click into TextEditor
+            // makes the panel key without activating our app, and
+            // macOS's input method server attaches its candidate
+            // window to the *active* app — which is whatever was
+            // foreground before. Visible symptom: Chinese typing
+            // works, but the candidate popup is invisible (you
+            // can't pick characters). Activating the app when the
+            // editor gains focus pulls the IME panel onto our text
+            // view; when the user dismisses focus, the foreground
+            // app gets its IME back naturally.
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $draftText)
                     .font(.callout)
                     .focused($isEditingDraft)
                     .scrollContentBackground(.hidden)
                     .frame(height: 70)
+                    .onChange(of: isEditingDraft) { _, focused in
+                        if focused {
+                            NSApp.activate(ignoringOtherApps: true)
+                        }
+                    }
                 if draftText.isEmpty {
                     // Empty-state hint sits behind the TextEditor.
                     // .allowsHitTesting(false) so clicks pass

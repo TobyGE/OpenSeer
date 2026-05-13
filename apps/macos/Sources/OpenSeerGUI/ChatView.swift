@@ -60,7 +60,7 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 if let t = selectedThread {
-                    ThreadBlock(thread: t)
+                    ThreadBlock(thread: t, controller: controller)
                         .padding(16)
                         .id(t.id)
                 } else {
@@ -217,27 +217,41 @@ private struct PressDimStyle: ButtonStyle {
 /// local runs each Send still spawns a fresh thread.
 private struct ThreadBlock: View {
     @ObservedObject var thread: ChatThread
+    @ObservedObject var controller: MainController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             ForEach(thread.sortedRuns) { run in
-                RunBlock(run: run, showFooter: thread.runs.count > 1
-                            || run.status != .done)
+                RunBlock(run: run,
+                         showFooter: thread.runs.count > 1
+                            || run.status != .done,
+                         controller: controller)
             }
         }
     }
 }
 
-/// One run's bubbles + (optional) footer.
+/// One run's bubbles + (optional) footer. Renders the lesson chip
+/// after the last turn so the post-run skill proposal lands directly
+/// under the answer bubble in the conversation flow, not as a
+/// separate UI surface on the orb. (The orb used to show a chip too;
+/// chat-bubble placement makes the suggestion discoverable when the
+/// user is looking at the conversation rather than the floating
+/// orb.)
 private struct RunBlock: View {
     @ObservedObject var run: RunSession
     let showFooter: Bool
+    @ObservedObject var controller: MainController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(run.turns) { t in
                 BubbleView(turn: t)
             }
+            LessonBubble(
+                run: run,
+                onApply: { controller.applyPendingLesson(on: run) },
+                onDiscard: { controller.discardPendingLesson(on: run) })
             if showFooter {
                 SessionFooter(session: run)
             }

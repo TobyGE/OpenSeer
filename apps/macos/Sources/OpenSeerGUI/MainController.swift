@@ -248,8 +248,15 @@ final class MainController: ObservableObject {
     /// the agentd WS and trust the inbound `skill_applied` event to
     /// clear the chip on success.
     func applyPendingLesson() {
-        guard let run = runWithPendingLesson(),
-              let pending = run.pendingLesson else { return }
+        guard let run = runWithPendingLesson() else { return }
+        applyPendingLesson(on: run)
+    }
+
+    /// Per-run variant — the chat-thread bubble already knows which
+    /// run it's rendering, so it skips the "find any run with a
+    /// pendingLesson" scan and addresses the exact target.
+    func applyPendingLesson(on run: RunSession) {
+        guard let pending = run.pendingLesson else { return }
         Task { @MainActor in
             do {
                 _ = try await AgentdClient.shared.applySkill(
@@ -276,8 +283,12 @@ final class MainController: ObservableObject {
     /// the proposed_skill.md sidecar so the same suggestion can't
     /// re-appear on a stale reconnect.
     func discardPendingLesson() {
-        guard let run = runWithPendingLesson(),
-              let pending = run.pendingLesson else { return }
+        guard let run = runWithPendingLesson() else { return }
+        discardPendingLesson(on: run)
+    }
+
+    func discardPendingLesson(on run: RunSession) {
+        guard let pending = run.pendingLesson else { return }
         run.pendingLesson = nil
         run.objectWillChange.send()
         Task { @MainActor in

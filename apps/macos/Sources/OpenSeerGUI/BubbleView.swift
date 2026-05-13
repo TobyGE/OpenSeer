@@ -158,6 +158,140 @@ struct BubbleView: View {
     }
 }
 
+/// In-thread bubble for the post-run skill proposal. Shows up
+/// directly under the answer bubble when reflection has parked a
+/// proposed SKILL.md on disk. Save / Discard tap into the same
+/// `applyPendingLesson` / `discardPendingLesson` daemon round-trip
+/// the orb's chip used to drive.
+struct LessonBubble: View {
+    @ObservedObject var run: RunSession
+    let onApply: () -> Void
+    let onDiscard: () -> Void
+    @State private var showPreview: Bool = false
+
+    var body: some View {
+        if let lesson = run.pendingLesson {
+            pendingView(lesson)
+        } else if let saved = run.lastAppliedSkillName, !saved.isEmpty {
+            savedView(saved)
+        }
+    }
+
+    @ViewBuilder
+    private func pendingView(_ lesson: RunSession.ProposedLesson) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "graduationcap.fill")
+                    .foregroundStyle(.yellow)
+                Text(lesson.isNew
+                     ? "Learned something — save as a skill?"
+                     : "Learned something — update \(lesson.skillName)?")
+                    .font(.callout.weight(.semibold))
+                Spacer(minLength: 0)
+                Button {
+                    onDiscard()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.bold))
+                }
+                .buttonStyle(.borderless)
+                .help("Dismiss without saving")
+            }
+            if !lesson.lesson.isEmpty {
+                Text(lesson.lesson)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 8) {
+                Button { showPreview = true } label: {
+                    Label("Preview", systemImage: "doc.text")
+                }
+                .controlSize(.small)
+                Button { onApply() } label: {
+                    Label("Save", systemImage: "tray.and.arrow.down")
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .frame(maxWidth: 560, alignment: .leading)
+        .background(Color.yellow.opacity(0.10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.yellow.opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .sheet(isPresented: $showPreview) {
+            previewSheet(lesson)
+        }
+    }
+
+    private func savedView(_ name: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+            Text("Saved skill `\(name)`")
+                .font(.callout.weight(.semibold))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .frame(maxWidth: 560, alignment: .leading)
+        .background(Color.green.opacity(0.10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.green.opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func previewSheet(
+        _ lesson: RunSession.ProposedLesson
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "doc.text.fill")
+                Text(lesson.skillName).font(.headline.monospaced())
+                Spacer()
+                Text(lesson.isNew ? "NEW" : "UPDATE")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(lesson.isNew
+                                 ? Color.blue.opacity(0.18)
+                                 : Color.orange.opacity(0.18))
+                    .clipShape(Capsule())
+            }
+            Divider()
+            ScrollView(.vertical) {
+                Text(lesson.body)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 320)
+            HStack {
+                Button("Discard") {
+                    showPreview = false
+                    onDiscard()
+                }
+                Spacer()
+                Button("Cancel") { showPreview = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    showPreview = false
+                    onApply()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 560, height: 480)
+    }
+}
+
+
 /// Status footer for a session: showing run state ("3 turns · done · 12s"
 /// or a spinner while running).
 struct SessionFooter: View {

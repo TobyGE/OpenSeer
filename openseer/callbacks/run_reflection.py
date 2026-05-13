@@ -79,6 +79,16 @@ Rules:
   Do not leave it as `none` when the same lesson would clearly save
   future steps. End-to-end flow ordering on consumer sites is almost
   always trigger (a).
+- Cross-run corroboration: when the user_text includes a
+  `PRIOR RUNS ON THIS SITE/APP` section, treat that as additional
+  evidence — NOT as a substitute for what this run did. A pattern
+  that recurs in 2+ prior runs (same dead-end, same workaround,
+  same control location) is strong evidence for a skill update
+  even if THIS run alone wouldn't qualify under (a)/(b)/(c). But
+  a one-off mention in one prior run is just noise — require
+  recurrence.
+  The `Lesson learned` section still describes THIS run only; the
+  prior-runs section informs the `Skill update` decision.
 - If an existing skill target is provided, update that exact skill name.
 - Do not create task-specific skills such as wechat-message or wechat-group.
 - One macOS app should usually have one CU skill named <app-slug>-mac.
@@ -353,6 +363,113 @@ def _infer_site_domain(history: list[Any], app_name: str,
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
+def _load_prior_run_digests(out_dir: Path, site_domain: str,
+                            app_name: str,
+                            max_runs: int = 5,
+                            scan_limit: int = 30) -> list[tuple[str, str]]:
+    """Find recent prior runs that touched the same site / app and
+    return their (task, step_digest) pairs.
+
+    The "current run only" reflection rarely finds a learnable
+    moment when each task is a routine scroll / lookup, so this
+    feeds the model a window of similar past runs. Pattern that
+    recurs three times beats pattern that appeared once.
+
+    Lookup is best-effort: read recent sibling run dirs by mtime,
+    parse `transcript.json` cheaply, substring-match against the
+    site/app, stop after `max_runs` matches. Bounded at
+    `scan_limit` dir reads so a user with 1000 runs doesn't pay
+    O(1000) every reflection.
+    """
+    if not site_domain and not app_name:
+        return []
+    runs_root = out_dir.parent
+    if not runs_root.exists() or runs_root.name != "runs":
+        return []
+    current_name = out_dir.name
+    candidates: list[tuple[float, Path]] = []
+    for p in runs_root.iterdir():
+        if not p.is_dir() or p.name == current_name or p.name == "latest":
+            continue
+        try:
+            candidates.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    candidates.sort(reverse=True)
+    needle_site = site_domain.lower() if site_domain else ""
+    needle_app = app_name.lower() if app_name else ""
+    digests: list[tuple[str, str]] = []
+    for _, p in candidates[:scan_limit]:
+        tx = p / "transcript.json"
+        if not tx.exists():
+            continue
+        try:
+            data = json.loads(tx.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        steps = data.get("steps") or []
+        if not steps:
+            continue
+        # Cheap substring filter on the transcript first.
+        blob = json.dumps(steps, ensure_ascii=False).lower()
+        matched = False
+        if needle_site and needle_site in blob:
+            matched = True
+        elif needle_app and needle_app in blob:
+            matched = True
+        # transcript steps only carry action results
+        # (`scrolled at (790,834)`), not AX text or URLs — so a
+        # scroll-only X run wouldn't match either needle even though
+        # it was clearly on x.com. Fall back to the run's
+        # `events.jsonl`, where every step emits a `prep_phase
+        # ax_done` event with the frontmost app in its `data`. This
+        # is cheap line-by-line — no JSON parse per line.
+        if not matched and (needle_site or needle_app):
+            ev_path = p / "events.jsonl"
+            if ev_path.exists():
+                try:
+                    with ev_path.open(encoding="utf-8") as f:
+                        for line in f:
+                            if "ax_done" not in line:
+                                continue
+                            low = line.lower()
+                            if needle_app and needle_app in low:
+                                matched = True
+                                break
+                            if needle_site and needle_site in low:
+                                matched = True
+                                break
+                except OSError:
+                    pass
+        if not matched:
+            continue
+        # Build a compact digest. Use the same fields the per-run
+        # _build_step_digest renders so the model sees a consistent
+        # shape across past + current.
+        task = str(data.get("task", "") or "")
+        lines: list[str] = []
+        for s in steps:
+            idx = s.get("idx", "?")
+            a_name = str(s.get("action") or "")
+            thought = _shorten(s.get("thought") or "", 180)
+            args: list[str] = []
+            for k in ("app", "skill_name", "url", "cmd", "query",
+                       "text", "key", "amount"):
+                v = s.get(k)
+                if v not in (None, ""):
+                    args.append(f"{k}={str(v)[:80]!r}")
+            result = _shorten(s.get("result") or "")
+            lines.append(
+                f"{idx}. thought={thought!r}; "
+                f"action={a_name} {' '.join(args)}; "
+                f"result={result}"
+            )
+        digests.append((task, "\n".join(lines)))
+        if len(digests) >= max_runs:
+            break
+    return digests
+
+
 def _build_step_digest(history: list[Any]) -> str:
     lines: list[str] = []
     for s in history:
@@ -574,6 +691,30 @@ class RunReflectionCallback(Callback):
             user_text += f"\nEXISTING SKILL BODY TO MERGE:\n{existing_body}\n"
         elif not expected_skill_name:
             user_text += "\nNo eligible skill target was found. Skill update must be none.\n"
+
+        # Cross-run context: a single run rarely has a clear lesson —
+        # the model needs to see a pattern repeated to be confident a
+        # skill update is warranted. Pull up to 5 recent prior runs
+        # on the same site / app and append their step digests. The
+        # model is told (via the prompt) to use these as
+        # corroboration only — `Lesson learned` still describes THIS
+        # run, but `Skill update` may cite cross-run patterns.
+        prior_digests = _load_prior_run_digests(
+            out_dir, site_domain or "", app_name or "")
+        if prior_digests:
+            user_text += (
+                "\nPRIOR RUNS ON THIS SITE/APP (most recent first):\n"
+                "Use these for cross-run pattern corroboration. A "
+                "repeated workaround / footgun across multiple runs "
+                "is strong evidence for a skill update; a one-off in "
+                "this run alone usually is not.\n"
+            )
+            for i, (prior_task, prior_steps) in enumerate(prior_digests):
+                user_text += (
+                    f"\n--- prior run {i+1} "
+                    f"(task: {prior_task or '(unknown)'}) ---\n"
+                    f"{prior_steps}\n"
+                )
 
         payload = {
             "model": ctx.get("model"),

@@ -298,7 +298,19 @@ def _infer_site_domain(history: list[Any], app_name: str,
         if name == "bash":
             argv_fields = [getattr(a, "cmd", None)]
         elif name == "read_page":
-            argv_fields = [getattr(a, "url", None)]
+            # When `read_page` is called without an explicit url, it
+            # reads the browser's currently-active tab — the model
+            # routinely emits `read_page` bare and relies on this. The
+            # action's RESULT then begins with the page title + URL
+            # the browser was actually at, so trust the first URL in
+            # the result as an argv-equivalent for site inference.
+            # Without this, every "summarize what's open" run on
+            # arxiv / a blog / etc. proposes no skill even after the
+            # earlier fixes.
+            argv_fields = [getattr(a, "url", None),
+                           (s.result or "").split("\n", 5)[1]
+                               if (s.result or "").count("\n") >= 1
+                               else (s.result or "")[:200]]
         elif name == "web_fetch":
             argv_fields = [getattr(a, "url", None),
                            getattr(a, "text", None)]
@@ -516,18 +528,29 @@ class RunReflectionCallback(Callback):
                 if site_domain in blob.lower():
                     domain_bash_actions += 1
         substantive_actions = ui_actions + domain_bash_actions
+        # Thresholds are intentionally low — they're a conservative
+        # floor below which we don't even ASK the reflection model to
+        # propose. The model's prompt still rejects proposals that
+        # don't match its (a) flow-order / (b) footgun /
+        # (c) control-location triggers, so a low threshold just
+        # widens the candidate pool. Click flows (UI) genuinely need
+        # several clicks to be a "real flow", but a single
+        # `read_page` or `web_fetch` already pulls a whole page worth
+        # of content — those count "heavier", so the site-skill bar
+        # is 2 substantive actions instead of 4.
         existing_body = ""
         expected_skill_name = ""
         if target_skill is not None:
             expected_skill_name = target_skill.name
-            if substantive_actions >= 4 or read_names:
+            if substantive_actions >= 2 or read_names:
                 existing_body = target_skill.path.read_text(encoding="utf-8")
-        elif site_domain and substantive_actions >= 4:
+        elif site_domain and substantive_actions >= 2:
             expected_skill_name = canonical_site_skill_name(site_domain)
         elif app_name and ui_actions >= 4:
-            # No bash boost for app-only skills: those still need real UI
-            # evidence (clicks/types) since the durable knowledge for a
-            # native macOS app lives in its UI tree, not in a curl recipe.
+            # App skills keep the strict 4-UI-action bar: durable
+            # knowledge for a native macOS app lives in its UI tree
+            # (which menu, which sidebar, which keyboard shortcut),
+            # and one or two clicks rarely capture that.
             expected_skill_name = canonical_skill_name(app_name)
 
         skill_target = "none"

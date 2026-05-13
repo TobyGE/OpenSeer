@@ -80,13 +80,39 @@ final class MainController: ObservableObject {
             + "switch focus there first (open_app or click)."
     }
 
+    /// Choose the ask_user dialog title in the same language as the
+    /// question itself. Bilingual users routinely talk to OpenSeer
+    /// in both — hard-coding either Chinese or English would feel
+    /// wrong half the time.
+    static func askUserTitle(for question: String) -> String {
+        for scalar in question.unicodeScalars {
+            let v = scalar.value
+            // CJK Unified Ideographs covers Chinese hanzi + most
+            // shared Japanese kanji. Hiragana / Katakana / Hangul
+            // are added so a question that's purely Japanese or
+            // Korean (no hanzi) still picks the non-English title.
+            if (0x4E00...0x9FFF).contains(v)
+                || (0x3040...0x309F).contains(v)
+                || (0x30A0...0x30FF).contains(v)
+                || (0xAC00...0xD7AF).contains(v) {
+                return "OpenSeer 想确认一下"
+            }
+        }
+        return "OpenSeer needs a quick check"
+    }
+
     /// Show a modal alert for an ask_user request and return the
     /// user's reply (or nil if dismissed). Runs on the main thread.
     private func respondToAskUser(_ req: AgentdClient.AskUserRequest)
         async -> String?
     {
         let alert = NSAlert()
-        alert.messageText = "OpenSeer 想确认一下"
+        // Pick the title language to match the question's. A Chinese
+        // question with an English title (or vice versa) reads jarring
+        // because the dialog clearly mixes locales; the question text
+        // is what the user actually sees first, so we follow it.
+        alert.messageText = MainController.askUserTitle(
+            for: req.question)
         alert.informativeText = req.question
         alert.alertStyle = .informational
 

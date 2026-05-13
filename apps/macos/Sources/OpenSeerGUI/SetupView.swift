@@ -436,18 +436,29 @@ private struct PermissionsStepView: View {
                     // Swift request the user would have to click `+`
                     // and browse to /Applications/OpenSeer.app to
                     // add it manually.
+                    //
+                    // We DON'T open System Settings ourselves here:
+                    // `AXIsProcessTrustedWithOptions(prompt: true)`
+                    // already shows the native macOS dialog (which
+                    // itself offers an "Open System Settings" button),
+                    // so opening Settings preemptively just slammed
+                    // the panel up before the user clicked Request.
+                    // The separate "Open Settings" button in
+                    // permissionRow remains as the explicit fallback.
                     Permissions.requestAccessibility()
                     Task { await model.runPermissionRequest() }
-                    Permissions.openSystemSettings(pane: .accessibility)
                 }
             )
             permissionRow(
                 title: "Screen Recording",
                 granted: p?.screenRecording ?? false,
                 onRequest: {
+                    // Same pattern as Accessibility above —
+                    // `CGRequestScreenCaptureAccess()` already
+                    // surfaces the native prompt; the explicit
+                    // "Open Settings" button stays as the fallback.
                     Permissions.requestScreenRecording()
                     Task { await model.runPermissionRequest() }
-                    Permissions.openSystemSettings(pane: .screenRecording)
                 }
             )
 

@@ -69,15 +69,28 @@ struct ChatView: View {
                         .padding(.vertical, 60)
                 }
             }
-            .onChange(of: totalTurnCount) { _, _ in
+            .onChange(of: bottomScrollKey) { _, _ in
                 if let t = selectedThread {
                     withAnimation { proxy.scrollTo(t.id, anchor: .bottom) }
                 }
             }
         }
     }
-    private var totalTurnCount: Int {
-        selectedThread?.runs.reduce(0) { $0 + $1.turns.count } ?? 0
+    /// Combined trigger for auto-scrolling to the latest content.
+    /// Includes both turn-count changes (new steps / answers) AND
+    /// post-run lesson-bubble appearances (`pendingLesson` /
+    /// `lastAppliedSkillName` flips), since those are appended below
+    /// the final answer without adding a new Turn — keying only on
+    /// turn count would leave the user scrolled past the new bubble
+    /// (codex P2 on the chip-to-chat move).
+    private var bottomScrollKey: String {
+        let runs = selectedThread?.runs ?? []
+        let turns = runs.reduce(0) { $0 + $1.turns.count }
+        let pending = runs.compactMap { $0.pendingLesson?.skillName }
+            .joined(separator: ",")
+        let applied = runs.compactMap { $0.lastAppliedSkillName }
+            .joined(separator: ",")
+        return "\(turns)|\(pending)|\(applied)"
     }
 
     /// Composer caption text — adapts to whether the next Send will

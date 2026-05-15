@@ -9,6 +9,13 @@ use the most.
 **Pre-alpha.** Working internals, reckless edges. It will literally
 take over your mouse and keyboard.
 
+> 💡 **The best experience is typeless + OpenSeer.** Flip *Voice* on
+> in Settings → General → Voice, then press `⌘⌥S` and just talk —
+> the orb listens, sends on a brief pause, and the agent drives the
+> rest. Voice is opt-in (off by default) so a fresh install doesn't
+> trip on microphone / Speech Recognition permissions before you've
+> chosen to use them.
+
 Press `⌘⌥S` from anywhere and the orb floats in with the mic on:
 
 <p align="center">

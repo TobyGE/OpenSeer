@@ -31,6 +31,11 @@ struct VoiceOrbView: View {
     @Binding var isWindowExpanded: Bool
 
     @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
+    // Voice input is opt-in. Default off so a fresh install doesn't
+    // auto-fail on missing microphone / Speech Recognition perms when
+    // the user just wants to type. Settings → General → Voice flips
+    // this on; the orb's hotkey then summons with the mic listening.
+    @AppStorage("voiceEnabled") private var voiceEnabled = false
     @StateObject private var input = VoiceInput()
     @State private var isOpen = false
     @State private var autoListen = false
@@ -181,8 +186,11 @@ struct VoiceOrbView: View {
         .onReceive(NotificationCenter.default.publisher(
             for: .openVoiceOrb)) { _ in
             // Global cmd+option+S fired (or any other code path
-            // wants the orb visible + listening). Open the panel
-            // and start the listen loop if it isn't already on.
+            // wants the orb visible + listening). Always open the
+            // panel; only kick the listen loop when voice is
+            // enabled in Settings — otherwise the orb summons in
+            // type-only mode and the user can focus the draft
+            // field directly.
             if !isOpen {
                 withAnimation(.spring(response: 0.26,
                                        dampingFraction: 0.86)) {
@@ -190,7 +198,7 @@ struct VoiceOrbView: View {
                     isWindowExpanded = true
                 }
             }
-            if !autoListen { startLoop() }
+            if voiceEnabled && !autoListen { startLoop() }
         }
         .onReceive(NotificationCenter.default.publisher(
             for: .dismissVoiceOrb)) { _ in
@@ -303,7 +311,18 @@ struct VoiceOrbView: View {
                           systemImage: autoListen ? "pause.fill" : "mic.fill")
                 }
                 .controlSize(.small)
-                .disabled(!input.isAvailable || input.isStarting)
+                // Disabled when voice is turned off in Settings —
+                // the underlying VoiceInput would refuse to start
+                // without mic + Speech Recognition permissions
+                // anyway, so we render the button greyed and use
+                // its `help` tooltip to point the user at the
+                // toggle.
+                .disabled(!voiceEnabled
+                          || !input.isAvailable
+                          || input.isStarting)
+                .help(voiceEnabled
+                      ? "Press to start / stop listening."
+                      : "Voice is off — turn it on in Settings → General → Voice.")
 
                 // Hand-off: pause/resume the agent so the user can
                 // drive the mouse + keyboard themselves for a few

@@ -102,6 +102,12 @@ struct SettingsSheet: View {
 private struct GeneralPane: View {
     @EnvironmentObject var env: OpenSeerEnv
     @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
+    // Voice is opt-in. A fresh install hasn't granted microphone /
+    // Speech Recognition yet, so auto-starting the listen loop on
+    // the first `⌘⌥S` would just fail with a permission error.
+    // Toggle this on once the user has granted both permissions
+    // (and actually wants voice instead of typing).
+    @AppStorage("voiceEnabled") private var voiceEnabled = false
     @State private var provider: String = ""
     @State private var saved: Bool = false
 
@@ -110,7 +116,7 @@ private struct GeneralPane: View {
             Section("Model provider") {
                 Picker("Provider", selection: $provider) {
                     Text("OpenAI · GPT-5.5").tag("openai")
-                    Text("Anthropic · Haiku 4.5").tag("anthropic")
+                    Text("Anthropic · Opus 4.7").tag("anthropic")
                 }
                 .pickerStyle(.segmented)
                 Button(saved ? "Saved ✓" : "Save provider") {
@@ -130,12 +136,17 @@ private struct GeneralPane: View {
                 .disabled(provider.isEmpty)
             }
             Section("Voice") {
+                Toggle("Enable voice input", isOn: $voiceEnabled)
+                Text("Off by default. When on, ⌘⌥S summons the orb with the mic listening. When off, the orb appears with the text field focused — type instead.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Picker("Recognition language", selection: $voiceLocale) {
                     Text("中文普通话").tag("zh-CN")
                     Text("English").tag("en-US")
                     Text("System default").tag("system")
                 }
                 .pickerStyle(.segmented)
+                .disabled(!voiceEnabled)
                 Text("Chinese recognition may use Apple's server-based Speech service if the on-device language pack is not installed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

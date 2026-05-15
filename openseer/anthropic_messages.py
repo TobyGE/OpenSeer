@@ -22,7 +22,16 @@ import urllib.error
 import urllib.request
 
 
-MODEL = "claude-haiku-4-5-20251001"
+# Probed via the Claude Code OAuth token (see /tmp/probe_claude_models2.py
+# in the dev box, May 2026): the OAuth scope covers the entire 4.x
+# family — haiku-4-5, sonnet-4-5, sonnet-4-6, opus-4-5, opus-4-6,
+# opus-4-7. Bare names work alongside date-suffixed ones; we use the
+# bare name so a new minor release is picked up automatically.
+# Defaulting to opus-4-7 because the agent loop's per-step reasoning
+# (deciding the next action from a screenshot + AX tree) benefits a
+# lot from the opus-tier; haiku occasionally chose wrong indices or
+# missed barge-in guidance on multi-step flows.
+MODEL = "claude-opus-4-7"
 
 _API_URL = "https://api.anthropic.com/v1/messages"
 _KEYCHAIN_SERVICE = "Claude Code-credentials"

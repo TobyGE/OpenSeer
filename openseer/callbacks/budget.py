@@ -11,18 +11,56 @@ from typing import Any
 from .base import Callback
 
 
-# very rough $/1M token estimates; update if model changes.
-# Used only for advisory cost printout — the real ceiling is `max_tokens`.
-_DEFAULT_COST_PER_M_INPUT = 0.50
-_DEFAULT_COST_PER_M_OUTPUT = 4.00
+# Rough public $/1M-token list prices, grouped by family. Used ONLY
+# for the advisory `[budget] est=$…` line — token caps in
+# max_input_tokens / max_output_tokens are the real ceiling. Numbers
+# are approximate (Anthropic / OpenAI both change list prices
+# without a versioning story) but get the order of magnitude right,
+# which is what matters for a "noticed I burned 50× more than usual"
+# signal. Update when adding a new model.
+_PRICES_PER_M: dict[str, tuple[float, float]] = {
+    # (input, output)
+    "opus":    (15.0, 75.0),    # opus-4-x — premium tier
+    "sonnet":  ( 3.0, 15.0),    # sonnet-4-x — mid tier
+    "haiku":   ( 1.0,  5.0),    # haiku-4-x — cheap tier
+    "gpt-5":   ( 5.0, 15.0),    # gpt-5.5 / gpt-5.3-codex — rough
+}
+# Fallback used when we can't match the model name. Picked to lean
+# pessimistic so a printed $est is unlikely to under-report.
+_PRICE_FALLBACK: tuple[float, float] = (5.0, 20.0)
+
+
+def _price_for_model(model: str | None) -> tuple[float, float]:
+    """Return (input_per_M_usd, output_per_M_usd) for a model id.
+
+    Match by substring of the family token (e.g. `claude-opus-4-7`
+    → `opus`). Keeps us correct across minor releases without a
+    list to maintain. Unknown → conservative fallback so the
+    [budget] line never silently under-estimates a new model.
+    """
+    if not model:
+        return _PRICE_FALLBACK
+    m = model.lower()
+    for needle, prices in _PRICES_PER_M.items():
+        if needle in m:
+            return prices
+    return _PRICE_FALLBACK
 
 
 class BudgetCallback(Callback):
     def __init__(self, max_input_tokens: int = 200_000,
                  max_output_tokens: int = 20_000,
-                 cost_per_m_input: float = _DEFAULT_COST_PER_M_INPUT,
-                 cost_per_m_output: float = _DEFAULT_COST_PER_M_OUTPUT,
+                 cost_per_m_input: float | None = None,
+                 cost_per_m_output: float | None = None,
+                 model: str | None = None,
                  verbose: bool = True):
+        # Per-call overrides take precedence; otherwise fall back to
+        # the per-family list above keyed on the active model.
+        family_in, family_out = _price_for_model(model)
+        if cost_per_m_input is None:
+            cost_per_m_input = family_in
+        if cost_per_m_output is None:
+            cost_per_m_output = family_out
         self.max_input  = max_input_tokens
         self.max_output = max_output_tokens
         self.cost_in   = cost_per_m_input

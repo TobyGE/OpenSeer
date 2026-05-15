@@ -711,7 +711,7 @@ def _default_callbacks(quiet: bool = False) -> list[Callback]:
         TrajectoryCallback(verbose=not quiet),
         RunReflectionCallback(verbose=not quiet),
         BudgetCallback(max_input_tokens=300_000, max_output_tokens=30_000,
-                       verbose=not quiet),
+                       model=OAI_MODEL, verbose=not quiet),
         SafetyCallback(mode="confirm"),
     ]
 

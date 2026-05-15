@@ -52,10 +52,17 @@ class BudgetCallback(Callback):
                  max_output_tokens: int = 20_000,
                  cost_per_m_input: float | None = None,
                  cost_per_m_output: float | None = None,
-                 model: str | None = None,
-                 verbose: bool = True):
-        # Per-call overrides take precedence; otherwise fall back to
-        # the per-family list above keyed on the active model.
+                 verbose: bool = True,
+                 *,
+                 model: str | None = None):
+        # `model` is keyword-only and trails `verbose` so old
+        # positional calls like `BudgetCallback(…, False)` (False
+        # meant for `verbose`) still bind to `verbose`, not to the
+        # newly-added `model` argument. Codex P3 on 5a9a967.
+        #
+        # Per-call cost overrides take precedence; otherwise fall
+        # back to the per-family list above keyed on the active
+        # model.
         family_in, family_out = _price_for_model(model)
         if cost_per_m_input is None:
             cost_per_m_input = family_in

@@ -128,6 +128,19 @@ struct VoiceOrbView: View {
         .onChange(of: voiceLocale) { _, newValue in
             input.configure(localeID: newValue)
         }
+        .onChange(of: voiceEnabled) { _, enabled in
+            // Toggling voice off in Settings while the mic is
+            // already recording must stop the loop — otherwise the
+            // Pause button greys out (its `.disabled` now includes
+            // `!voiceEnabled`) and the user has no UI control to
+            // end the in-flight SFSpeech session. Codex P2 caught
+            // this on the v0.1.9 tag push. Toggling back on does
+            // NOT auto-start; the user explicitly Listens or
+            // re-summons via the hotkey.
+            if !enabled && autoListen {
+                stopLoop()
+            }
+        }
         .onChange(of: input.partialTick) { _, _ in
             // Reset the autoCommit timer on every partial — including
             // partials that repeat the same string. Watching transcript

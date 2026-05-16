@@ -323,15 +323,15 @@ struct VoiceOrbView: View {
             // editor gains focus pulls the IME panel onto our text
             // view; when the user dismisses focus, the foreground
             // app gets its IME back naturally.
-            // TextField with `axis: .vertical` gives us native
-            // `.onSubmit` (Return-to-send) while still expanding for
-            // multi-line drafts. CJK IME naturally consumes Return
-            // during candidate selection, so the submit only fires
-            // once composition has ended — exactly the behavior the
-            // user asked for ("just press return to send"). The
-            // ZStack overlay placeholder TextEditor needed is gone:
-            // TextField has built-in prompt rendering, and the
-            // status-text line above already conveys mode info.
+            // TextField with `axis: .vertical` grows for multi-line
+            // drafts. Plain Return would normally insert a newline
+            // (codex P2: `.onSubmit` doesn't fire on multiline
+            // TextField), so we intercept Return ourselves via
+            // `.onKeyPress`. CJK IME composition is unaffected —
+            // the input method consumes candidate-confirm Returns
+            // before SwiftUI's key-press pipeline sees them, so
+            // commitNow only fires after composition ends. Shift+
+            // Return falls through to insert a newline as usual.
             TextField(transcriptText, text: $draftText,
                       axis: .vertical)
                 .textFieldStyle(.plain)
@@ -346,13 +346,9 @@ struct VoiceOrbView: View {
                         NSApp.activate(ignoringOtherApps: true)
                     }
                 }
-                .onSubmit {
-                    // Plain Return → send the draft. commitNow is
-                    // safe to call with an empty draft (it guards
-                    // and returns), and IME-composing Returns never
-                    // reach here because the input method has
-                    // already consumed them as candidate confirms.
+                .onKeyPress(.return) {
                     commitNow()
+                    return .handled
                 }
 
             HStack(spacing: 8) {

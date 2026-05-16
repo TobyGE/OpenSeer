@@ -97,10 +97,10 @@ struct ChatView: View {
     /// continue the selected local thread or spawn a fresh one.
     private var composerHint: String {
         if let t = selectedThread, t.kind == .local {
-            return "Fn+↩ to send · continuing this conversation · "
+            return "⌃↩ to send · continuing this conversation · "
                 + "Compose ✏️ to start fresh"
         }
-        return "Fn+↩ to send · starts a new conversation"
+        return "⌃↩ to send · starts a new conversation"
     }
 
     private var emptyState: some View {
@@ -140,14 +140,12 @@ struct ChatView: View {
                                         .isEmpty) {
                     submit()
                 }
-                // Send = Fn+Return (or the keypad Enter key on
-                // keyboards that have one). SwiftUI's EventModifiers
-                // doesn't expose `.fn`, but on Macs without a
-                // numpad, Fn+Return emits the same event as keypad-
-                // Enter — Unicode `\u{0003}` (ETX). Binding the
-                // KeyEquivalent directly with no modifiers catches
-                // both inputs.
-                .keyboardShortcut(KeyEquivalent("\u{0003}"), modifiers: [])
+                // Send = Control+Return. Plain Return inside a
+                // TextField inserts a newline (we want multi-line
+                // drafts), so the send key needs a modifier that
+                // doesn't conflict. ⌃ pairs well with the new
+                // global hotkey (control+S to summon the orb).
+                .keyboardShortcut(.return, modifiers: [.control])
             }
             HStack {
                 Toggle("Dry run (preview only)", isOn: $controller.dryRun)

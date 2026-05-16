@@ -1,7 +1,7 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// System-wide cmd+option+S hotkey that toggles the voice orb from any
+/// System-wide control+S hotkey that toggles the voice orb from any
 /// app. Uses Carbon's RegisterEventHotKey because it's the only path
 /// that actually consumes the keystroke (NSEvent global monitor can
 /// observe but not block, so the focused app would also receive it).
@@ -15,7 +15,7 @@ final class GlobalHotkey {
 
     private init() {}
 
-    /// Install the handler + register cmd+option+S. Returns true on
+    /// Install the handler + register control+S. Returns true on
     /// success. Safe to call once at app launch; no-op on subsequent
     /// calls (we only register a single binding for now).
     @discardableResult
@@ -52,10 +52,12 @@ final class GlobalHotkey {
             return false
         }
 
-        // Cmd+Option+S. "S for Seer / Summon". Cmd+Option keeps
-        // us out of the cmd+S "save" namespace every app uses,
-        // and option-S isn't commonly bound either.
-        let modifiers: UInt32 = UInt32(cmdKey | optionKey)
+        // Control+S. "S for Seer / Summon". Plain control+S is
+        // largely unused by macOS apps (Cocoa text fields treat it
+        // as "transpose chars" in classic Emacs bindings, but that
+        // virtually no one relies on), and it's one fewer modifier
+        // for the user's pinky than the older cmd+option+S.
+        let modifiers: UInt32 = UInt32(controlKey)
         let keyCode: UInt32 = UInt32(kVK_ANSI_S)
         // Signature is an OSType (FourCharCode) — any unique 32-bit
         // value will do. We use 'OSRH' = OpenSeer Hotkey so
@@ -72,7 +74,7 @@ final class GlobalHotkey {
             return false
         }
         hotKeyRef = ref
-        NSLog("[hotkey] registered cmd+option+S")
+        NSLog("[hotkey] registered control+S")
         return true
     }
 }

@@ -79,7 +79,7 @@ struct MainView: View {
     var body: some View {
         ChatView(controller: controller)
         // The floating voice orb is no longer auto-shown on launch.
-        // Users summon it with cmd+option+S and dismiss it with the
+        // Users summon it with control+S and dismiss it with the
         // same shortcut — see GlobalHotkey + MainController.
     }
 }

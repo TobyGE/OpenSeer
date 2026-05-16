@@ -10,13 +10,13 @@ use the most.
 take over your mouse and keyboard.
 
 > 💡 **The best experience is typeless + OpenSeer.** Flip *Voice* on
-> in Settings → General → Voice, then press `⌘⌥S` and just talk —
+> in Settings → General → Voice, then press `⌃S` and just talk —
 > the orb listens, sends on a brief pause, and the agent drives the
 > rest. Voice is opt-in (off by default) so a fresh install doesn't
 > trip on microphone / Speech Recognition permissions before you've
 > chosen to use them.
 
-Press `⌘⌥S` from anywhere and the orb floats in with the mic on:
+Press `⌃S` from anywhere and the orb floats in with the mic on:
 
 <p align="center">
   <img src="docs/screenshots/orb-listening.png"
@@ -34,7 +34,7 @@ you can take over at any time with **Hand off** or **Stop**:
        width="520" />
 </p>
 
-Press `⌘⌥S` again to dismiss the orb entirely — no invisible
+Press `⌃S` again to dismiss the orb entirely — no invisible
 recording, no leftover panel.
 
 ## The Siri Apple Intelligence promised
@@ -100,7 +100,7 @@ whichever you're missing. Your choice persists to
 
 ## How you talk to it
 
-- **`⌘⌥S` from anywhere on the system** — a crystal-ball window
+- **`⌃S` from anywhere on the system** — a crystal-ball window
   appears at the bottom-right of your screen with the mic on,
   listening. Press the same hotkey again to dismiss it entirely
   (panel hidden, mic silenced — no invisible recording). The orb

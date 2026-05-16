@@ -34,7 +34,7 @@ final class MainController: ObservableObject {
         AgentdClient.shared.askUserHandler = { [weak self] req in
             await self?.respondToAskUser(req) ?? nil
         }
-        // Global cmd+option+S — toggle the voice orb's visibility.
+        // Global control+S — toggle the voice orb's visibility.
         // Summon: shows the panel + captures the frontmost app as
         // session context + posts the open notification so the orb
         // starts listening. Dismiss: hides the panel entirely so it

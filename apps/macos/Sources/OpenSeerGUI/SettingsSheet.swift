@@ -107,7 +107,7 @@ private struct GeneralPane: View {
     @AppStorage("voiceLocale") private var voiceLocale = "zh-CN"
     // Voice is opt-in. A fresh install hasn't granted microphone /
     // Speech Recognition yet, so auto-starting the listen loop on
-    // the first `⌘⌥S` would just fail with a permission error.
+    // the first `⌃S` would just fail with a permission error.
     // Toggle this on once the user has granted both permissions
     // (and actually wants voice instead of typing).
     @AppStorage("voiceEnabled") private var voiceEnabled = false
@@ -140,7 +140,7 @@ private struct GeneralPane: View {
             }
             Section("Voice") {
                 Toggle("Enable voice input", isOn: $voiceEnabled)
-                Text("Off by default. When on, ⌘⌥S summons the orb with the mic listening. When off, the orb appears with the text field focused — type instead.")
+                Text("Off by default. When on, ⌃S summons the orb with the mic listening. When off, the orb appears with the text field focused — type instead.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("Recognition language", selection: $voiceLocale) {
@@ -352,11 +352,11 @@ private struct ShortcutsPane: View {
     }
 
     private static let shortcuts: [Shortcut] = [
-        Shortcut(keys: ["⌘", "⌥", "S"],
+        Shortcut(keys: ["⌃", "S"],
                  description: "Summon / dismiss the floating voice orb",
                  scope: "Global"),
-        Shortcut(keys: ["Fn", "⏎"],
-                 description: "Send the prompt (also: numeric keypad Enter)",
+        Shortcut(keys: ["⌃", "⏎"],
+                 description: "Send the prompt",
                  scope: "Orb panel · Chat composer"),
         Shortcut(keys: ["⎋"],
                  description: "Cancel / dismiss a sheet",
@@ -388,9 +388,9 @@ private struct ShortcutsPane: View {
                     .font(.headline)
                     .padding(.top, 6)
                 VStack(alignment: .leading, spacing: 6) {
-                    bullet("Fn+Return is also the keypad-Enter key on Macs with a numeric keypad. Both inputs emit the same event, so either one sends.")
+                    bullet("Plain ⏎ inside the text field inserts a newline; ⌃⏎ is what actually sends.")
                     bullet("The orb hotkey works system-wide via Carbon's `RegisterEventHotKey`, so it fires from any app. macOS may ask you to grant Accessibility the first time another app's text field has focus.")
-                    bullet("Voice input is opt-in (General → Voice). With it off, pressing ⌘⌥S still summons the orb but lands in the text field; Fn+Return sends.")
+                    bullet("Voice input is opt-in (General → Voice). With it off, pressing ⌃S still summons the orb but lands in the text field; ⌃⏎ sends.")
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)

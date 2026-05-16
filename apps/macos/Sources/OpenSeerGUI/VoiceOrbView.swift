@@ -213,7 +213,7 @@ struct VoiceOrbView: View {
         }
         .onReceive(NotificationCenter.default.publisher(
             for: .openVoiceOrb)) { _ in
-            // Global cmd+option+S fired (or any other code path
+            // Global control+S fired (or any other code path
             // wants the orb visible + listening). Always open the
             // panel; only kick the listen loop when voice is
             // enabled in Settings — otherwise the orb summons in
@@ -232,7 +232,7 @@ struct VoiceOrbView: View {
                 // Type-only mode: drop the user straight into the
                 // TextEditor so the very next keystroke lands in the
                 // draft buffer (codex P2 on 414526d). Without this,
-                // pressing ⌘⌥S in default-off mode opened the panel
+                // pressing ⌃S in default-off mode opened the panel
                 // but left focus elsewhere, and the user had to
                 // click into the editor before typing.
                 isEditingDraft = true
@@ -412,11 +412,11 @@ struct VoiceOrbView: View {
                     Label("Send", systemImage: "paperplane.fill")
                 }
                 .controlSize(.small)
-                // Send = Fn+Return / keypad Enter (Unicode ETX).
-                // See ChatView.swift for the rationale — SwiftUI
-                // can't bind `.fn` as a modifier, so we use the
-                // KeyEquivalent emitted by both inputs directly.
-                .keyboardShortcut(KeyEquivalent("\u{0003}"), modifiers: [])
+                // Send = ⌃↩ (control+return). See ChatView.swift
+                // for rationale: plain ↩ goes to newline inside
+                // the text editor; ⌃ pairs with the global ⌃S
+                // summon shortcut.
+                .keyboardShortcut(.return, modifiers: [.control])
                 .disabled(draftText
                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
@@ -536,6 +536,12 @@ struct VoiceOrbView: View {
                 ? "Listening… speak to interrupt."
                 : "OpenSeer is working…"
         }
+        // Type-only mode: voice opt-in is off, so the user is going
+        // to type. Show a type-focused placeholder so the editor
+        // doesn't pretend it's about to start listening.
+        if !voiceEnabled {
+            return "Type your prompt. ⌃↩ to send."
+        }
         if input.isAvailable { return "Listening starts when voice mode opens." }
         return "Voice input is unavailable in this runtime."
     }
@@ -552,6 +558,11 @@ struct VoiceOrbView: View {
         if input.isRecording { return "Listening. Pause briefly to send." }
         if input.isStarting { return "Starting microphone..." }
         if let err = input.error { return err }
+        // Same type-only mode override — without it the header
+        // promises voice behavior the orb won't actually perform.
+        if !voiceEnabled {
+            return "Type a prompt. Enable voice in Settings → General → Voice."
+        }
         return "Speak naturally. OpenSeer sends after a short pause."
     }
 
@@ -560,6 +571,9 @@ struct VoiceOrbView: View {
         if isTaskHeld { return .yellow }
         if input.isRecording { return .red }
         if isTaskRunning { return .accentColor }
+        // Type-only mode reads in a quieter tone — no red mic, no
+        // "voice ready" accent.
+        if !voiceEnabled { return .secondary }
         return .secondary
     }
 

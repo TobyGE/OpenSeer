@@ -140,7 +140,14 @@ struct ChatView: View {
                                         .isEmpty) {
                     submit()
                 }
-                .keyboardShortcut(.return, modifiers: [.command])
+                // Send = Fn+Return (or the keypad Enter key on
+                // keyboards that have one). SwiftUI's EventModifiers
+                // doesn't expose `.fn`, but on Macs without a
+                // numpad, Fn+Return emits the same event as keypad-
+                // Enter — Unicode `\u{0003}` (ETX). Binding the
+                // KeyEquivalent directly with no modifiers catches
+                // both inputs.
+                .keyboardShortcut(KeyEquivalent("\u{0003}"), modifiers: [])
             }
             HStack {
                 Toggle("Dry run (preview only)", isOn: $controller.dryRun)

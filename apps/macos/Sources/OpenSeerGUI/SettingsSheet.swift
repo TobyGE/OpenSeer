@@ -16,22 +16,24 @@ struct SettingsSheet: View {
     @State private var tab: Tab = .memory
 
     enum Tab: String, CaseIterable, Identifiable {
-        case general, memory, skills, telegram
+        case general, memory, skills, shortcuts, telegram
         var id: String { rawValue }
         var label: String {
             switch self {
-            case .general:  return "General"
-            case .memory:   return "Memory"
-            case .skills:   return "Skills"
-            case .telegram: return "Telegram"
+            case .general:   return "General"
+            case .memory:    return "Memory"
+            case .skills:    return "Skills"
+            case .shortcuts: return "Shortcuts"
+            case .telegram:  return "Telegram"
             }
         }
         var icon: String {
             switch self {
-            case .general:  return "slider.horizontal.3"
-            case .memory:   return "brain"
-            case .skills:   return "books.vertical"
-            case .telegram: return "paperplane"
+            case .general:   return "slider.horizontal.3"
+            case .memory:    return "brain"
+            case .skills:    return "books.vertical"
+            case .shortcuts: return "keyboard"
+            case .telegram:  return "paperplane"
             }
         }
     }
@@ -68,11 +70,12 @@ struct SettingsSheet: View {
     @ViewBuilder
     private var content: some View {
         switch tab {
-        case .general:  GeneralPane()
-        case .memory:   MemoryPane()
-        case .skills:   SkillsPane()
-        case .telegram: TelegramPane(statusBlob: $statusBlob,
-                                     binary: env.binaryPath ?? "")
+        case .general:   GeneralPane()
+        case .memory:    MemoryPane()
+        case .skills:    SkillsPane()
+        case .shortcuts: ShortcutsPane()
+        case .telegram:  TelegramPane(statusBlob: $statusBlob,
+                                      binary: env.binaryPath ?? "")
         }
     }
 
@@ -332,6 +335,111 @@ private struct SkillsPane: View {
         }
         return SkillEntry(name: name, family: family,
                           description: description, path: url.path)
+    }
+}
+
+// ── Keyboard shortcuts (read-only, for now) ────────────────────────
+
+private struct ShortcutsPane: View {
+    /// One row in the shortcuts table. `keys` is rendered as a
+    /// sequence of glyph chips (⌘ ⌥ ⏎ etc.), `description` is the
+    /// plain-language meaning, `scope` says where it applies.
+    struct Shortcut: Identifiable {
+        let id = UUID()
+        let keys: [String]
+        let description: String
+        let scope: String
+    }
+
+    private static let shortcuts: [Shortcut] = [
+        Shortcut(keys: ["⌘", "⌥", "S"],
+                 description: "Summon / dismiss the floating voice orb",
+                 scope: "Global"),
+        Shortcut(keys: ["Fn", "⏎"],
+                 description: "Send the prompt (also: numeric keypad Enter)",
+                 scope: "Orb panel · Chat composer"),
+        Shortcut(keys: ["⎋"],
+                 description: "Cancel / dismiss a sheet",
+                 scope: "Modal sheets"),
+        Shortcut(keys: ["⏎"],
+                 description: "Confirm default action on a sheet",
+                 scope: "Modal sheets"),
+    ]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Keyboard shortcuts")
+                    .font(.title3.bold())
+                Text("These are the keys OpenSeer binds today. Customization is on the roadmap; for now they're hard-coded.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+
+                VStack(spacing: 0) {
+                    ForEach(Array(Self.shortcuts.enumerated()), id: \.element.id) { idx, s in
+                        row(s, isFirst: idx == 0,
+                            isLast: idx == Self.shortcuts.count - 1)
+                    }
+                }
+                .background(.background.secondary)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                Text("Notes")
+                    .font(.headline)
+                    .padding(.top, 6)
+                VStack(alignment: .leading, spacing: 6) {
+                    bullet("Fn+Return is also the keypad-Enter key on Macs with a numeric keypad. Both inputs emit the same event, so either one sends.")
+                    bullet("The orb hotkey works system-wide via Carbon's `RegisterEventHotKey`, so it fires from any app. macOS may ask you to grant Accessibility the first time another app's text field has focus.")
+                    bullet("Voice input is opt-in (General → Voice). With it off, pressing ⌘⌥S still summons the orb but lands in the text field; Fn+Return sends.")
+                }
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ s: Shortcut, isFirst: Bool, isLast: Bool) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            HStack(spacing: 4) {
+                ForEach(Array(s.keys.enumerated()), id: \.offset) { _, k in
+                    Text(k)
+                        .font(.callout.monospaced())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.background)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.secondary.opacity(0.25),
+                                        lineWidth: 1))
+                }
+            }
+            .frame(width: 110, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(s.description).font(.callout)
+                Text(s.scope)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Divider().padding(.leading, 14)
+            }
+        }
+    }
+
+    private func bullet(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("•").foregroundStyle(.tertiary)
+            Text(text)
+            Spacer(minLength: 0)
+        }
     }
 }
 

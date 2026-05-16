@@ -412,7 +412,11 @@ struct VoiceOrbView: View {
                     Label("Send", systemImage: "paperplane.fill")
                 }
                 .controlSize(.small)
-                .keyboardShortcut(.return, modifiers: [.command])
+                // Send = Fn+Return / keypad Enter (Unicode ETX).
+                // See ChatView.swift for the rationale — SwiftUI
+                // can't bind `.fn` as a modifier, so we use the
+                // KeyEquivalent emitted by both inputs directly.
+                .keyboardShortcut(KeyEquivalent("\u{0003}"), modifiers: [])
                 .disabled(draftText
                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }

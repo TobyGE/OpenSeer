@@ -42,7 +42,7 @@ class Action:
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
-    selector: str | None = None    # for read_page: optional CSS selector to extract a specific element instead of full body
+    selector: str | None = None    # CSS selector — for read_page: extract that element's innerText; for click/type: drive via Chrome DevTools Protocol instead of pixel coords
     # ask_user: pause and request user input. `kind` ∈ {"confirm", "choose", "text"}.
     # `question` is the prompt shown to the user; `options` is required for kind="choose"
     # and ignored otherwise (kind="confirm" auto-uses Yes/No). `attachments` reuses
@@ -423,6 +423,60 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
     if dry_run:
         return f"would read_page in {app!r}" + (f" after navigate {url}" if url else "")
 
+    # ─── CDP fast path ────────────────────────────────────────────────
+    # When the agent passes an explicit URL we route to the OpenSeer-
+    # owned Chrome via DevTools Protocol. Why only with a URL: a
+    # bare read_page is "read whatever the user is looking at right
+    # now" — that's a different intent than "fetch this URL's text,"
+    # and the user's frontmost browser is the right surface for the
+    # former. Selecting which tab to read inside the OpenSeer Chrome
+    # without an explicit url would be guessing.
+    #
+    # We do NOT gate on the detected frontmost browser being chromium:
+    # OpenSeer's Chrome is a separate process, and the user's Safari
+    # being frontmost is irrelevant to whether we can use CDP. The
+    # only honored opt-out is the agent EXPLICITLY setting
+    # `app="Safari"` / Firefox etc. — that signals "reuse my actual
+    # logged-in browser session" and we respect it.
+    #
+    # CDPError is silenced by default (the AppleScript fallback
+    # below has parity for the bare case); the user can set
+    # OPENSEER_BROWSER_CDP=on to make CDP failures hard errors,
+    # which is useful for debugging why CDP isn't picking up.
+    explicit_non_chromium = (action.app or "").strip().lower() in (
+        "safari", "firefox", "firefox developer edition",
+        "librewolf", "waterfox", "tor browser")
+    if url and not explicit_non_chromium:
+        from . import browser_cdp
+        if browser_cdp.cdp_available():
+            try:
+                out = browser_cdp.read_page_via_cdp(
+                    url=url, selector=selector or None,
+                    max_chars=8000)
+                title = (out.get("title") or "").strip()
+                page_url = (out.get("url") or "").strip()
+                content = (out.get("content") or "").strip()
+                head = f"# {title}" if title else "# (untitled)"
+                return f"{head}\n{page_url}\n\n{content}"
+            except browser_cdp.CDPError as e:
+                if browser_cdp.cdp_required():
+                    return (f"ERROR: CDP read_page failed ({e}). "
+                            f"Unset OPENSEER_BROWSER_CDP or set it to "
+                            f"'auto' to allow AppleScript fallback.")
+                # Silent fallback to AppleScript: the CDP module
+                # already logged at INFO via its own logger.
+        elif browser_cdp.cdp_required():
+            # `=on` is the user's explicit "do NOT touch my regular
+            # browser" signal — typically set when debugging or when
+            # the run must stay inside the OpenSeer profile for
+            # logged-in-session reasons. Silently falling through to
+            # AppleScript would defeat that intent, so surface a
+            # clear error instead.
+            return ("ERROR: OPENSEER_BROWSER_CDP=on but CDP isn't "
+                    "available (no Chromium binary found; set "
+                    "OPENSEER_CHROME or install Google Chrome). "
+                    "Set =auto to allow AppleScript fallback.")
+
     # AppleScript string literal escaping: backslash + double-quote.
     # Without this, a URL or app name containing `"` or `\` breaks
     # the script — or worse, lets malicious input inject AppleScript
@@ -552,6 +606,33 @@ def execute(action: Action, *, dry_run: bool = True,
         return f"waited {s}s"
 
     # ─── computer-use primitives ──────────────────────────────────────────
+    # ─── CDP selector path for click ─────────────────────────────────
+    # When the agent provides a `selector` we drive the click through
+    # the OpenSeer-owned Chrome via DevTools Protocol instead of
+    # pyautogui pixel taps. The model uses this for web UIs where it
+    # has a reliable CSS selector but no easy way to derive (x,y) —
+    # e.g. "click button[data-testid='tweetButton']". No silent
+    # fallback to pyautogui here: without coords we'd have nowhere to
+    # tap, and surfacing the error lets the model try a different
+    # selector or screenshot+coords path.
+    if name == "click" and (action.selector or "").strip():
+        sel = action.selector.strip()
+        if dry_run:
+            return f"would CDP-click selector {sel!r}"
+        from . import browser_cdp
+        if not browser_cdp.cdp_available():
+            return ("ERROR: click(selector=...) requires CDP "
+                    "(set OPENSEER_BROWSER_CDP=auto and ensure "
+                    "Google Chrome / Chromium is installed). "
+                    "Use click(x,y) or click(index) instead.")
+        try:
+            out = browser_cdp.click_via_cdp(sel)
+            x = out.get("x"); y = out.get("y")
+            xy = f" at ({x},{y})" if x is not None and y is not None else ""
+            return f"CDP-clicked {sel!r}{xy}"
+        except browser_cdp.CDPError as e:
+            return f"ERROR: CDP click({sel!r}) failed: {e}"
+
     if name in ("click", "scroll"):
         # If `index` is given on a click and no x,y, the agent loop has
         # already resolved (x,y) from the AX tree (see _resolve_index in
@@ -657,6 +738,25 @@ def execute(action: Action, *, dry_run: bool = True,
     if name == "type":
         if not action.text:
             return "ERROR: missing text"
+        # CDP selector path: route directly into the matched element
+        # via native value-setter / contenteditable insertText. Avoids
+        # the click-then-typewrite focus dance entirely.
+        if (action.selector or "").strip():
+            sel = action.selector.strip()
+            if dry_run:
+                return (f"would CDP-type {action.text!r} into "
+                        f"selector {sel!r}")
+            from . import browser_cdp
+            if not browser_cdp.cdp_available():
+                return ("ERROR: type(selector=...) requires CDP "
+                        "(OPENSEER_BROWSER_CDP=auto + Chromium). "
+                        "Use click(x,y) + type(text) instead.")
+            try:
+                out = browser_cdp.type_via_cdp(sel, action.text)
+                return (f"CDP-typed {action.text!r} into {sel!r} "
+                        f"({out.get('status', 'ok')})")
+            except browser_cdp.CDPError as e:
+                return f"ERROR: CDP type({sel!r}) failed: {e}"
         # If x,y given, click target first to establish focus. This is the
         # robust pattern (matches Anthropic/OpenAI computer-use APIs) — the
         # model declares "type X into the field at (x,y)" and the executor

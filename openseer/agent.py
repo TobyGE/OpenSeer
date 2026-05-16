@@ -123,8 +123,8 @@ For `answer` (purely conversational), write the reply itself — no preamble.
   web_search     `query`, optional `amount`, `freshness` ∈ day|week|month|year.
   web_fetch      `url` → page text. Best for static pages; SPAs (X / LinkedIn / etc.) need read_page instead.
   read_page      READ a webpage's content (posts/articles/search results/threads). Returns the active browser tab's full innerText in one call — replaces 5+ scroll-and-screenshot turns and handles SPAs (X / LinkedIn / Substack / Reddit) where `web_fetch` returns empty shells. Optional `url` (navigate first, in the same call), `app` (Safari/Chrome/Arc/Brave/Edge — default = whatever's frontmost), `selector` (CSS like `"article"`/`"main"` for one section only). Use this for ANY task that says "summarize / read / browse / find X in posts / what does this page say". One-time setup: user enables "Allow JavaScript from Apple Events" in the browser's menu — the action returns a clear error with the menu path if not.
-  click          `index` (AX-tree, preferred when present) OR `x`, `y`. Optional `count`.
-  type           `text` + one of: `index`, `x,y`, or NEITHER (use currently-focused field).
+  click          `index` (AX-tree, preferred when present) OR `x`, `y`. Optional `count`. ALSO `selector` (CSS) when the target is inside the OpenSeer-owned Chrome — drives via DevTools Protocol; use after `read_page` with a `url` has populated that browser. Don't use `selector` for native macOS UI — only for web elements you've just inspected via read_page.
+  type           `text` + one of: `index`, `x,y`, `selector` (CSS, OpenSeer Chrome only — types via the native value setter so React/Vue change handlers fire), or NEITHER (use currently-focused field).
   key            `key` combo like `"cmd+a"`, `"enter"`, `"pageup"`, `"esc"`.
   scroll         `x`, `y`, `amount` (positive=down, 50–200 for fast).
   open_app       `app` = name. Activates via AppleScript; bypasses the Dock.

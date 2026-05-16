@@ -135,7 +135,16 @@ whichever you're missing. Your choice persists to
   [`openseer_ax`](./openseer_ax) package for other macOS
   automation projects.
 - **Read pages** — `read_page` pulls a webpage's full text in one
-  call, no scroll-and-screenshot loops.
+  call, no scroll-and-screenshot loops. When a URL is supplied,
+  OpenSeer drives a dedicated Chrome instance (separate
+  `--user-data-dir=~/.openseer/chrome-profile`, never your normal
+  browser) via Chrome DevTools Protocol — Promise-awaiting,
+  DOM-stable waits, no "Allow JavaScript from Apple Events" toggle
+  required. First time you need a logged-in site, log in once
+  inside that profile; cookies persist. Set
+  `OPENSEER_BROWSER_CDP=off` to disable and stay on the
+  AppleScript path; `=on` to make CDP failures hard errors
+  (default `auto` falls back silently).
 - **Bash + web** — runs shell commands, fetches URLs, web search.
   The agent picks the right tool itself.
 - **Skills that grow themselves** — per-site / per-app markdown

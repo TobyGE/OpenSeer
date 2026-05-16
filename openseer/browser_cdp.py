@@ -517,6 +517,558 @@ class CDPClient:
         return (result.get("result") or {}).get("value")
 
 
+# ── JS helpers ───────────────────────────────────────────────────────
+# These are template strings with {placeholders} filled in by Python.
+# Ported from OpenCLI's `dom-helpers.ts` waitForDomStableJs / clickJs /
+# typeTextJs with three adaptations:
+#   1. Single-string literal so we can str.format it from Python
+#   2. JSON-encode all caller-supplied values to defend against
+#      attribute / quote injection
+#   3. No `data-opencli-ref` attribute lookup — we don't stamp refs;
+#      we accept a raw CSS selector
+#
+# Why we don't import the strings from OpenCLI: it's TypeScript with
+# its own build, and the file is small. Reimplementing in-line keeps
+# the dep boundary clean and lets us evolve the JS without bumping
+# an external version. Comments call out the OpenCLI lineage.
+
+_DOM_STABLE_JS = """
+new Promise(resolve => {{
+  if (!document.body) {{
+    setTimeout(() => resolve('nobody'), {max_ms});
+    return;
+  }}
+  let timer = null;
+  let cap = null;
+  const obs = new MutationObserver(resetQuiet);
+  function done(reason) {{
+    clearTimeout(timer);
+    clearTimeout(cap);
+    obs.disconnect();
+    resolve(reason);
+  }}
+  function resetQuiet() {{
+    clearTimeout(timer);
+    timer = setTimeout(() => done('quiet'), {quiet_ms});
+  }}
+  obs.observe(document.body, {{
+    childList: true, subtree: true, attributes: true,
+  }});
+  resetQuiet();
+  cap = setTimeout(() => done('capped'), {max_ms});
+}})
+"""
+
+# Click via querySelector + el.click(). Works for ~95% of click
+# targets; CDP-Input mouse-dispatch fallback can come later if we
+# hit elements that need a real bubbled MouseEvent sequence.
+_CLICK_JS = """
+(() => {{
+  const sel = {selector_json};
+  let el = document.querySelector(sel);
+  if (!el) {{
+    // Try indexed access: selector === "12" → 12th matching tabbable.
+    const idx = parseInt(sel, 10);
+    if (!isNaN(idx)) {{
+      el = document.querySelectorAll(
+        'a, button, input, select, textarea, '
+        + '[role="button"], [tabindex]:not([tabindex="-1"])')[idx];
+    }}
+  }}
+  if (!el) throw new Error('Element not found: ' + sel);
+  el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+  const r = el.getBoundingClientRect();
+  el.click();
+  return {{
+    status: 'clicked', x: Math.round(r.left + r.width/2),
+    y: Math.round(r.top + r.height/2),
+    w: Math.round(r.width), h: Math.round(r.height),
+  }};
+}})()
+"""
+
+# Type via the native setter so React/Vue / Lit-style controlled
+# inputs fire change handlers correctly. For contenteditable we
+# fall back to document.execCommand insertText — deprecated but
+# the only path that fires the right composition + input event
+# sequence for SPAs like the Twitter composer.
+_TYPE_JS = """
+(() => {{
+  const sel = {selector_json};
+  const text = {text_json};
+  const el = document.querySelector(sel);
+  if (!el) throw new Error('Element not found: ' + sel);
+  el.focus();
+  if (el.isContentEditable) {{
+    const sel0 = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    sel0.removeAllRanges();
+    sel0.addRange(range);
+    document.execCommand('insertText', false, text);
+    return {{ status: 'typed-contenteditable',
+              length: text.length }};
+  }}
+  const proto = el.tagName === 'TEXTAREA'
+    ? window.HTMLTextAreaElement.prototype
+    : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+  setter.call(el, text);
+  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  return {{ status: 'typed', length: text.length }};
+}})()
+"""
+
+
+# ── CDPTab — page-level convenience wrapper ──────────────────────────
+
+
+class CDPTab:
+    """Wraps a single Chrome target (= page) with the methods the
+    OpenSeer agent loop needs. All methods are async; the sync
+    callers (executor.py via the bridge functions below) marshal
+    through `_BackgroundLoop`.
+
+    Lifecycle: open via `ChromeManager.open_tab()` or `current_tab()`,
+    use, then `await close()`. Closing the tab here drops the CDP
+    socket but does NOT close the Chrome target itself — the user
+    can keep using it. Callers that want the tab gone too should
+    `_close_target` separately.
+    """
+
+    def __init__(self, port: int, target: dict) -> None:
+        self._port = port
+        self._target = target
+        self._client: CDPClient | None = None
+        self._enabled = False
+
+    async def _ensure_client(self) -> CDPClient:
+        if self._client is None:
+            ws = self._target.get("webSocketDebuggerUrl")
+            if not ws:
+                raise CDPError("target has no webSocketDebuggerUrl")
+            self._client = CDPClient(ws)
+            await self._client.connect()
+        if not self._enabled:
+            await self._client.send("Page.enable")
+            await self._client.send("Runtime.enable")
+            self._enabled = True
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
+
+    @property
+    def target_id(self) -> str:
+        return str(self._target.get("id", ""))
+
+    async def goto(self, url: str, *, wait_load: bool = True,
+                   timeout: float = 20.0) -> None:
+        """Navigate to `url`. When `wait_load` is true, ALSO waits
+        for (a) the destination document to actually exist (the
+        new `Runtime.evaluate` is hitting the new page, not the
+        prior about:blank), and (b) the DOM to stabilize for ~400ms.
+
+        Why the two-phase wait: `Page.navigate` returns as soon as
+        Chrome has accepted the navigation request; it does NOT mean
+        the new document has been parsed yet. Without phase (a) a
+        fast follow-up `Runtime.evaluate` can hit the about:blank
+        document, find a quiet DOM immediately, and `read_page_via_cdp`
+        returns empty content — exactly the silent failure mode this
+        method was built to avoid.
+
+        Detection uses two independent signals: a URL change away
+        from the pre-navigate href, OR a `readyState=='loading'`
+        observation (proving the document went through a fresh load
+        cycle). Either one combined with a final non-loading state
+        is sufficient. Polling beats Page events here because our
+        CDPClient demuxes by reply-id only — adding event dispatch
+        would be more surface area than the problem warrants."""
+        c = await self._ensure_client()
+        try:
+            pre_href = await self.evaluate(
+                "location.href", await_promise=False)
+        except CDPError:
+            pre_href = None
+        await c.send("Page.navigate", {"url": url})
+        if wait_load:
+            await self._wait_document_committed(
+                pre_href=pre_href if isinstance(pre_href, str) else None,
+                timeout=min(timeout, 8.0))
+            try:
+                await self.wait_dom_stable(
+                    quiet_ms=400, max_ms=int(timeout * 1000))
+            except CDPError:
+                # Don't fail navigation just because DOM-stable timed
+                # out; agents often want partial content anyway.
+                pass
+
+    async def _wait_document_committed(self, *,
+                                       pre_href: str | None,
+                                       timeout: float = 8.0) -> None:
+        """Wait until we have evidence the destination document is
+        live. Two independent qualifying signals (only one needed):
+
+          - `location.href` differs from `pre_href` and isn't blank
+            — Chrome has swapped to the new document
+          - we observe `document.readyState=='loading'` at any point
+            — proves the document went through a fresh load cycle
+            (handles re-navigation to the same URL where href won't
+            change)
+
+        Either signal, combined with a final non-loading readyState
+        (`interactive` or `complete`), means it's safe to query the
+        page. If the timeout fires without that combination, return
+        anyway — the goto() contract doesn't raise on slow pages."""
+        deadline = time.monotonic() + timeout
+        saw_loading = False
+        while time.monotonic() < deadline:
+            try:
+                # Bundle href + readyState in one round-trip — keeps
+                # the poll cycle cheap (~5-10ms per probe).
+                probe = await self.evaluate(
+                    "({h: location.href, s: document.readyState})",
+                    await_promise=False)
+            except CDPError:
+                # Transient — Page.navigate can briefly leave Runtime
+                # without an active execution context. Retry.
+                await asyncio.sleep(0.1)
+                continue
+            href = probe.get("h") if isinstance(probe, dict) else None
+            state = probe.get("s") if isinstance(probe, dict) else None
+            url_changed = (isinstance(href, str)
+                           and href != "about:blank"
+                           and (pre_href is None or href != pre_href))
+            if state == "loading":
+                saw_loading = True
+            if (url_changed or saw_loading) \
+                    and state in ("interactive", "complete"):
+                return
+            await asyncio.sleep(0.05)
+
+    async def wait_dom_stable(self, *, quiet_ms: int = 400,
+                              max_ms: int = 4000) -> str:
+        js = _DOM_STABLE_JS.format(quiet_ms=quiet_ms, max_ms=max_ms)
+        return str(await self.evaluate(js, await_promise=True))
+
+    async def evaluate(self, expression: str, *,
+                       await_promise: bool = True) -> Any:
+        c = await self._ensure_client()
+        return await c.evaluate(expression, await_promise=await_promise)
+
+    async def extract_text(self, *, selector: str | None = None,
+                           max_chars: int = 8000) -> str:
+        """`innerText` of selector match (or full body). Result is
+        truncated to `max_chars` to match the existing AppleScript
+        path's 8 kB cap."""
+        if selector:
+            js = (
+                "(() => {"
+                f"const el = document.querySelector({json.dumps(selector)});"
+                "if (!el) return null;"
+                f"return el.innerText.slice(0, {max_chars});"
+                "})()"
+            )
+        else:
+            js = (f"(document.body ? document.body.innerText : '')"
+                   f".slice(0, {max_chars})")
+        out = await self.evaluate(js, await_promise=False)
+        return str(out or "")
+
+    async def title(self) -> str:
+        return str(await self.evaluate("document.title",
+                                        await_promise=False))
+
+    async def current_url(self) -> str:
+        return str(await self.evaluate("location.href",
+                                        await_promise=False))
+
+    async def click(self, selector: str) -> dict:
+        js = _CLICK_JS.format(selector_json=json.dumps(selector))
+        out = await self.evaluate(js, await_promise=False)
+        return out if isinstance(out, dict) else {"status": "ok"}
+
+    async def type_text(self, selector: str, text: str) -> dict:
+        js = _TYPE_JS.format(
+            selector_json=json.dumps(selector),
+            text_json=json.dumps(text))
+        out = await self.evaluate(js, await_promise=False)
+        return out if isinstance(out, dict) else {"status": "ok"}
+
+
+def _close_target(port: int, target_id: str) -> None:
+    """HTTP request to close a tab. Best-effort; ignored on error."""
+    try:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/close/{target_id}",
+            timeout=2.0).read()
+    except (urllib.error.URLError, OSError, TimeoutError):
+        pass
+
+
+# ── ChromeManager — process-wide singleton ───────────────────────────
+
+
+class ChromeManager:
+    """Single OpenSeer Chrome per Python process.
+
+    The agent loop runs synchronously in a worker thread; ChromeManager
+    is the bridge it talks to for "I need a browser tab now." We keep
+    the launched ChromeHandle cached so the second read_page in a run
+    doesn't pay the 1-3s Chrome cold-start tax.
+    """
+
+    _instance: "ChromeManager | None" = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def shared(cls) -> "ChromeManager":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def __init__(self) -> None:
+        self._handle: ChromeHandle | None = None
+        self._handle_lock = threading.Lock()
+        # target_id of the most recent CDP read. Used to pin
+        # follow-up selector clicks/types to the same tab even when
+        # `/json` MRU ordering changes (browser pop-up activates a
+        # different tab, user clicks into the OpenSeer Chrome, etc.).
+        self._last_target_id: str | None = None
+        self._last_target_lock = threading.Lock()
+
+    def remember_target(self, target_id: str) -> None:
+        with self._last_target_lock:
+            self._last_target_id = target_id
+
+    def _remembered_target(self) -> str | None:
+        with self._last_target_lock:
+            return self._last_target_id
+
+    def ensure_running(self) -> ChromeHandle:
+        """Returns a usable ChromeHandle, launching if needed. Idempotent.
+        Re-launches if a previously-cached handle's port no longer
+        answers DevTools (Chrome was quit by the user, OS killed it,
+        etc.) OR if the port is now held by some OTHER Chrome (we got
+        race-displaced after our Chrome exited and a regular Chrome
+        bound the port). The lsof+cmdline cross-check is the SAME
+        guard `launch_chrome` uses on first attach — without it here
+        we'd silently route the agent into the user's regular Chrome
+        and clobber whatever they had open. Real edge case but the
+        blast radius (writing into the user's tabs) is large enough
+        that paying ~5ms of lsof per request is fine."""
+        with self._handle_lock:
+            if self._handle is not None:
+                port = self._handle.port
+                if _devtools_reachable(port) and _our_chrome_on_port(port):
+                    return self._handle
+                log.info(
+                    "CDP cached Chrome on :%d no longer ours (gone or "
+                    "displaced); relaunching", port)
+                self._handle = None
+            self._handle = launch_chrome()
+            return self._handle
+
+    def open_tab(self, url: str | None = None) -> CDPTab:
+        """Create a NEW target pointing at `url` (or about:blank if
+        not provided) and return a CDPTab bound to it. The caller
+        owns the tab — close it via `tab.close()` then optionally
+        `_close_target(port, tab.target_id)`."""
+        handle = self.ensure_running()
+        target_url = url or "about:blank"
+        target = _new_tab(handle.port, target_url)
+        return CDPTab(handle.port, target)
+
+    def front_tab(self) -> CDPTab | None:
+        """Return a CDPTab to operate on. Preference order:
+
+          1. The target_id remembered by the last successful CDP
+             read (via `remember_target`), if it still exists. This
+             is what binds `click(selector=...)` to the tab that
+             `read_page(url=...)` just populated — `/json` MRU order
+             is not stable across multiple reads (a popup, an
+             extension, or the user clicking into OpenSeer Chrome
+             can promote a different tab to front), and selector
+             actions silently hitting the wrong tab would corrupt
+             the read_page → click workflow.
+          2. Fall back to MRU (`/json[0]`) when no remembered target
+             exists or that target was closed — best effort for
+             ad-hoc one-off click(selector) calls.
+
+        Returns None if there are no page targets at all."""
+        handle = self.ensure_running()
+        tabs = fetch_tabs(handle.port)
+        if not tabs:
+            return None
+        remembered = self._remembered_target()
+        if remembered:
+            for t in tabs:
+                if t.get("id") == remembered:
+                    return CDPTab(handle.port, t)
+            # Remembered target was closed — clear the cache so we
+            # don't keep racing back to it.
+            with self._last_target_lock:
+                if self._last_target_id == remembered:
+                    self._last_target_id = None
+        return CDPTab(handle.port, tabs[0])
+
+    def shutdown(self) -> None:
+        """Kill the Chrome we spawned (if any). Doesn't touch
+        Chromes we merely attached to. Mostly for tests."""
+        with self._handle_lock:
+            h = self._handle
+            self._handle = None
+        if h is None or h.proc is None:
+            return
+        try:
+            h.proc.terminate()
+        except OSError:
+            pass
+
+
+# ── sync bridges for executor.py ─────────────────────────────────────
+
+
+def cdp_available() -> bool:
+    """Cheap, non-throwing probe — does the system have what we need?
+    Used by executor.py as the gate: try CDP only if this returns
+    True, otherwise fall straight through to AppleScript without
+    paying the launch cost or the user-visible Chrome flash.
+    """
+    # Hard gate via env var so a user can force-off if CDP is misbehaving.
+    mode = (os.environ.get("OPENSEER_BROWSER_CDP", "auto") or "").lower()
+    if mode == "off":
+        return False
+    return find_chrome_binary() is not None
+
+
+def cdp_required() -> bool:
+    """True when the user has set `OPENSEER_BROWSER_CDP=on` — in
+    that mode a CDP failure should surface to the model as an error
+    instead of silently falling back to AppleScript. Useful for
+    diagnosing why CDP isn't being picked up."""
+    return (os.environ.get("OPENSEER_BROWSER_CDP", "auto") or "")\
+        .lower() == "on"
+
+
+def _run_cdp(coro_factory, *, what: str) -> Any:
+    """Submit a coroutine-producing callable to the background loop
+    and uniformly convert any leaked exception into CDPError. The
+    executor's fallback layer only catches CDPError, so a stray
+    OSError from a half-open socket, `websockets.ConnectionClosed`,
+    or the background-loop's `concurrent.futures.TimeoutError`
+    would otherwise escape and abort the agent step instead of
+    falling through to AppleScript. Centralizing the wrap here
+    keeps the contract honest at every bridge entry point."""
+    try:
+        return _BackgroundLoop.shared().run(coro_factory())
+    except CDPError:
+        raise
+    except Exception as e:
+        raise CDPError(f"{what}: {type(e).__name__}: {e}") from e
+
+
+def read_page_via_cdp(*, url: str | None = None,
+                      selector: str | None = None,
+                      max_chars: int = 8000) -> dict:
+    """Sync entry point used by executor._read_page. Returns a dict
+    with the same shape as the existing AppleScript path's JSON
+    output: ``{title, url, content}``. Raises CDPError on failure;
+    the caller decides whether to fall back to AppleScript."""
+    async def _run() -> dict:
+        mgr = ChromeManager.shared()
+        if url:
+            # `/json/new?url=...` (inside open_tab) ALREADY initiated
+            # navigation to `url`. Calling Page.navigate(url) here
+            # would be a redundant second nav AND would defeat the
+            # `_wait_document_committed` heuristic: pre_href would
+            # already equal url, the readyState may have raced past
+            # 'loading', and we'd burn the full 8s timeout on every
+            # call. Just wait for the already-in-flight load.
+            tab = mgr.open_tab(url)
+            # Pin THIS tab as the follow-up selector target so a
+            # later click/type doesn't race onto whichever tab `/json`
+            # happens to report first.
+            if tab.target_id:
+                mgr.remember_target(tab.target_id)
+        else:
+            tab = mgr.front_tab()
+            if tab is None:
+                tab = mgr.open_tab("about:blank")
+        try:
+            if url:
+                await tab._ensure_client()
+                # pre_href=None: a freshly-spawned target's initial
+                # location.href is 'about:blank' before /json/new's
+                # URL parameter applies, so any non-blank reading is
+                # already evidence of the navigation we asked for.
+                await tab._wait_document_committed(
+                    pre_href=None, timeout=8.0)
+                try:
+                    await tab.wait_dom_stable(
+                        quiet_ms=400, max_ms=8000)
+                except CDPError:
+                    pass
+            else:
+                await tab.wait_dom_stable(quiet_ms=300, max_ms=2500)
+            title = await tab.title()
+            current = await tab.current_url()
+            content = await tab.extract_text(
+                selector=selector, max_chars=max_chars)
+            if selector and not content:
+                content = "(selector matched no element)"
+            return {"title": title, "url": current,
+                    "content": content}
+        finally:
+            # Drop the websocket but LEAVE the OS-level tab open: the
+            # agent's natural follow-up is `click(selector=...)` /
+            # `type(selector=...)` against the same page, and those
+            # bind to ChromeManager.front_tab(). Closing the target
+            # here would force the model into a "read_page → empty
+            # browser → reopen URL → click" loop that defeats the
+            # whole point of the URL+selector workflow. Tabs
+            # accumulate over a run, but the OpenSeer Chrome is per-
+            # process and short-lived; we'll revisit lifecycle when
+            # multi-tab workflows show up.
+            await tab.close()
+    return _run_cdp(_run, what="read_page")
+
+
+def click_via_cdp(selector: str) -> dict:
+    """Click an element by CSS selector in the front-most OpenSeer
+    Chrome tab. Used by executor when an Action has `selector` set."""
+    async def _run() -> dict:
+        tab = ChromeManager.shared().front_tab()
+        if tab is None:
+            raise CDPError(
+                "no open tab to click into — use read_page with a url "
+                "first, or open_app the browser to give it a page")
+        try:
+            return await tab.click(selector)
+        finally:
+            await tab.close()
+    return _run_cdp(_run, what="click")
+
+
+def type_via_cdp(selector: str, text: str) -> dict:
+    """Type `text` into the element matching `selector` on the
+    front-most OpenSeer Chrome tab."""
+    async def _run() -> dict:
+        tab = ChromeManager.shared().front_tab()
+        if tab is None:
+            raise CDPError(
+                "no open tab to type into — open the page first")
+        try:
+            return await tab.type_text(selector, text)
+        finally:
+            await tab.close()
+    return _run_cdp(_run, what="type")
+
+
 # ── Day 1 smoke test ─────────────────────────────────────────────────
 
 
@@ -580,17 +1132,25 @@ def _main() -> int:
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(message)s",
     )
-    if len(sys.argv) < 3 or sys.argv[1] != "test":
-        print("usage: python -m openseer.browser_cdp test <url>",
+    if len(sys.argv) < 3 or sys.argv[1] not in ("test", "read"):
+        print("usage:\n"
+              "  python -m openseer.browser_cdp test <url>\n"
+              "  python -m openseer.browser_cdp read <url>",
               file=sys.stderr)
         return 2
-    url = sys.argv[2]
+    cmd, url = sys.argv[1], sys.argv[2]
     try:
-        title = _BackgroundLoop.shared().run(_smoke_test(url))
+        if cmd == "test":
+            title = _BackgroundLoop.shared().run(_smoke_test(url))
+            print(f"OK: title={title!r}")
+        else:
+            out = read_page_via_cdp(url=url, max_chars=200)
+            print(f"OK: title={out['title']!r} "
+                  f"url={out['url']!r} "
+                  f"content[:200]={out['content']!r}")
     except CDPError as e:
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
-    print(f"OK: title={title!r}")
     return 0
 
 

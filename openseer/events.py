@@ -57,6 +57,17 @@ class EventType:
     SKILL_PROPOSED  = "skill_proposed"
     SKILL_APPLIED   = "skill_applied"
     SKILL_DISCARDED = "skill_discarded"
+    # Mirror of SKILL_PROPOSED for the per-user MEMORY.md file. The
+    # reflection callback fires MEMORY_PROPOSED and writes
+    # ~/.openseer/runs/<run_id>/proposed_memory.md; the GUI shows a
+    # chip; the user clicks Save (→ apply_memory) or Discard (→
+    # discard_memory) over the agentd WS. Auto-applying without
+    # confirmation was a prompt-injection sink — page content fed
+    # into reflection could persist instructions into every future
+    # run's prompt.
+    MEMORY_PROPOSED  = "memory_proposed"
+    MEMORY_APPLIED   = "memory_applied"
+    MEMORY_DISCARDED = "memory_discarded"
 
 
 @dataclass

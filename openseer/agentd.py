@@ -498,6 +498,94 @@ class _Connection:
             })
             return
 
+        if t in ("apply_memory", "discard_memory"):
+            # Same shape as apply_skill/discard_skill, for the
+            # per-user MEMORY.md file. The reflection callback emits
+            # MEMORY_PROPOSED and writes
+            # ~/.openseer/runs/<run_id>/proposed_memory.md to disk;
+            # the orb shows a chip; the user clicks Save or Discard;
+            # the click lands here AFTER the agent's run() loop has
+            # already returned. Reconstruct from disk only.
+            target = msg.get("run_id")
+            if not target:
+                await self.send({
+                    "type": "error", "request_id": rid,
+                    "error": f"{t}: missing run_id",
+                })
+                return
+            run_dir = Path.home() / ".openseer" / "runs" / target
+            proposed_path = run_dir / "proposed_memory.md"
+            if t == "apply_memory":
+                if not proposed_path.exists():
+                    await self.send({
+                        "type": "error", "request_id": rid,
+                        "error": "no proposed memory for this run",
+                    })
+                    return
+                try:
+                    from .personal import append_memory, MEMORY_PATH
+                    body = proposed_path.read_text(encoding="utf-8")
+                    if not body.strip():
+                        raise ValueError("proposed_memory.md is empty")
+                    if len(body) > 2000:
+                        # Defense-in-depth: reflection enforced the
+                        # same cap, but a stale file might predate
+                        # that check.
+                        raise ValueError(
+                            f"proposed memory too large ({len(body)} bytes)")
+                    append_memory(body)
+                    try:
+                        proposed_path.unlink()
+                    except Exception:
+                        pass
+                    await self.send({
+                        "type": "ack", "request_id": rid,
+                        "memory_path": str(MEMORY_PATH),
+                    })
+                    await self.send({
+                        "type": "event", "run_id": target,
+                        "event": {
+                            "type": "memory_applied",
+                            "ts": time.time(),
+                            "step": None,
+                            "data": {
+                                "memory_path": str(MEMORY_PATH),
+                                "body": body,
+                                "bytes_": len(body),
+                            },
+                        },
+                    })
+                except Exception as e:
+                    log.warning("apply_memory failed for %s: %s",
+                                 target, e)
+                    await self.send({
+                        "type": "error", "request_id": rid,
+                        "error": str(e),
+                    })
+                return
+            # discard_memory
+            try:
+                proposed_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                log.warning("discard_memory: couldn't unlink %s: %s",
+                             proposed_path, e)
+            await self.send({
+                "type": "ack", "request_id": rid,
+                "discarded": target,
+            })
+            await self.send({
+                "type": "event", "run_id": target,
+                "event": {
+                    "type": "memory_discarded",
+                    "ts": time.time(),
+                    "step": None,
+                    "data": {},
+                },
+            })
+            return
+
         if t == "cancel_task":
             target = msg.get("run_id")
             # Two-pronged stop:

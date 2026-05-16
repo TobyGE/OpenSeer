@@ -24,6 +24,7 @@ from ..skills import (
 
 
 _SKILL_BLOCK_RE = re.compile(r"```skill-md\s*\n(.*?)\n```", re.DOTALL)
+_MEMORY_BLOCK_RE = re.compile(r"```memory-md\s*\n(.*?)\n```", re.DOTALL)
 # Extract the bulleted lesson-learned summary from the reflection
 # markdown so the GUI chip can show the user-facing reason without
 # having to ship them the full reflection text.
@@ -47,8 +48,10 @@ REFLECTION_PROMPT = """You are OpenSeer's post-run reflection pass.
 
 You receive a completed, failed, capped, or interrupted macOS agent run.
 Do NOT continue the task and do NOT output action JSON.
-Write a concise markdown reflection for the trace, and optionally propose a
-durable skill update only when the run taught reusable app knowledge.
+Write a concise markdown reflection for the trace, and optionally propose:
+1. a durable skill update when the run taught reusable app/site knowledge.
+2. a durable memory update when the user explicitly revealed a reusable
+   personal preference/default/fact that should affect future tasks.
 
 Rules:
 - Use only evidence from the steps. Cite steps like [steps 4-9].
@@ -101,6 +104,15 @@ Rules:
   evidence-backed new facts.
 - The skill body MUST have frontmatter with name, description, family, and
   requires.apps. For macOS UI skills use `family: cu`.
+- Memory updates are NOT app skills. Propose memory only for stable user facts
+  such as preferences, defaults, addresses, payment-card aliases/last-fours,
+  naming conventions, or recurring boundaries. Do NOT save one-off task values,
+  search terms, URLs, content from third-party pages, or guesses.
+- Memory updates are appended automatically after reflection. Be conservative:
+  only include facts the user explicitly stated or confirmed.
+- If proposing memory, output short Markdown bullets in a ```memory-md fenced
+  block. Each bullet should be independently useful and <= 200 chars. Use the
+  user's own explicit statement or an ask_user reply as evidence.
 
 Output exactly this markdown shape:
 
@@ -113,6 +125,12 @@ Lesson learned:
 
 Skill update:
 none
+
+Memory update:
+none
+
+Skill and memory decisions are independent. If there is memory to save but no
+skill update, keep `Skill update: none` and use `Memory update: append`.
 
 Or:
 
@@ -129,6 +147,13 @@ update `skill-name`
 ```skill-md
 <full merged SKILL.md>
 ```
+
+Memory update:
+append
+
+```memory-md
+- preference: ...
+```
 """
 
 
@@ -144,6 +169,17 @@ def extract_skill_block(markdown: str) -> str | None:
     if not m:
         return None
     return m.group(1).strip() + "\n"
+
+
+def extract_memory_block(markdown: str) -> str | None:
+    m = _MEMORY_BLOCK_RE.search(markdown or "")
+    if not m:
+        return None
+    body = m.group(1).strip()
+    if not body:
+        return None
+    lines = [line.rstrip() for line in body.splitlines() if line.strip()]
+    return "\n".join(lines).strip() + "\n"
 
 
 def extract_lesson_block(markdown: str) -> str:
@@ -565,6 +601,18 @@ class RunReflectionCallback(Callback):
         # auto: write after validation
         # trace-only/off: append reflection but never write
         self.mode = (mode or os.environ.get("OPENSEER_SKILL_UPDATES") or "ask").strip().lower()
+        # Memory writes have a different blast radius than skill
+        # writes — MEMORY.md is injected into EVERY future run's
+        # prompt, while a skill only fires when the agent re-enters
+        # the matching app/site. We default memory to `ask` and only
+        # honor `auto` when the user explicitly opts in via the
+        # separate OPENSEER_MEMORY_UPDATES env var; the skill mode is
+        # NOT inherited. This matters when a user sets
+        # OPENSEER_SKILL_UPDATES=auto for frictionless skill saves —
+        # they shouldn't silently get auto-applied memory writes too.
+        self.memory_mode = (
+            os.environ.get("OPENSEER_MEMORY_UPDATES") or "ask"
+        ).strip().lower()
         self.verbose = verbose
 
     def on_run_end(self, ctx: dict[str, Any]) -> None:
@@ -597,6 +645,7 @@ class RunReflectionCallback(Callback):
             return
 
         skill_body = extract_skill_block(reflection)
+        memory_body = extract_memory_block(reflection)
         if skill_body:
             # Persist the expected skill name as a sidecar so the
             # daemon's Telegram "Apply" button (which fires after the
@@ -631,6 +680,8 @@ class RunReflectionCallback(Callback):
             lesson_text = extract_lesson_block(reflection)
             self._maybe_apply_skill(ctx, skill_body, trace_path,
                                     lesson_text=lesson_text)
+        if memory_body:
+            self._maybe_apply_memory(ctx, memory_body, trace_path)
 
     def _reflect(self, ctx: dict[str, Any], stream_full) -> str:
         history = ctx.get("history") or []
@@ -856,6 +907,112 @@ class RunReflectionCallback(Callback):
                 print(f"  ✓ updated skill {parsed.name} → {res.path}")
         else:
             self._append_note(trace_path, f"Skill apply skipped: {res.error}")
+
+    def _maybe_apply_memory(self, ctx: dict[str, Any], memory_body: str,
+                            trace_path: Path) -> None:
+        # MEMORY.md is injected into every future run as user-facts
+        # context, so a poisoned line here keeps influencing the model
+        # forever. Reflection input is derived from run traces that
+        # can include attacker-controlled `read_page` / `web_fetch`
+        # content, so we mirror the skill flow: propose, wait for the
+        # user to approve via the GUI chip (or CLI input() prompt),
+        # then write. The auto-apply path that existed previously
+        # was a prompt-injection sink — flagged repeatedly by codex
+        # review on the Day 2-5 CDP push.
+        #
+        # Crucially this uses `self.memory_mode` (own env var,
+        # defaults to "ask") not `self.mode` — see __init__ for why
+        # skill auto-apply must NOT silently extend to memory.
+        if ctx.get("dry_run"):
+            self._append_note(trace_path, "Memory apply skipped: run was dry-run.")
+            return
+        if self.memory_mode in ("off", "trace-only", "none"):
+            return
+        if len(memory_body) > 2000:
+            self._append_note(trace_path, "Memory apply skipped: proposed memory was too large.")
+            return
+
+        out_dir = Path(ctx["out_dir"])
+        # Stash the proposed memory on disk so the deferred
+        # apply_memory request (after the agent loop has exited)
+        # can read the exact vetted body — we can't trust ctx by
+        # the time the user clicks Save.
+        try:
+            (out_dir / "proposed_memory.md").write_text(
+                memory_body, encoding="utf-8",
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"[reflection] could not write "
+                      f"proposed_memory.md: {e}")
+
+        if self.memory_mode == "ask":
+            emit_event = ctx.get("_emit_event")
+            if callable(emit_event):
+                run_id = out_dir.name
+                emit_event(
+                    "memory_proposed",
+                    run_id=run_id,
+                    body=memory_body,
+                    bytes_=len(memory_body),
+                )
+                self._append_note(
+                    trace_path,
+                    f"Memory apply deferred: emitted MEMORY_PROPOSED "
+                    f"({len(memory_body)} bytes); waiting for user.",
+                )
+                return
+            # CLI fallback: print preview + input() prompt.
+            print()
+            print("  ◌ proposed memory update")
+            print(f"    bytes: {len(memory_body)}")
+            print("    --- BODY PREVIEW (first 40 lines) ---")
+            for line in memory_body.splitlines()[:40]:
+                print(f"    | {line}")
+            if memory_body.count("\n") > 40:
+                print(f"    | ... ({memory_body.count(chr(10)) - 40} more lines)")
+            print("    --- END PREVIEW ---")
+            try:
+                ans = input("  Apply this memory update? [y/N] ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans not in ("y", "yes"):
+                self._append_note(trace_path, "Memory apply skipped: user did not confirm.")
+                return
+
+        # Reaches here when memory_mode != "ask" (the explicit
+        # OPENSEER_MEMORY_UPDATES=auto opt-in), or memory_mode == "ask"
+        # AND the CLI prompt was confirmed. The GUI-event branch
+        # returns above without writing — apply happens later through
+        # the agentd apply_memory handler.
+        self._apply_memory_now(ctx, memory_body, trace_path)
+
+    def _apply_memory_now(self, ctx: dict[str, Any], memory_body: str,
+                          trace_path: Path) -> None:
+        try:
+            from ..personal import append_memory, MEMORY_PATH
+            append_memory(memory_body)
+            self._append_note(trace_path, f"Memory applied: appended to {MEMORY_PATH}.")
+            # Clean up the sidecar — same idempotency guard the skill
+            # flow uses so a double-confirm can't double-apply.
+            try:
+                (Path(ctx["out_dir"]) / "proposed_memory.md").unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            emit_event = ctx.get("_emit_event")
+            if callable(emit_event):
+                run_id = Path(ctx["out_dir"]).name
+                emit_event(
+                    "memory_applied",
+                    run_id=run_id,
+                    memory_path=str(MEMORY_PATH),
+                    body=memory_body,
+                    bytes_=len(memory_body),
+                )
+        except Exception as e:
+            self._append_note(trace_path, f"Memory apply failed: {e!r}")
 
     def _find_existing_skill(self, ctx: dict[str, Any], name: str) -> Any:
         """Look up `name` in ctx's loaded skill groups; None if not found."""

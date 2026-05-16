@@ -463,6 +463,28 @@ final class AgentdClient: NSObject {
             "discard_skill", payload: ["run_id": runId])
     }
 
+    /// Persist the MEMORY.md body the daemon parked at
+    /// `~/.openseer/runs/<runId>/proposed_memory.md`. Same shape as
+    /// applySkill — body's already on disk, this just authorizes
+    /// the write. Returns the path the daemon appended to.
+    @discardableResult
+    func applyMemory(runId: String) async throws -> String {
+        let ack = try await sendRequest(
+            "apply_memory", payload: ["run_id": runId])
+        guard let path = ack["memory_path"] as? String else {
+            throw AgentdError.badResponse(
+                "apply_memory ack missing memory_path: \(ack)")
+        }
+        return path
+    }
+
+    /// Drop the proposed memory sidecar so the suggestion can't be
+    /// re-applied after dismissal.
+    func discardMemory(runId: String) async throws {
+        _ = try await sendRequest(
+            "discard_memory", payload: ["run_id": runId])
+    }
+
     /// Start a task on the daemon. Returns the run_id immediately
     /// after the ack; events flow through `onEvent` as the agent
     /// produces them. `onEvent` will see at least one terminator

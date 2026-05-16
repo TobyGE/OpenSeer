@@ -292,6 +292,144 @@ struct LessonBubble: View {
 }
 
 
+/// In-thread bubble for the post-run MEMORY.md proposal. Visually
+/// parallel to LessonBubble (yellow → blue, graduationcap → brain)
+/// so the user immediately reads it as "persistent fact about you"
+/// vs "persistent fact about this site/app." Save / Discard hit the
+/// same agentd round-trip MainController owns for skills.
+struct MemoryBubble: View {
+    @ObservedObject var run: RunSession
+    let onApply: () -> Void
+    let onDiscard: () -> Void
+    @State private var showPreview: Bool = false
+
+    var body: some View {
+        if let mem = run.pendingMemory {
+            pendingView(mem)
+        } else if let saved = run.lastAppliedMemoryBody, !saved.isEmpty {
+            savedView(saved)
+        }
+    }
+
+    @ViewBuilder
+    private func pendingView(
+        _ mem: RunSession.ProposedMemory
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "brain.head.profile")
+                    .foregroundStyle(.blue)
+                Text("Remember this for next time?")
+                    .font(.callout.weight(.semibold))
+                Spacer(minLength: 0)
+                Button {
+                    onDiscard()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.bold))
+                }
+                .buttonStyle(.borderless)
+                .help("Dismiss without saving")
+            }
+            // Show the proposed body inline — it's a short markdown
+            // line ≤2 kB, so this is the whole payload, not a
+            // preview. The user wants to vet exact wording before
+            // it lands in MEMORY.md.
+            Text(mem.body)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 8) {
+                if mem.body.count > 240 {
+                    Button { showPreview = true } label: {
+                        Label("Preview", systemImage: "doc.text")
+                    }
+                    .controlSize(.small)
+                }
+                Button { onApply() } label: {
+                    Label("Save", systemImage: "tray.and.arrow.down")
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .frame(maxWidth: 560, alignment: .leading)
+        .background(Color.blue.opacity(0.10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.blue.opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .sheet(isPresented: $showPreview) {
+            previewSheet(mem)
+        }
+    }
+
+    private func savedView(_ body: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+            Text("Saved to memory")
+                .font(.callout.weight(.semibold))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+        .frame(maxWidth: 560, alignment: .leading)
+        .background(Color.green.opacity(0.10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.green.opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func previewSheet(
+        _ mem: RunSession.ProposedMemory
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "brain.head.profile")
+                Text("Proposed memory update")
+                    .font(.headline)
+                Spacer()
+                Text("\(mem.bytes) B")
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.blue.opacity(0.18))
+                    .clipShape(Capsule())
+            }
+            Divider()
+            ScrollView(.vertical) {
+                Text(mem.body)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minHeight: 240)
+            HStack {
+                Button("Discard") {
+                    showPreview = false
+                    onDiscard()
+                }
+                Spacer()
+                Button("Cancel") { showPreview = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    showPreview = false
+                    onApply()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 560, height: 360)
+    }
+}
+
+
 /// Status footer for a session: showing run state ("3 turns · done · 12s"
 /// or a spinner while running).
 struct SessionFooter: View {

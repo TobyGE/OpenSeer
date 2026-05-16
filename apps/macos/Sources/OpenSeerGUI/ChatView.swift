@@ -270,6 +270,10 @@ private struct RunBlock: View {
                 run: run,
                 onApply: { controller.applyPendingLesson(on: run) },
                 onDiscard: { controller.discardPendingLesson(on: run) })
+            MemoryBubble(
+                run: run,
+                onApply: { controller.applyPendingMemory(on: run) },
+                onDiscard: { controller.discardPendingMemory(on: run) })
             if showFooter {
                 SessionFooter(session: run)
             }

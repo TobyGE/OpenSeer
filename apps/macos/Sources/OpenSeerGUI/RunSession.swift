@@ -44,6 +44,19 @@ final class RunSession: ObservableObject, Identifiable {
     /// seconds so the orb can flash a "saved: foo-com-web" toast
     /// before the chip vanishes entirely.
     @Published var lastAppliedSkillName: String? = nil
+
+    /// Post-run MEMORY.md proposal awaiting the user's decision.
+    /// Mirrors `pendingLesson` for the per-user MEMORY.md file —
+    /// reflection saw a fact worth remembering across runs (payment
+    /// default, shipping address, recurring preference) and dropped
+    /// `proposed_memory.md` in the run dir. Auto-applying was a
+    /// prompt-injection sink (page text in the trace could persist
+    /// instructions into every future run), so the chip's Save
+    /// click is what actually writes via the agentd round-trip.
+    @Published var pendingMemory: ProposedMemory? = nil
+    /// Briefly-set "saved memory" toast marker; kept ~5s so the
+    /// applied-memory bubble flashes before the chip disappears.
+    @Published var lastAppliedMemoryBody: String? = nil
     /// When this session was created in the GUI. Used to order the
     /// session list (newest first). For historical daemon traces
     /// loaded at startup we override this from the run dir's mtime.
@@ -77,6 +90,16 @@ final class RunSession: ObservableObject, Identifiable {
         let isNew: Bool        // create new vs update existing
         let lesson: String     // bullet-form "Lesson learned" text
         let body: String       // full SKILL.md preview
+    }
+
+    /// One pending memory suggestion. `body` is the markdown line(s)
+    /// the model wants appended to ~/.openseer/memory/MEMORY.md.
+    /// Capped at 2 kB on the Python side so the chip's preview can
+    /// reasonably show the whole thing.
+    struct ProposedMemory: Equatable {
+        let runId: String
+        let body: String
+        let bytes: Int
     }
 
     private var stream: CLI.StreamHandle?
@@ -468,9 +491,74 @@ final class RunSession: ObservableObject, Identifiable {
             pendingLesson = nil
         } else if ev.type == "skill_discarded" {
             pendingLesson = nil
+        } else if ev.type == "memory_proposed" {
+            // Reflection wants to append to MEMORY.md but parked the
+            // body on disk; surface a chip so the user can vet it
+            // before it persists into every future run's prompt.
+            //
+            // On REPLAY (tail of an old events.jsonl), the original
+            // memory_proposed line is still there, but the user may
+            // have already saved or discarded in a prior session.
+            // The terminal `apply_memory`/`discard_memory` only
+            // round-trips over the live WS and is not persisted to
+            // events.jsonl, so we'd resurrect a stale chip whose
+            // Save click would round-trip back to the daemon and
+            // fail with "no proposed memory for this run."
+            // Guard on the sidecar's existence — the daemon unlinks
+            // `proposed_memory.md` on both Save and Discard, so a
+            // missing file means the decision was already made.
+            let runId = ev.data["run_id"]?.string ?? traceId ?? ""
+            let body = ev.data["body"]?.string ?? ""
+            let sidecar = NSHomeDirectory()
+                + "/.openseer/runs/\(runId)/proposed_memory.md"
+            if !runId.isEmpty && !body.isEmpty
+                && FileManager.default.fileExists(atPath: sidecar) {
+                pendingMemory = ProposedMemory(
+                    runId: runId,
+                    body: body,
+                    bytes: ev.data["bytes_"]?.int
+                            ?? body.utf8.count)
+            }
+        } else if ev.type == "memory_applied" {
+            // Same age-gated "saved" toast pattern skills use: a
+            // recent live save flashes the green confirmation; an
+            // old replay just clears the pending chip silently.
+            let age = Date().timeIntervalSince1970 - ev.ts
+            let toastLifetime: TimeInterval = 5
+            if age < toastLifetime {
+                let body = ev.data["body"]?.string
+                    ?? pendingMemory?.body
+                lastAppliedMemoryBody = body
+                let remaining = toastLifetime - age
+                scheduleAppliedMemoryToastClear(
+                    after: remaining, body: body)
+            }
+            pendingMemory = nil
+        } else if ev.type == "memory_discarded" {
+            pendingMemory = nil
         }
         // Trigger SwiftUI redraw.
         objectWillChange.send()
+    }
+
+    private func scheduleAppliedMemoryToastClear(
+        after seconds: TimeInterval, body: String?
+    ) {
+        guard seconds > 0 else {
+            lastAppliedMemoryBody = nil
+            objectWillChange.send()
+            return
+        }
+        let target = body
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self else { return }
+            if self.lastAppliedMemoryBody == target {
+                self.lastAppliedMemoryBody = nil
+                self.objectWillChange.send()
+            }
+        }
     }
 
     /// Schedule a single-shot clear of `lastAppliedSkillName`.

@@ -340,6 +340,34 @@ final class MainController: ObservableObject {
         }
     }
 
+    /// User accepted the post-run memory suggestion. Same shape as
+    /// `applyPendingLesson(on:)` — body's already on disk, the WS
+    /// round-trip just authorizes the append. We trust the inbound
+    /// `memory_applied` event to clear the chip on success.
+    func applyPendingMemory(on run: RunSession) {
+        guard let pending = run.pendingMemory else { return }
+        Task { @MainActor in
+            do {
+                _ = try await AgentdClient.shared.applyMemory(
+                    runId: pending.runId)
+            } catch {
+                NSLog("[memory] applyMemory failed: %@", "\(error)")
+                run.errorMessage = "Save memory failed: \(error)"
+                run.objectWillChange.send()
+            }
+        }
+    }
+
+    func discardPendingMemory(on run: RunSession) {
+        guard let pending = run.pendingMemory else { return }
+        run.pendingMemory = nil
+        run.objectWillChange.send()
+        Task { @MainActor in
+            try? await AgentdClient.shared.discardMemory(
+                runId: pending.runId)
+        }
+    }
+
     func selectNewestThreadIfNeeded() {
         if selectedThreadID == nil,
            let newest = daemon.threads

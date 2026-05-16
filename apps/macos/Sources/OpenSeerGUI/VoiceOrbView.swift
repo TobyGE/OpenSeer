@@ -95,7 +95,22 @@ struct VoiceOrbView: View {
                     isOpen.toggle()
                     isWindowExpanded = isOpen
                 }
-                isOpen ? startLoop() : stopLoop()
+                // Tapping the crystal ball toggles the panel.
+                // Starting the listen loop on every open ignored the
+                // voiceEnabled toggle (codex P2 on 414526d); now we
+                // only kick the loop when voice is opted-in.
+                // Otherwise, focus the draft TextEditor so the user
+                // can start typing immediately — type-only mode is
+                // the default path.
+                if isOpen {
+                    if voiceEnabled {
+                        startLoop()
+                    } else {
+                        isEditingDraft = true
+                    }
+                } else {
+                    stopLoop()
+                }
             } label: {
                 CrystalOrb(active: input.isRecording,
                            isOpen: isOpen)
@@ -198,7 +213,17 @@ struct VoiceOrbView: View {
                     isWindowExpanded = true
                 }
             }
-            if voiceEnabled && !autoListen { startLoop() }
+            if voiceEnabled && !autoListen {
+                startLoop()
+            } else if !voiceEnabled {
+                // Type-only mode: drop the user straight into the
+                // TextEditor so the very next keystroke lands in the
+                // draft buffer (codex P2 on 414526d). Without this,
+                // pressing ⌘⌥S in default-off mode opened the panel
+                // but left focus elsewhere, and the user had to
+                // click into the editor before typing.
+                isEditingDraft = true
+            }
         }
         .onReceive(NotificationCenter.default.publisher(
             for: .dismissVoiceOrb)) { _ in

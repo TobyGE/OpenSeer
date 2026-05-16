@@ -347,15 +347,19 @@ struct VoiceOrbView: View {
                     }
                 }
                 .onKeyPress(phases: .down) { press in
-                    // Plain Return → send. Any modifier (Shift /
-                    // Option / Command / Control) falls through so
-                    // Shift+Return still inserts a newline in the
-                    // multiline TextField and the other chords stay
-                    // available for system-level use. Codex P2 on
-                    // d1a816d caught the original handler swallowing
-                    // every Return regardless of modifier.
+                    // Plain Return → send. Only CHORD modifiers
+                    // (Shift / Option / Command / Control) block
+                    // the send so the user can still get a newline
+                    // via Shift+Return and the other chords stay
+                    // available for system-level use. Caps Lock is
+                    // explicitly stripped because macOS reports it
+                    // in the modifier set whenever it's engaged,
+                    // and a user typing in ALL CAPS still expects
+                    // Return to send (codex P2 on c5ec59a).
+                    let chord = press.modifiers
+                        .subtracting(.capsLock)
                     guard press.key == .return,
-                          press.modifiers.isEmpty else {
+                          chord.isEmpty else {
                         return .ignored
                     }
                     commitNow()

@@ -355,9 +355,15 @@ private struct ShortcutsPane: View {
         Shortcut(keys: ["⌃", "S"],
                  description: "Summon / dismiss the floating voice orb",
                  scope: "Global"),
+        Shortcut(keys: ["⏎"],
+                 description: "Send the prompt",
+                 scope: "Orb panel"),
+        Shortcut(keys: ["⇧", "⏎"],
+                 description: "Insert a newline in the orb draft",
+                 scope: "Orb panel"),
         Shortcut(keys: ["⌃", "⏎"],
                  description: "Send the prompt",
-                 scope: "Orb panel · Chat composer"),
+                 scope: "Chat composer"),
         Shortcut(keys: ["⎋"],
                  description: "Cancel / dismiss a sheet",
                  scope: "Modal sheets"),
@@ -388,9 +394,10 @@ private struct ShortcutsPane: View {
                     .font(.headline)
                     .padding(.top, 6)
                 VStack(alignment: .leading, spacing: 6) {
-                    bullet("Plain ⏎ inside the text field inserts a newline; ⌃⏎ is what actually sends.")
+                    bullet("Orb editor: plain ⏎ submits. Use ⇧⏎ for a newline. CJK input methods consume their own Return during candidate selection, so picking a candidate doesn't accidentally send.")
+                    bullet("Main chat composer: ⌃⏎ submits, plain ⏎ inserts a newline — that field is for longer drafts.")
                     bullet("The orb hotkey works system-wide via Carbon's `RegisterEventHotKey`, so it fires from any app. macOS may ask you to grant Accessibility the first time another app's text field has focus.")
-                    bullet("Voice input is opt-in (General → Voice). With it off, pressing ⌃S still summons the orb but lands in the text field; ⌃⏎ sends.")
+                    bullet("Voice input is opt-in (General → Voice). With it off, pressing ⌃S still summons the orb but lands in the text field; ⏎ sends.")
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)

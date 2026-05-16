@@ -346,7 +346,18 @@ struct VoiceOrbView: View {
                         NSApp.activate(ignoringOtherApps: true)
                     }
                 }
-                .onKeyPress(.return) {
+                .onKeyPress(phases: .down) { press in
+                    // Plain Return → send. Any modifier (Shift /
+                    // Option / Command / Control) falls through so
+                    // Shift+Return still inserts a newline in the
+                    // multiline TextField and the other chords stay
+                    // available for system-level use. Codex P2 on
+                    // d1a816d caught the original handler swallowing
+                    // every Return regardless of modifier.
+                    guard press.key == .return,
+                          press.modifiers.isEmpty else {
+                        return .ignored
+                    }
                     commitNow()
                     return .handled
                 }

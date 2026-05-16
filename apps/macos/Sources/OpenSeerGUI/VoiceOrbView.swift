@@ -323,53 +323,55 @@ struct VoiceOrbView: View {
             // editor gains focus pulls the IME panel onto our text
             // view; when the user dismisses focus, the foreground
             // app gets its IME back naturally.
-            ZStack(alignment: .topLeading) {
-                TextEditor(text: $draftText)
-                    .font(.callout)
-                    .focused($isEditingDraft)
-                    .scrollContentBackground(.hidden)
-                    .frame(height: 70)
-                    .onChange(of: isEditingDraft) { _, focused in
-                        if focused {
-                            NSApp.activate(ignoringOtherApps: true)
-                        }
+            // TextField with `axis: .vertical` gives us native
+            // `.onSubmit` (Return-to-send) while still expanding for
+            // multi-line drafts. CJK IME naturally consumes Return
+            // during candidate selection, so the submit only fires
+            // once composition has ended — exactly the behavior the
+            // user asked for ("just press return to send"). The
+            // ZStack overlay placeholder TextEditor needed is gone:
+            // TextField has built-in prompt rendering, and the
+            // status-text line above already conveys mode info.
+            TextField(transcriptText, text: $draftText,
+                      axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.callout)
+                .focused($isEditingDraft)
+                .lineLimit(2...5)
+                .padding(8)
+                .background(.background.secondary)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onChange(of: isEditingDraft) { _, focused in
+                    if focused {
+                        NSApp.activate(ignoringOtherApps: true)
                     }
-                if draftText.isEmpty {
-                    // Empty-state hint sits behind the TextEditor.
-                    // .allowsHitTesting(false) so clicks pass
-                    // through to the editor below.
-                    Text(transcriptText)
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 8)
-                        .allowsHitTesting(false)
                 }
-            }
-            .padding(6)
-            .background(.background.secondary)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onSubmit {
+                    // Plain Return → send the draft. commitNow is
+                    // safe to call with an empty draft (it guards
+                    // and returns), and IME-composing Returns never
+                    // reach here because the input method has
+                    // already consumed them as candidate confirms.
+                    commitNow()
+                }
 
             HStack(spacing: 8) {
-                Button {
-                    autoListen ? stopLoop() : startLoop()
-                } label: {
-                    Label(autoListen ? "Pause" : "Listen",
-                          systemImage: autoListen ? "pause.fill" : "mic.fill")
+                // Listen / Pause is only shown when voice is enabled
+                // in Settings. With voice off the button has no role
+                // — it could never start a session and just took up
+                // visual space next to Undo / Send, contradicting
+                // the "Prompt" header + type-mode copy.
+                if voiceEnabled {
+                    Button {
+                        autoListen ? stopLoop() : startLoop()
+                    } label: {
+                        Label(autoListen ? "Pause" : "Listen",
+                              systemImage: autoListen ? "pause.fill" : "mic.fill")
+                    }
+                    .controlSize(.small)
+                    .disabled(!input.isAvailable || input.isStarting)
+                    .help("Press to start / stop listening.")
                 }
-                .controlSize(.small)
-                // Disabled when voice is turned off in Settings —
-                // the underlying VoiceInput would refuse to start
-                // without mic + Speech Recognition permissions
-                // anyway, so we render the button greyed and use
-                // its `help` tooltip to point the user at the
-                // toggle.
-                .disabled(!voiceEnabled
-                          || !input.isAvailable
-                          || input.isStarting)
-                .help(voiceEnabled
-                      ? "Press to start / stop listening."
-                      : "Voice is off — turn it on in Settings → General → Voice.")
 
                 // Hand-off: pause/resume the agent so the user can
                 // drive the mouse + keyboard themselves for a few
@@ -421,11 +423,11 @@ struct VoiceOrbView: View {
                     Label("Send", systemImage: "paperplane.fill")
                 }
                 .controlSize(.small)
-                // Send = ⌃↩ (control+return). See ChatView.swift
-                // for rationale: plain ↩ goes to newline inside
-                // the text editor; ⌃ pairs with the global ⌃S
-                // summon shortcut.
-                .keyboardShortcut(.return, modifiers: [.control])
+                // No keyboard shortcut on the orb's Send button —
+                // the TextField above already submits on plain ↩
+                // via `.onSubmit`. Keeping a redundant ⌃↩ shortcut
+                // would just leak through when the editor isn't
+                // focused and cause stray sends.
                 .disabled(draftText
                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
@@ -546,10 +548,10 @@ struct VoiceOrbView: View {
                 : "OpenSeer is working…"
         }
         // Type-only mode: voice opt-in is off, so the user is going
-        // to type. Show a type-focused placeholder so the editor
-        // doesn't pretend it's about to start listening.
+        // to type. Plain Return now submits via the TextField's
+        // .onSubmit; the placeholder just nudges them to start.
         if !voiceEnabled {
-            return "Type your prompt. ⌃↩ to send."
+            return "Type your prompt."
         }
         if input.isAvailable { return "Listening starts when voice mode opens." }
         return "Voice input is unavailable in this runtime."

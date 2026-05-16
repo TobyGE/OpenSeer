@@ -97,10 +97,10 @@ struct ChatView: View {
     /// continue the selected local thread or spawn a fresh one.
     private var composerHint: String {
         if let t = selectedThread, t.kind == .local {
-            return "⌘↩ to send · continuing this conversation · "
+            return "Fn+↩ to send · continuing this conversation · "
                 + "Compose ✏️ to start fresh"
         }
-        return "⌘↩ to send · starts a new conversation"
+        return "Fn+↩ to send · starts a new conversation"
     }
 
     private var emptyState: some View {

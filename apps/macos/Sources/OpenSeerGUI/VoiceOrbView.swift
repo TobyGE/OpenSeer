@@ -271,9 +271,18 @@ struct VoiceOrbView: View {
     private var panel: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Image(systemName: "waveform.circle.fill")
-                    .foregroundStyle(input.isRecording ? .red : .accentColor)
-                Text("Voice")
+                // Header glyph + title reflect the active mode.
+                // Voice off → keyboard / "Prompt" so the panel
+                // doesn't pretend it's still a voice surface; voice
+                // on → waveform / "Voice" with the red recording
+                // tint when the mic is actually live.
+                Image(systemName: voiceEnabled
+                      ? "waveform.circle.fill"
+                      : "keyboard")
+                    .foregroundStyle(voiceEnabled
+                                      ? (input.isRecording ? .red : .accentColor)
+                                      : .secondary)
+                Text(voiceEnabled ? "Voice" : "Prompt")
                     .font(.headline)
                 Spacer()
                 Button {

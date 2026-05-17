@@ -889,14 +889,6 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
     # block on stdin (breaks for the daemon) or re-import the cbs
     # list, which is a closure-local detail of this function.
     ctx["_emit_event"] = emit
-    # Mark that the caller wired an interactive surface. ANY caller
-    # passing ask_user is an interactive remote bridge — WS daemon,
-    # Telegram bot, future MCP host — and any post-run prompt
-    # belongs on that surface, NOT on this process's stdin. Without
-    # this flag the reflection callback would have to use
-    # `stdin.isatty()` to detect interactivity, which mis-reports
-    # for dev daemons launched from a terminal.
-    ctx["_has_remote_client"] = ask_user is not None
 
     def record_step(step) -> None:
         """Append a Step to history and fire BOTH the legacy on_step_recorded

@@ -158,9 +158,17 @@ class WsStreamCallback(Callback):
     def on_event(self, ctx: dict[str, Any], event: TaskEvent) -> None:
         if event is None:
             return
-        # Note: agent.run sets ctx["_has_remote_client"] from
-        # `ask_user is not None`, which covers us (and Telegram /
-        # future MCP hosts) without us needing to mark it here.
+        # Mark the ctx so post-run callbacks (RunReflection's
+        # memory/skill approval, notably) can tell "a client that
+        # actually renders approval chips is listening" apart from
+        # any other ask_user-passing bridge. We CAN'T set this from
+        # `ask_user is not None` in agent.run: the Telegram daemon
+        # passes ask_user but doesn't handle memory_proposed, so
+        # deferring to it would just orphan the proposal. The
+        # invariant here is "I will surface MEMORY_PROPOSED" — Swift
+        # GUI's RunSession.ingestEvent does. Telegram has to opt
+        # in separately when its bot adds memory chip handling.
+        ctx["_has_remote_client"] = True
         # Field name MUST be `ts` (not `timestamp`) — clients
         # consuming this stream decode it as the same `RunEvent`
         # they use to parse events.jsonl, and that schema expects

@@ -33,10 +33,18 @@ _CATEGORY_RE = re.compile(
 def _arxiv_fetch(qs: str) -> str:
     url = f"{_ARXIV_BASE}?{qs}"
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    # 30s timeout — keyword search returns in <2s, but author
+    # phrase queries (`au:"Yoshua Bengio"`) routinely take 10-25s
+    # on arxiv's public endpoint. 15s wasn't enough for that path
+    # under normal load.
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=30) as r:
             return r.read().decode("utf-8")
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            raise RuntimeError(
+                "arXiv API rate-limited (HTTP 429). Wait ~10s and "
+                "retry; their public API rate-limits per IP.") from e
         raise RuntimeError(
             f"arXiv API HTTP {e.code}: check your search term or paper ID")\
             from e
@@ -183,6 +191,42 @@ class ArxivPaper(SiteCommand):
         return [{k: e[k] for k in self.columns} for e in entries]
 
 
+class ArxivAuthor(SiteCommand):
+    site = "arxiv"
+    name = "author"
+    description = "List arXiv papers by a given author (newest first)"
+    columns = ["id", "title", "authors", "published",
+                "primary_category", "url"]
+    needs_browser = False
+
+    def add_args(self, p: argparse.ArgumentParser) -> None:
+        p.add_argument("author",
+                        help='Author name (e.g. "Yoshua Bengio" or "Y Bengio")')
+        p.add_argument("--limit", type=int, default=20,
+                        help="Max papers (default 20, max 50)")
+
+    def run(self, args: argparse.Namespace) -> list[dict]:
+        # Author names on arXiv aren't stable IDs — same person
+        # often appears under multiple spellings ("Y. Bengio" vs
+        # "Yoshua Bengio"). Quote the value so multi-word names
+        # match as a phrase rather than as separate terms.
+        author = (args.author or "").strip()
+        if not author:
+            raise ValueError(
+                'arxiv author cannot be empty. Example: '
+                'openseer site arxiv author "Yoshua Bengio"')
+        limit = _check_limit(args.limit, default=20, max_value=50)
+        q = urllib.parse.quote(f'au:"{author}"')
+        qs = (f"search_query={q}&max_results={limit}"
+              f"&sortBy=submittedDate&sortOrder=descending")
+        entries = _parse_entries(_arxiv_fetch(qs))
+        if not entries:
+            raise RuntimeError(
+                f"No arXiv papers found for author {author!r}. "
+                f"Try alternate spellings (e.g. initials).")
+        return [{k: e[k] for k in self.columns} for e in entries]
+
+
 class ArxivRecent(SiteCommand):
     site = "arxiv"
     name = "recent"
@@ -217,4 +261,5 @@ class ArxivRecent(SiteCommand):
 # via `from . import arxiv`.
 ArxivSearch.register()
 ArxivPaper.register()
+ArxivAuthor.register()
 ArxivRecent.register()

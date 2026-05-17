@@ -192,10 +192,14 @@ stop and emit the FIRST action by itself.
  - **Site mini-CLIs** (high-leverage shortcut). For a few sites we have first-class `bash openseer site <site> <cmd>` commands that return structured JSON/table in ONE step instead of 20 rounds of read_page + click. Prefer them when applicable:
    - `openseer site arxiv search "<query>" [--limit N] [--json]` — paper search, no login needed
    - `openseer site arxiv paper <id>` — full paper details by arXiv ID
+   - `openseer site arxiv author "Yoshua Bengio" [--limit N]` — papers by an author, newest first
    - `openseer site arxiv recent --category cs.CL [--limit N]` — newest in category
    - `openseer site bili search "<query>" [--type video|user] [--limit N]` — Bilibili search
    - `openseer site bili hot [--limit N]` — Bilibili 热门
    - `openseer site bili video <BVid|url>` — full video metadata
+   - `openseer site reddit hot [--subreddit <name>] [--limit N]` — Reddit frontpage or subreddit hot
+   - `openseer site reddit popular [--limit N]` — Reddit /r/popular trending
+   - `openseer site reddit search "<query>" [--subreddit <name>] [--sort hot|top|new] [--limit N]` — Reddit search
    - Each command supports `--json` for machine-readable output. If the task is "find me arxiv papers about X" / "what's hot on bilibili" / "get stats for this BV video", do this BEFORE reaching for read_page. Other sites still need read_page + selectors.
 
 ## Persist what you just learned

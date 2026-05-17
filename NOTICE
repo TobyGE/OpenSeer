@@ -16,8 +16,9 @@ site adapters from the OpenCLI project:
 
 Specifically:
 
-  openseer/site_cli/arxiv.py      ←  OpenCLI/clis/arxiv/{search,paper,recent,utils}.js
+  openseer/site_cli/arxiv.py      ←  OpenCLI/clis/arxiv/{search,paper,author,recent,utils}.js
   openseer/site_cli/bilibili.py   ←  OpenCLI/clis/bilibili/{search,hot,video,utils}.js
+  openseer/site_cli/reddit.py     ←  OpenCLI/clis/reddit/{hot,popular,search}.js
 
 Ported from OpenCLI commit 0c488bbf. We preserved OpenCLI's site
 adapter design intent (browser-as-fetch-wrapper, WBI signing inside

@@ -38,6 +38,7 @@ def _registry() -> dict[str, dict[str, SiteCommand]]:
     base module owns."""
     from . import arxiv as _arxiv     # noqa: F401  side-effecting import
     from . import bilibili as _bili   # noqa: F401
+    from . import reddit as _reddit   # noqa: F401
     return registry
 
 

@@ -158,6 +158,14 @@ class WsStreamCallback(Callback):
     def on_event(self, ctx: dict[str, Any], event: TaskEvent) -> None:
         if event is None:
             return
+        # Mark the context so post-run callbacks (RunReflection's
+        # memory/skill approval, most notably) can tell "a remote
+        # WS client is listening" apart from "this is a bare CLI
+        # run." stdin.isatty() lies for daemon processes launched
+        # from a terminal during dev — that path would have us
+        # block on input() in the daemon's stdout while the actual
+        # client sits there expecting an approval chip event.
+        ctx["_has_remote_client"] = True
         # Field name MUST be `ts` (not `timestamp`) — clients
         # consuming this stream decode it as the same `RunEvent`
         # they use to parse events.jsonl, and that schema expects

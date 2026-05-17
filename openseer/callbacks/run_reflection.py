@@ -948,7 +948,19 @@ class RunReflectionCallback(Callback):
 
         if self.memory_mode == "ask":
             emit_event = ctx.get("_emit_event")
-            if callable(emit_event):
+            # Three-way discriminator. `_emit_event` is ALWAYS
+            # populated by agent.run (it's the trajectory event
+            # bus) so its presence alone doesn't mean a GUI is
+            # listening. WsStreamCallback marks `_has_remote_client`
+            # on its first event — that's the reliable "agentd is
+            # bridging to a GUI/Telegram client" signal, and it
+            # handles the gotcha that a developer-launched agentd
+            # has stdin.isatty()==True but no terminal user to
+            # answer an input() prompt. stdin.isatty() only enters
+            # the picture for actual bare CLI runs (no agentd).
+            import sys
+            has_remote = bool(ctx.get("_has_remote_client"))
+            if callable(emit_event) and has_remote:
                 run_id = out_dir.name
                 emit_event(
                     "memory_proposed",
@@ -960,6 +972,18 @@ class RunReflectionCallback(Callback):
                     trace_path,
                     f"Memory apply deferred: emitted MEMORY_PROPOSED "
                     f"({len(memory_body)} bytes); waiting for user.",
+                )
+                return
+            if not sys.stdin.isatty():
+                # No remote client AND no interactive terminal —
+                # nothing can confirm. Leave the proposal on disk
+                # so the next interactive run / GUI session can
+                # offer it, but don't apply silently.
+                self._append_note(
+                    trace_path,
+                    f"Memory apply deferred: no remote client and "
+                    f"stdin is not a TTY; proposal parked at "
+                    f"proposed_memory.md ({len(memory_body)} bytes).",
                 )
                 return
             # CLI fallback: print preview + input() prompt.

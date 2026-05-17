@@ -108,19 +108,63 @@ def _reddit_fetch(tab: browser_cdp.CDPTab, path: str) -> dict:
     429) but is tolerant of in-browser fetches because they look
     like normal client-side navigation. Routing through CDP also
     means a logged-in cookie jar (if the user signed in inside
-    OpenSeer Chrome) automatically personalizes results."""
+    OpenSeer Chrome) automatically personalizes results.
+
+    Returns the parsed JSON payload OR raises RuntimeError when
+    Reddit signals a failure — HTTP non-2xx, error envelope
+    (`{error: 403, message: "Forbidden"}`), or no listing data.
+    Without the raise a banned/private subreddit or rate-limit
+    would silently render as "(no results)", which makes a real
+    failure look like legitimately empty data.
+    """
     url_js = json.dumps(path)
+    # Capture HTTP status alongside body so we can distinguish
+    # transport errors (429, 5xx) from API-level errors (200 +
+    # error JSON, which reddit also does).
     js = f"""
     (async () => {{
       const r = await fetch({url_js}, {{ credentials: 'include' }});
-      return await r.json();
+      let body = null;
+      try {{ body = await r.json(); }} catch (e) {{ body = null; }}
+      return {{ status: r.status, body }};
     }})()
     """
-    payload = browser_cdp._BackgroundLoop.shared().run(
-        tab.evaluate(js, await_promise=True))
-    if not isinstance(payload, dict):
+    # Route through _run_cdp so any leaked websockets / OSError /
+    # asyncio.TimeoutError becomes CDPError, which the cli
+    # dispatcher already catches. Without this wrap a stale tab
+    # (cached from a prior run, websocket gone) would crash with
+    # a `ConnectionClosedError` traceback.
+    result = browser_cdp._run_cdp(
+        lambda: tab.evaluate(js, await_promise=True),
+        what=f"reddit {path}")
+    if not isinstance(result, dict):
         raise RuntimeError(
             f"Reddit returned a non-JSON payload for {path!r}")
+    status = result.get("status")
+    payload = result.get("body")
+    if not isinstance(status, int) or status < 200 or status >= 300:
+        # Surface as a clean error string. Special-case 429 because
+        # the suggested wait is what unblocks the user.
+        if status == 429:
+            raise RuntimeError(
+                f"Reddit API rate-limited (HTTP 429) for {path!r}. "
+                f"Wait ~10s and retry.")
+        if status in (403, 404):
+            raise RuntimeError(
+                f"Reddit API HTTP {status} for {path!r} "
+                f"— subreddit may be private, banned, or misspelled.")
+        raise RuntimeError(
+            f"Reddit API HTTP {status} for {path!r}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"Reddit returned a non-JSON body for {path!r}")
+    # Reddit's API also packs errors into a 200 OK body sometimes,
+    # e.g. `{"error": 429, "message": "Too Many Requests"}`. Treat
+    # an `error` field as failure.
+    if "error" in payload:
+        raise RuntimeError(
+            f"Reddit API error for {path!r}: "
+            f"{payload.get('message') or payload.get('error')}")
     return payload
 
 

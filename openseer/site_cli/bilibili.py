@@ -135,9 +135,16 @@ def _ensure_bili_tab() -> browser_cdp.CDPTab:
 
 
 def _eval(tab: browser_cdp.CDPTab, js: str) -> Any:
-    """Run JS inside the bili tab, return the resolved value."""
-    return browser_cdp._BackgroundLoop.shared().run(
-        tab.evaluate(js, await_promise=True))
+    """Run JS inside the bili tab, return the resolved value.
+
+    Routed through _run_cdp so a leaked websockets ConnectionClosed
+    / OSError / asyncio.TimeoutError from a stale tab becomes a
+    CDPError — which the cli dispatcher catches. Without the wrap
+    the bilibili command would print a raw traceback whenever the
+    cached tab's websocket had died (e.g. after sleep/wake)."""
+    return browser_cdp._run_cdp(
+        lambda: tab.evaluate(js, await_promise=True),
+        what="bilibili eval")
 
 
 def _bili_get_nav(tab: browser_cdp.CDPTab) -> dict:

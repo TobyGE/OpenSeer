@@ -43,6 +43,10 @@ class Action:
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
     selector: str | None = None    # CSS selector — for read_page: extract that element's innerText; for click/type: drive via Chrome DevTools Protocol instead of pixel coords
+    capture_xhr: bool = False      # for read_page (CDP path only): also capture JSON XHRs the page fetches and include them in the result — best for SPAs whose rendered text is mostly chrome but whose underlying API call is the actual data
+    urls: list[str] | None = None  # for read_pages: list of URLs to read in parallel — replaces N sequential read_page calls when comparing/aggregating pages
+    path: str | None = None        # for save_pdf: output PDF file path (absolute or cwd-relative)
+    landscape: bool = False        # for save_pdf: landscape orientation (default portrait)
     # ask_user: pause and request user input. `kind` ∈ {"confirm", "choose", "text"}.
     # `question` is the prompt shown to the user; `options` is required for kind="choose"
     # and ignored otherwise (kind="confirm" auto-uses Yes/No). `attachments` reuses
@@ -394,6 +398,85 @@ def read_page_auto(app: str, *,
     return result
 
 
+def _read_pages(action: "Action", *, dry_run: bool) -> str:
+    """Batch-read N URLs via CDP and concatenate the results.
+
+    Replaces sequential read_page+read_page+read_page chains when
+    the agent needs to compare or aggregate across pages
+    ("summarize these 3 papers", "pick the cheapest of these
+    listings"). Uses bounded parallelism (4 tabs concurrent) so
+    we overlap network latency without thrashing the renderer.
+    Per-URL errors don't kill the batch — failed pages get a
+    short error line and the rest are returned normally.
+    """
+    urls = [u.strip() for u in (action.urls or []) if u and u.strip()]
+    if not urls:
+        return "ERROR: read_pages needs `urls` (list of strings)"
+    if len(urls) > 10:
+        return (f"ERROR: read_pages capped at 10 urls per call "
+                f"(got {len(urls)}). Split into smaller batches.")
+    if dry_run:
+        return f"would batch-read {len(urls)} urls"
+    from . import browser_cdp
+    if not browser_cdp.cdp_available():
+        return ("ERROR: read_pages requires CDP "
+                "(install Chrome or set OPENSEER_BROWSER_CDP=auto). "
+                "Sequential read_page calls still work via AppleScript.")
+    try:
+        results = browser_cdp.read_pages_via_cdp(urls, max_chars=4000)
+    except browser_cdp.CDPError as e:
+        return f"ERROR: read_pages CDP failure: {e}"
+    # Concatenate; per-URL section keeps the original URL as the
+    # header so the agent can quote / link / re-fetch precisely.
+    sections = []
+    for i, (u, r) in enumerate(zip(urls, results), 1):
+        if r.get("error"):
+            sections.append(
+                f"## [{i}/{len(urls)}] {u}\n\nERROR: {r['error']}\n")
+            continue
+        title = (r.get("title") or "").strip()
+        page_url = (r.get("url") or u).strip()
+        content = (r.get("content") or "").strip()
+        src = (r.get("source") or "").strip()
+        src_tag = f" [via {src}]" if src else ""
+        head = (f"## [{i}/{len(urls)}] {title}{src_tag}"
+                if title else f"## [{i}/{len(urls)}]{src_tag}")
+        sections.append(f"{head}\n{page_url}\n\n{content}\n")
+    return "\n".join(sections)
+
+
+def _save_pdf(action: "Action", *, dry_run: bool) -> str:
+    """Save a webpage to a local PDF via CDP's Page.printToPDF.
+
+    Chrome renders the page exactly as the browser sees it (CSS,
+    fonts, images, lazy-loaded SPA state, hydrated content), so
+    the output preserves visual fidelity that `wkhtmltopdf` /
+    headless renderers don't get right. Useful for "save this
+    article", "PDF this receipt", "archive this thread" tasks.
+    """
+    url = (action.url or "").strip() or None
+    path = (action.path or "").strip()
+    if not path:
+        return "ERROR: save_pdf needs `path` (output file)"
+    if not path.lower().endswith(".pdf"):
+        return ("ERROR: save_pdf `path` must end in .pdf "
+                f"(got {path!r})")
+    if dry_run:
+        return (f"would save_pdf to {path!r}"
+                + (f" after navigate {url}" if url else ""))
+    from . import browser_cdp
+    if not browser_cdp.cdp_available():
+        return ("ERROR: save_pdf requires CDP "
+                "(install Chrome or set OPENSEER_BROWSER_CDP=auto)")
+    try:
+        out = browser_cdp.save_pdf_via_cdp(
+            url=url, path=path, landscape=bool(action.landscape))
+    except browser_cdp.CDPError as e:
+        return f"ERROR: save_pdf CDP failure: {e}"
+    return (f"saved PDF {out.get('path')} "
+            f"({out.get('bytes')} bytes) from {out.get('url')}")
+
+
 def _read_page(action: "Action", *, dry_run: bool) -> str:
     """Extract page text from the active tab of a browser via AppleScript
     JavaScript injection. Lets the agent consume a webpage's content in
@@ -452,7 +535,8 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
             try:
                 out = browser_cdp.read_page_via_cdp(
                     url=url, selector=selector or None,
-                    max_chars=8000)
+                    max_chars=8000,
+                    capture_xhr=bool(action.capture_xhr))
                 title = (out.get("title") or "").strip()
                 page_url = (out.get("url") or "").strip()
                 content = (out.get("content") or "").strip()
@@ -465,7 +549,32 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
                             if src and src not in ("selector",) else "")
                 head = (f"# {title}{src_tag}"
                         if title else f"# (untitled){src_tag}")
-                return f"{head}\n{page_url}\n\n{content}"
+                body = f"{head}\n{page_url}\n\n{content}"
+                # Render captured XHRs as a separate appendix so the
+                # model can quote them by URL. We keep it summary-only
+                # (URL, status, mime, preview) — the body would
+                # dominate the token budget on a busy page. Agents
+                # that want a full body should re-call with selector
+                # or call web_fetch on the XHR URL.
+                xhrs = out.get("xhr") or []
+                if xhrs:
+                    body += "\n\n## Captured XHR\n"
+                    for x in xhrs:
+                        u = (x.get("url") or "").strip()
+                        st = x.get("status")
+                        mime = (x.get("mime") or "").split(";")[0]
+                        preview = ""
+                        b = x.get("body") or ""
+                        if b:
+                            preview = b[:300].replace("\n", " ")
+                            if len(b) > 300:
+                                preview += "…"
+                        body += (
+                            f"- `{u}` (status {st}, {mime}, "
+                            f"{x.get('size', 0)} bytes)\n"
+                            f"  preview: {preview}\n"
+                        )
+                return body
             except browser_cdp.CDPError as e:
                 if browser_cdp.cdp_required():
                     return (f"ERROR: CDP read_page failed ({e}). "
@@ -838,6 +947,10 @@ def execute(action: Action, *, dry_run: bool = True,
 
     if name == "read_page":
         return _read_page(action, dry_run=dry_run)
+    if name == "read_pages":
+        return _read_pages(action, dry_run=dry_run)
+    if name == "save_pdf":
+        return _save_pdf(action, dry_run=dry_run)
 
     if name == "web_fetch":
         from .web import web_fetch

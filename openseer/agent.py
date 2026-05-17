@@ -122,7 +122,9 @@ For `answer` (purely conversational), write the reply itself — no preamble.
   bash           run shell command. `cmd`, optional `cwd`, `timeout` (≤120s).
   web_search     `query`, optional `amount`, `freshness` ∈ day|week|month|year.
   web_fetch      `url` → page text. Best for static pages; SPAs (X / LinkedIn / etc.) need read_page instead.
-  read_page      READ a webpage's content (posts/articles/search results/threads). When `url` is given, OpenSeer drives its own Chrome via CDP and runs Mozilla Readability inside the page to isolate the main article — what you get back is compact Markdown (preserved headings, lists, code blocks, links), NOT a raw innerText dump. The result header is tagged with the extraction source: `[via readability]` = clean article path; `[via fallback]` = Readability declined and we returned a structural container; `[via innerText]` = body.innerText dump (no Readability hit, or AppleScript path). Optional `url` (navigate first, in the same call), `app` (Safari/Chrome/Arc/Brave/Edge — default = frontmost), `selector` (CSS like `"article"`/`"main"` for one section only — overrides Readability). Use this for ANY task that says "summarize / read / browse / find X in posts / what does this page say". Legacy AppleScript path (no URL → frontmost user browser): still requires the one-time "Allow JavaScript from Apple Events" toggle.
+  read_page      READ a webpage's content (posts/articles/search results/threads). When `url` is given, OpenSeer drives its own Chrome via CDP and runs Mozilla Readability inside the page to isolate the main article — what you get back is compact Markdown (preserved headings, lists, code blocks, links), NOT a raw innerText dump. The result header is tagged with the extraction source: `[via readability]` = clean article path; `[via fallback]` = Readability declined and we returned a structural container; `[via innerText]` = body.innerText dump (no Readability hit, or AppleScript path). Optional `url` (navigate first, in the same call), `app` (Safari/Chrome/Arc/Brave/Edge — default = frontmost), `selector` (CSS like `"article"`/`"main"` for one section only — overrides Readability), `capture_xhr: true` (record JSON XHRs the page fetches during load and append a `## Captured XHR` section to the result — switch this on for SPAs like Twitter/LinkedIn/Reddit/Bilibili where the rendered text is mostly chrome but the underlying API call is the actual data). Use this for ANY task that says "summarize / read / browse / find X in posts / what does this page say". Legacy AppleScript path (no URL → frontmost user browser): still requires the one-time "Allow JavaScript from Apple Events" toggle.
+  read_pages     READ multiple webpages in ONE call. `urls`: list of strings (≤10). Each URL is fetched in parallel (4 tabs concurrent) and the results concatenated with per-URL section headers `## [i/N] Title [via readability]`. Use when the task is "compare these 3 articles", "summarize these N papers", "which of these listings is cheapest" — replaces sequential read_page chains and is faster (parallel) AND cheaper (one tool result, model reads them together). Per-URL errors don't kill the batch.
+  save_pdf       SAVE a webpage to local PDF via Chrome's Page.printToPDF (CDP only). `path` (required, must end in `.pdf`), `url` (optional — if omitted, saves the current OpenSeer Chrome tab), `landscape: true` (default portrait). Output PDF is what Chrome itself renders, preserving CSS / fonts / images / lazy-loaded content. Use for "save this article as PDF", "archive this receipt", "PDF this thread for me".
   click          `index` (AX-tree, preferred when present) OR `x`, `y`. Optional `count`. ALSO `selector` (CSS) when the target is inside the OpenSeer-owned Chrome — drives via DevTools Protocol; use after `read_page` with a `url` has populated that browser. Don't use `selector` for native macOS UI — only for web elements you've just inspected via read_page.
   type           `text` + one of: `index`, `x,y`, `selector` (CSS, OpenSeer Chrome only — types via the native value setter so React/Vue change handlers fire), or NEITHER (use currently-focused field).
   key            `key` combo like `"cmd+a"`, `"enter"`, `"pageup"`, `"esc"`.
@@ -351,6 +353,11 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
         verified_by_steps=_verified_steps(obj.get("verified_by_steps")),
         attachments=obj.get("attachments"),
         selector=obj.get("selector"),
+        capture_xhr=bool(obj.get("capture_xhr") or False),
+        urls=(list(obj["urls"])
+              if isinstance(obj.get("urls"), list) else None),
+        path=obj.get("path"),
+        landscape=bool(obj.get("landscape") or False),
         kind=obj.get("kind"),
         question=obj.get("question"),
         options=obj.get("options"),
@@ -406,7 +413,8 @@ def _parse_actions(raw: str) -> list[Action]:
 # `screenshot` do NOT count as evidence of having done the work.
 _PRODUCING_ACTIONS = {"click", "double_click", "type", "key", "scroll",
                       "open_app", "bash", "web_search", "web_fetch",
-                      "read_page", "write_skill", "write_memory"}
+                      "read_page", "read_pages", "save_pdf",
+                      "write_skill", "write_memory"}
 # `screenshot`, `get_app_state`, and `reground` are passive observers —
 # they do NOT produce or change the requested result. Citing only them
 # in `verified_by_steps` would let a run terminate done after merely

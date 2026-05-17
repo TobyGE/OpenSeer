@@ -426,6 +426,28 @@ class CDPClient:
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._recv_task: asyncio.Task | None = None
+        # method-name → list of (params_dict) → None callbacks. CDP
+        # events that don't carry an `id` get fanned out here. Empty
+        # by default so the cost is zero until someone subscribes.
+        # Used by the Network-capture path on CDPTab.
+        self._event_handlers: dict[str, list] = {}
+
+    def on(self, method: str, handler) -> None:
+        """Subscribe to a CDP event (e.g. "Network.responseReceived").
+        Handler signature: (params: dict) -> None. May be sync or
+        async — async handlers are scheduled on the current loop.
+        Multiple handlers per method are supported."""
+        self._event_handlers.setdefault(method, []).append(handler)
+
+    def off(self, method: str, handler=None) -> None:
+        """Unsubscribe. With `handler=None`, removes all handlers
+        for the event."""
+        if handler is None:
+            self._event_handlers.pop(method, None)
+            return
+        handlers = self._event_handlers.get(method)
+        if handlers and handler in handlers:
+            handlers.remove(handler)
 
     async def connect(self) -> None:
         # Chrome rejects subprotocols and oversized frames in stdlib
@@ -450,9 +472,10 @@ class CDPClient:
 
     async def _recv_loop(self) -> None:
         """Demux incoming JSON-RPC messages by id back to the futures
-        their `send()` call is awaiting. Drops events (no `id` field)
-        on the floor for Day 1 — Day 2 will route those to subscriber
-        callbacks for things like Page.loadEventFired."""
+        their `send()` call is awaiting; fan events (no `id` field)
+        out to subscribers registered via `on()`. Handler exceptions
+        are swallowed so a single buggy subscriber can't kill the
+        recv loop and stall every in-flight request."""
         try:
             async for raw in self._ws:
                 try:
@@ -462,8 +485,17 @@ class CDPClient:
                     continue
                 mid = msg.get("id")
                 if mid is None:
-                    # Event, not a response. Day 1 ignores; Day 2
-                    # will fan these out to subscribers.
+                    method = msg.get("method")
+                    params = msg.get("params") or {}
+                    for h in list(self._event_handlers.get(method, [])):
+                        try:
+                            result = h(params)
+                            if asyncio.iscoroutine(result):
+                                asyncio.create_task(result)
+                        except Exception as e:
+                            log.warning(
+                                "CDP event handler for %s raised: %s",
+                                method, e)
                     continue
                 fut = self._pending.pop(mid, None)
                 if fut is None or fut.done():
@@ -642,6 +674,13 @@ class CDPTab:
         self._target = target
         self._client: CDPClient | None = None
         self._enabled = False
+        # Network capture state (only allocated when enabled). Keyed
+        # by CDP requestId; each entry tracks the response metadata
+        # plus (eventually) the body once Network.loadingFinished
+        # fires.
+        self._capture_active: bool = False
+        self._captured_responses: dict[str, dict] = {}
+        self._capture_mime_filter: tuple[str, ...] = ()
 
     async def _ensure_client(self) -> CDPClient:
         if self._client is None:
@@ -754,27 +793,204 @@ class CDPTab:
         js = _DOM_STABLE_JS.format(quiet_ms=quiet_ms, max_ms=max_ms)
         return str(await self.evaluate(js, await_promise=True))
 
+    async def wait_for_content(self, *,
+                                min_chars: int = 400,
+                                quiet_ms: int = 400,
+                                max_ms: int = 6000) -> str:
+        """Wait until the page's main-content area has real text,
+        not a skeleton screen.
+
+        ``wait_dom_stable`` is a structural signal (DOM mutations
+        stop). On SPA pages with skeleton loading (Twitter,
+        LinkedIn, modern news sites) the skeleton's
+        ``<div class="skeleton">`` placeholders stabilize FAST
+        — within 400ms of nav — but the real text doesn't land
+        for another 1-3 seconds. The structural signal fires too
+        early and read_page returns ``Loading…`` / pulsing-blocks
+        text.
+
+        ``wait_for_content`` checks the actual visible text inside
+        ``<main>`` / ``<article>`` / ``[role=main]`` and waits
+        until it crosses ``min_chars`` of non-skeleton text. If
+        the content is shorter than min_chars (short article, login
+        page, error message), we still return after ``quiet_ms``
+        of mutation quiet — same loose definition as wait_dom_stable.
+        Capped at ``max_ms``.
+
+        Returns the reason it stopped: ``"content"`` / ``"quiet"`` /
+        ``"capped"``.
+        """
+        js = f"""
+        new Promise(resolve => {{
+          const QUIET_MS = {quiet_ms};
+          const MAX_MS = {max_ms};
+          const MIN_CHARS = {min_chars};
+          if (!document.body) {{
+            setTimeout(() => resolve('nobody'), MAX_MS);
+            return;
+          }}
+          // Crude but effective "is this real content?" test. We
+          // tolerate ellipses + spaces but reject the most common
+          // skeleton-text leaks ("Loading...", spinner labels).
+          const SKELETON_RE = /^[\\s.\\u2026]*(loading|skeleton|加载|载入中)?[\\s.\\u2026]*$/i;
+          function mainText() {{
+            const root = document.querySelector(
+              'main, article, [role="main"]') || document.body;
+            const t = (root.innerText || "").trim();
+            if (SKELETON_RE.test(t)) return "";
+            return t;
+          }}
+          // All timers + observer use `let` so we can null them
+          // out individually and avoid the TDZ trap codex caught
+          // — calling done() before `cap`/`quietTimer` were assigned
+          // threw `Cannot access ... before initialization` and
+          // the caller silently fell back to "extract immediately"
+          // (which on SPA pages is exactly the bug we're fixing).
+          let quietTimer = null;
+          let cap = null;
+          let obs = null;
+          let resolved = false;
+          function done(reason) {{
+            if (resolved) return;
+            resolved = true;
+            if (quietTimer != null) clearTimeout(quietTimer);
+            if (cap != null) clearTimeout(cap);
+            if (obs) obs.disconnect();
+            resolve(reason);
+          }}
+          function check() {{
+            if (mainText().length >= MIN_CHARS) done('content');
+          }}
+          function resetQuiet() {{
+            if (quietTimer != null) clearTimeout(quietTimer);
+            quietTimer = setTimeout(() => done('quiet'), QUIET_MS);
+          }}
+          cap = setTimeout(() => done('capped'), MAX_MS);
+          obs = new MutationObserver(() => {{
+            resetQuiet();
+            check();
+          }});
+          obs.observe(document.body, {{
+            childList: true, subtree: true, characterData: true,
+            attributes: false,
+          }});
+          resetQuiet();
+          check();
+        }})
+        """
+        return str(await self.evaluate(js, await_promise=True))
+
     async def evaluate(self, expression: str, *,
                        await_promise: bool = True) -> Any:
         c = await self._ensure_client()
         return await c.evaluate(expression, await_promise=await_promise)
 
     async def extract_text(self, *, selector: str | None = None,
-                           max_chars: int = 8000) -> str:
-        """`innerText` of selector match (or full body). Result is
-        truncated to `max_chars` to match the existing AppleScript
-        path's 8 kB cap."""
-        if selector:
-            js = (
-                "(() => {"
-                f"const el = document.querySelector({json.dumps(selector)});"
-                "if (!el) return null;"
-                f"return el.innerText.slice(0, {max_chars});"
-                "})()"
-            )
-        else:
-            js = (f"(document.body ? document.body.innerText : '')"
-                   f".slice(0, {max_chars})")
+                           max_chars: int = 8000,
+                           pierce_shadow: bool = True) -> str:
+        """Visible text of selector match (or full body). Truncates
+        to `max_chars`.
+
+        ``pierce_shadow`` (default True) walks into shadow roots and
+        same-origin iframes — needed for modern Web Components
+        (Notion, Linear, design-system inputs) where the visible
+        text lives in a closed shadow tree that ``element.innerText``
+        skips by default. Pass False to opt out for performance
+        when you know the page is shadow-DOM-free.
+        """
+        sel_json = json.dumps(selector) if selector else "null"
+        if not pierce_shadow:
+            if selector:
+                js = (
+                    "(() => {"
+                    f"const el = document.querySelector({sel_json});"
+                    "if (!el) return null;"
+                    f"return el.innerText.slice(0, {max_chars});"
+                    "})()"
+                )
+            else:
+                js = (f"(document.body ? document.body.innerText : '')"
+                       f".slice(0, {max_chars})")
+            out = await self.evaluate(js, await_promise=False)
+            return str(out or "")
+        # Shadow-piercing text walk: same tree traversal the
+        # serializer uses, but emit text only AND respect rendered
+        # visibility — `display:none` / `visibility:hidden` containers
+        # contribute zero text. This matches the old `innerText`
+        # behavior closely while still picking up shadow-DOM and
+        # iframe content that innerText alone would miss. Without
+        # the visibility check, preloaded modals / hidden menus
+        # would dump invisible text and crowd out real content
+        # under the max_chars budget (codex P2 on first push).
+        js = f"""
+        (() => {{
+          const SKIP = new Set(["script","style","noscript","template"]);
+          function isVisible(el) {{
+            // Element.checkVisibility was added in Chromium 105 —
+            // covers display:none, visibility:hidden,
+            // content-visibility:hidden, and disconnected nodes.
+            // Fall back to a basic display:none check on older
+            // Chromes (we vendor a recent build, but defensive).
+            try {{
+              if (typeof el.checkVisibility === "function") {{
+                return el.checkVisibility({{
+                  checkOpacity: false,
+                  checkVisibilityCSS: true,
+                }});
+              }}
+            }} catch (e) {{ /* fall through */ }}
+            const cs = el.ownerDocument && el.ownerDocument.defaultView
+              ? el.ownerDocument.defaultView.getComputedStyle(el)
+              : null;
+            if (cs && (cs.display === "none"
+                        || cs.visibility === "hidden")) return false;
+            return true;
+          }}
+          function gather(node, parts) {{
+            if (!node) return;
+            if (node.nodeType === Node.TEXT_NODE) {{
+              const t = node.textContent;
+              if (t && t.trim()) parts.push(t);
+              return;
+            }}
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            const tag = (node.tagName || "").toLowerCase();
+            if (SKIP.has(tag)) return;
+            if (!isVisible(node)) return;
+            if (tag === "iframe") {{
+              try {{
+                const sub = node.contentDocument;
+                if (sub && sub.body) gather(sub.body, parts);
+              }} catch (e) {{ /* cross-origin */ }}
+              return;
+            }}
+            if (tag === "br") {{ parts.push("\\n"); return; }}
+            // Shadow content first (matches composed tree order).
+            if (node.shadowRoot) {{
+              for (const c of node.shadowRoot.childNodes) gather(c, parts);
+            }}
+            for (const c of node.childNodes) gather(c, parts);
+            // Block-level elements get a trailing newline so we don't
+            // collapse the structure into one big sentence.
+            const BLOCKS = new Set(["p","div","li","tr","article","section",
+              "header","footer","main","nav","h1","h2","h3","h4","h5","h6",
+              "blockquote","pre","ul","ol","table","figure","aside"]);
+            if (BLOCKS.has(tag)) parts.push("\\n");
+          }}
+          const sel = {sel_json};
+          const root = sel
+            ? document.querySelector(sel)
+            : (document.body || document.documentElement);
+          if (!root) return null;
+          const parts = [];
+          gather(root, parts);
+          // Coalesce whitespace runs so the model gets compact text.
+          const txt = parts.join("").replace(/[ \\t]+/g, " ")
+                                       .replace(/\\n{{3,}}/g, "\\n\\n")
+                                       .trim();
+          return txt.slice(0, {max_chars});
+        }})()
+        """
         out = await self.evaluate(js, await_promise=False)
         return str(out or "")
 
@@ -797,6 +1013,197 @@ class CDPTab:
             text_json=json.dumps(text))
         out = await self.evaluate(js, await_promise=False)
         return out if isinstance(out, dict) else {"status": "ok"}
+
+    # ─── Network capture (XHR / fetch interception) ────────────────
+    # CDP's Network domain delivers every request/response the page
+    # makes. We subscribe to the metadata events, remember responses
+    # whose mime-type looks like JSON, then on `captured_responses()`
+    # fetch each body via Network.getResponseBody.
+    #
+    # Why this is the killer feature for "cleaner data": SPAs like
+    # Twitter/LinkedIn/Reddit render their feed from JSON XHRs
+    # (`/i/api/2/timeline/home.json` etc.). The rendered HTML is
+    # decorations; the JSON IS the data. Capturing it gives the
+    # model an order-of-magnitude cleaner input than the rendered
+    # innerText. Cost: ~50ms of subscribe overhead + a per-body
+    # round trip after navigation.
+
+    async def enable_network_capture(
+        self, *, mime_filter: tuple[str, ...] = ("json",),
+    ) -> None:
+        """Start buffering responses whose mime-type contains any of
+        `mime_filter`. Default filter catches application/json,
+        application/vnd.api+json, text/json. Call BEFORE navigation
+        so the first XHR doesn't escape the subscription window.
+        Idempotent — calling twice resets the buffer but keeps the
+        handlers registered."""
+        client = await self._ensure_client()
+        self._captured_responses.clear()
+        self._capture_mime_filter = tuple(
+            m.lower() for m in mime_filter)
+        if self._capture_active:
+            return
+        await client.send("Network.enable")
+        # Filter only at handler time; the Network domain doesn't
+        # support server-side mime filtering, but keeping the
+        # filter local means we don't store metadata for irrelevant
+        # requests at all (saves ~50% memory on busy pages).
+        client.on("Network.responseReceived",
+                   self._on_network_response)
+        client.on("Network.loadingFinished",
+                   self._on_network_loading_finished)
+        self._capture_active = True
+
+    def _on_network_response(self, params: dict) -> None:
+        rid = params.get("requestId")
+        resp = params.get("response") or {}
+        mime = (resp.get("mimeType") or "").lower()
+        if not rid or not mime:
+            return
+        if self._capture_mime_filter and not any(
+                m in mime for m in self._capture_mime_filter):
+            return
+        self._captured_responses[rid] = {
+            "url": resp.get("url"),
+            "status": resp.get("status"),
+            "mime": mime,
+            "type": (params.get("type") or "").lower(),
+            "size": (resp.get("encodedDataLength")
+                      or resp.get("contentLength") or 0),
+            "body": None,
+            "loaded": False,
+        }
+
+    def _on_network_loading_finished(self, params: dict) -> None:
+        rid = params.get("requestId")
+        if rid in self._captured_responses:
+            self._captured_responses[rid]["loaded"] = True
+
+    async def captured_responses(
+        self, *, parse_json: bool = True, max_bodies: int = 50,
+        per_body_max_bytes: int = 200_000,
+    ) -> list[dict]:
+        """Return all captured responses with bodies fetched. After
+        navigation completes, walk the buffer, ask Chrome for each
+        body via Network.getResponseBody, optionally parse JSON.
+        Caps:
+          - `max_bodies`: skip extras beyond N. Pages can fire 100+
+            JSON XHRs (analytics, telemetry); the agent doesn't need
+            them all.
+          - `per_body_max_bytes`: truncate the raw body before parse
+            so a single huge response (data dumps, file uploads)
+            doesn't blow up the websocket reply.
+        """
+        if not self._capture_active or not self._captured_responses:
+            return []
+        client = await self._ensure_client()
+        out: list[dict] = []
+        for rid, info in list(self._captured_responses.items()):
+            if len(out) >= max_bodies:
+                break
+            if not info.get("loaded"):
+                continue
+            if info.get("body") is None:
+                try:
+                    body_resp = await client.send(
+                        "Network.getResponseBody",
+                        {"requestId": rid})
+                    body = body_resp.get("body") or ""
+                    if body_resp.get("base64Encoded"):
+                        # The body is base64 — typically images,
+                        # binary blobs. We requested JSON only, so
+                        # this should be rare; skip rather than
+                        # ship gibberish.
+                        info["body"] = None
+                        continue
+                    if len(body) > per_body_max_bytes:
+                        body = body[:per_body_max_bytes]
+                        info["truncated"] = True
+                    info["body"] = body
+                except CDPError:
+                    # Body may already have been freed by Chrome
+                    # (especially for redirects / preflights).
+                    continue
+            entry = {
+                "url": info["url"],
+                "status": info["status"],
+                "mime": info["mime"],
+                "type": info["type"],
+                "size": info["size"],
+                "body": info["body"],
+            }
+            if info.get("truncated"):
+                entry["truncated"] = True
+            if parse_json:
+                try:
+                    entry["data"] = json.loads(info["body"])
+                except (json.JSONDecodeError, TypeError):
+                    entry["data"] = None
+            out.append(entry)
+        return out
+
+    async def save_pdf(self, output_path: str, *,
+                       landscape: bool = False,
+                       print_background: bool = True,
+                       prefer_css_page_size: bool = True,
+                       margin: float = 0.4) -> dict:
+        """Save the current page as a PDF via Page.printToPDF.
+
+        Chrome renders the page exactly as the browser sees it
+        (CSS, fonts, images, lazy-loaded content, hydrated SPA
+        state) into a PDF. This is significantly cleaner than
+        `wkhtmltopdf` (which has its own headless renderer
+        producing different layouts) and replaces a common
+        "save this page to send to the user" workflow.
+
+        ``output_path`` may be relative — anchored to the agent's
+        current working directory, like bash. Returns
+        ``{"path": <abs_path>, "bytes": N}``.
+
+        Margin is in inches (matches CDP's API). `print_background`
+        defaults True so the printed page looks like the screen
+        version, not a stripped white-bg variant.
+        """
+        client = await self._ensure_client()
+        params = {
+            "landscape": landscape,
+            "printBackground": print_background,
+            "preferCSSPageSize": prefer_css_page_size,
+            "marginTop": margin, "marginBottom": margin,
+            "marginLeft": margin, "marginRight": margin,
+            # transferMode: ReturnAsBase64 — the websocket-friendly
+            # path. ReturnAsStream would need extra plumbing for
+            # IO.read which is not worth it for one-off saves.
+            "transferMode": "ReturnAsBase64",
+        }
+        resp = await client.send("Page.printToPDF", params)
+        b64 = resp.get("data") or ""
+        if not b64:
+            raise CDPError("Page.printToPDF returned no data")
+        import base64
+        from pathlib import Path as _Path
+        out = _Path(output_path).expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        raw = base64.b64decode(b64)
+        out.write_bytes(raw)
+        return {"path": str(out), "bytes": len(raw)}
+
+    async def disable_network_capture(self) -> None:
+        """Stop subscribing + clear the buffer. Cheap to call even
+        if capture isn't active."""
+        if not self._capture_active:
+            return
+        client = await self._ensure_client()
+        client.off("Network.responseReceived",
+                    self._on_network_response)
+        client.off("Network.loadingFinished",
+                    self._on_network_loading_finished)
+        try:
+            await client.send("Network.disable")
+        except CDPError:
+            pass
+        self._captured_responses.clear()
+        self._capture_active = False
 
 
 def _close_target(port: int, target_id: str) -> None:
@@ -1016,6 +1423,60 @@ _DEFAULT_FALLBACK_SELECTORS = [
 _FALLBACK_MIN_TEXT = 80  # chars; below this a fallback root is skipped
 
 
+# Recursive HTML serializer that flattens shadowRoot and same-origin
+# iframe content into a single document. The default
+# `document.documentElement.outerHTML` skips both, which is fine for
+# 90s-style sites but loses everything inside modern Web Components
+# (Notion's editor, Linear, Google Workspace, Twitter composer) and
+# any embedded same-origin frame. Inserted as a JS function literal
+# into _build_extract_article_js's IIFE so we don't depend on globals.
+#
+# Void-element rule + script/style skipping is matched by
+# Readability's own behavior; serializing them anyway would just
+# bloat the parse without changing the article it picks.
+_SERIALIZE_WITH_SHADOW_JS = r"""
+function serializeWithShadow(node) {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.textContent || "").replace(/[<>&]/g,
+      c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return "";
+  const tag = (node.tagName || "").toLowerCase();
+  if (tag === "script" || tag === "style" || tag === "noscript") return "";
+  const VOID = new Set(["area","base","br","col","embed","hr","img",
+                          "input","link","meta","source","track","wbr"]);
+  let html = "<" + tag;
+  for (const a of node.attributes) {
+    html += " " + a.name + "=\"" +
+      String(a.value).replace(/"/g, "&quot;") + "\"";
+  }
+  html += ">";
+  if (VOID.has(tag)) return html;
+  // Same-origin iframe: recurse into the sub-document. Cross-origin
+  // access throws — silently skip those.
+  if (tag === "iframe") {
+    try {
+      const sub = node.contentDocument;
+      if (sub && (sub.body || sub.documentElement)) {
+        html += serializeWithShadow(sub.body || sub.documentElement);
+      }
+    } catch (e) { /* cross-origin — skip */ }
+    html += "</" + tag + ">";
+    return html;
+  }
+  // Shadow content renders BEFORE slotted light-DOM content in the
+  // composed tree; preserve that order so Readability scores it
+  // correctly.
+  if (node.shadowRoot) {
+    for (const c of node.shadowRoot.childNodes) html += serializeWithShadow(c);
+  }
+  for (const c of node.childNodes) html += serializeWithShadow(c);
+  html += "</" + tag + ">";
+  return html;
+}
+"""
+
+
 def _build_extract_article_js(*, force: bool = False,
                                clean_selectors: list[str] | None = None,
                                fallback_selectors: list[str] | None = None,
@@ -1038,6 +1499,10 @@ def _build_extract_article_js(*, force: bool = False,
   const minFallbackText = {_FALLBACK_MIN_TEXT};
   const readabilitySrc = {json.dumps(readability)};
   const readerableSrc = {json.dumps(readerable)};
+
+  // Shadow-DOM + iframe-aware serializer (defined in Python as
+  // _SERIALIZE_WITH_SHADOW_JS, inlined here so the IIFE owns it).
+  {_SERIALIZE_WITH_SHADOW_JS}
 
   // Cap every outgoing payload at 200 kB BEFORE serializing back
   // through Runtime.evaluate. Two reasons:
@@ -1086,9 +1551,27 @@ def _build_extract_article_js(*, force: bool = False,
     }}
   }}
 
-  // Deep-clone the doc; mutations on the clone don't affect the
-  // live page (we may still want to click / type later).
-  const cloneDoc = document.cloneNode(true);
+  // Build a SHADOW-FLATTENED clone. document.cloneNode(true) silently
+  // skips shadowRoot and iframe content, so on modern Web Component
+  // apps (Notion, Linear, Twitter composer, custom design systems)
+  // Readability sees an empty shell and gives up. Our serializer
+  // walks the live tree, recursively inlining shadow content +
+  // same-origin iframes, and we re-parse into a fresh document.
+  // Mutations on this clone don't affect the live page so any
+  // follow-up click/type sees the original DOM.
+  let cloneDoc;
+  try {{
+    const flatHTML = serializeWithShadow(document.documentElement);
+    cloneDoc = new DOMParser().parseFromString(flatHTML, "text/html");
+    if (!cloneDoc || !cloneDoc.body || !cloneDoc.body.firstChild) {{
+      // Reparse landed an empty doc — likely a parser quirk on a
+      // weird page. Fall back to the dumb clone so we at least see
+      // the light DOM.
+      cloneDoc = document.cloneNode(true);
+    }}
+  }} catch (e) {{
+    cloneDoc = document.cloneNode(true);
+  }}
   for (const sel of cleanSelectors) {{
     try {{ for (const n of cloneDoc.querySelectorAll(sel)) n.remove(); }}
     catch (e) {{ /* invalid selector — ignore */ }}
@@ -1170,6 +1653,32 @@ def _html_to_markdown(html: str) -> str:
     return "\n".join(line.rstrip() for line in md.splitlines()).strip()
 
 
+async def _attach_xhr(tab: "CDPTab", armed: bool,
+                       max_bodies: int, per_body_max: int,
+                       result: dict) -> dict:
+    """If network capture was armed for this read, fetch the
+    captured bodies and merge them into the result dict under
+    `xhr`. Always tears the capture down before returning so a
+    later call on the same tab doesn't see stale buffers."""
+    if not armed:
+        return result
+    try:
+        xhrs = await tab.captured_responses(
+            max_bodies=max_bodies,
+            per_body_max_bytes=per_body_max)
+        if xhrs:
+            result["xhr"] = xhrs
+    except CDPError:
+        # Capture is best-effort; never let an XHR-side failure
+        # mask the (already-successful) content extraction.
+        pass
+    try:
+        await tab.disable_network_capture()
+    except CDPError:
+        pass
+    return result
+
+
 async def _extract_article_inpage(tab: "CDPTab") -> dict | None:
     """Run Readability inside the tab. Returns a dict shaped like
     OpenCLI's ExtractedArticle (source, html, title, byline, …)
@@ -1183,7 +1692,8 @@ async def _extract_article_inpage(tab: "CDPTab") -> dict | None:
     return out
 
 
-def _run_cdp(coro_factory, *, what: str) -> Any:
+def _run_cdp(coro_factory, *, what: str,
+              timeout: float | None = None) -> Any:
     """Submit a coroutine-producing callable to the background loop
     and uniformly convert any leaked exception into CDPError. The
     executor's fallback layer only catches CDPError, so a stray
@@ -1191,9 +1701,18 @@ def _run_cdp(coro_factory, *, what: str) -> Any:
     or the background-loop's `concurrent.futures.TimeoutError`
     would otherwise escape and abort the agent step instead of
     falling through to AppleScript. Centralizing the wrap here
-    keeps the contract honest at every bridge entry point."""
+    keeps the contract honest at every bridge entry point.
+
+    ``timeout`` overrides the default 30 s budget — needed by
+    batch operations (``read_pages`` can legitimately need
+    multiple waves of 20 s per-URL waits) where the global cap
+    would prematurely abort an otherwise-valid run.
+    """
     try:
-        return _BackgroundLoop.shared().run(coro_factory())
+        if timeout is None:
+            return _BackgroundLoop.shared().run(coro_factory())
+        return _BackgroundLoop.shared().run(
+            coro_factory(), timeout=timeout)
     except CDPError:
         raise
     except Exception as e:
@@ -1203,7 +1722,10 @@ def _run_cdp(coro_factory, *, what: str) -> Any:
 def read_page_via_cdp(*, url: str | None = None,
                       selector: str | None = None,
                       mode: str = "auto",
-                      max_chars: int = 8000) -> dict:
+                      max_chars: int = 8000,
+                      capture_xhr: bool = False,
+                      capture_max_bodies: int = 20,
+                      capture_per_body_max: int = 20000) -> dict:
     """Sync entry point used by executor._read_page. Returns a dict
     ``{title, url, content, source}`` where ``source`` reports which
     extraction path produced ``content``:
@@ -1239,32 +1761,70 @@ def read_page_via_cdp(*, url: str | None = None,
 
     async def _run() -> dict:
         mgr = ChromeManager.shared()
+        capture_was_armed = False
         if url:
-            # `/json/new?url=...` (inside open_tab) ALREADY initiated
-            # navigation to `url`. Calling Page.navigate(url) here
-            # would be a redundant second nav AND would defeat the
-            # `_wait_document_committed` heuristic: pre_href would
-            # already equal url, the readyState may have raced past
-            # 'loading', and we'd burn the full 8s timeout on every
-            # call. Just wait for the already-in-flight load.
-            tab = mgr.open_tab(url)
-            # Pin THIS tab as the follow-up selector target so a
-            # later click/type doesn't race onto whichever tab `/json`
-            # happens to report first.
-            if tab.target_id:
-                mgr.remember_target(tab.target_id)
+            # When XHR capture is requested, we MUST enable the
+            # Network domain before the document starts loading or
+            # the page's first wave of fetches (the actual data
+            # XHRs on SPAs like Twitter/LinkedIn/Reddit) fire while
+            # we're not listening. Two-step open in that case:
+            # open an about:blank tab, enable capture, THEN
+            # Page.navigate to the real URL. For non-capture
+            # requests the single-step /json/new?url= path stays —
+            # it's faster and shares cookie state with subsequent
+            # follow-up actions.
+            if capture_xhr:
+                tab = mgr.open_tab("about:blank")
+                if tab.target_id:
+                    mgr.remember_target(tab.target_id)
+                await tab._ensure_client()
+                try:
+                    await tab.enable_network_capture()
+                    capture_was_armed = True
+                except CDPError:
+                    capture_was_armed = False
+                # Now actually navigate. Use Page.navigate so the
+                # _wait_document_committed pre_href tracking still
+                # works (the tab IS on about:blank now, that's a
+                # real distinguishable pre-state).
+                client = await tab._ensure_client()
+                await client.send("Page.navigate", {"url": url})
+            else:
+                # `/json/new?url=...` (inside open_tab) ALREADY
+                # initiated navigation to `url`. Calling Page.navigate
+                # again would defeat the _wait_document_committed
+                # heuristic.
+                tab = mgr.open_tab(url)
+                if tab.target_id:
+                    mgr.remember_target(tab.target_id)
         else:
             tab = mgr.front_tab()
             if tab is None:
                 tab = mgr.open_tab("about:blank")
+            if capture_xhr:
+                try:
+                    await tab.enable_network_capture()
+                    capture_was_armed = True
+                except CDPError:
+                    capture_was_armed = False
         try:
             if url:
                 await tab._ensure_client()
+                # For the capture path we navigated AWAY from
+                # about:blank, so the pre_href ("about:blank") IS
+                # the distinguishable signal. For the no-capture
+                # path the tab is mid-load from /json/new; same
+                # heuristic with pre_href=None still works.
+                pre = ("about:blank" if capture_was_armed else None)
                 await tab._wait_document_committed(
-                    pre_href=None, timeout=8.0)
+                    pre_href=pre, timeout=8.0)
                 try:
-                    await tab.wait_dom_stable(
-                        quiet_ms=400, max_ms=8000)
+                    # Prefer content-aware wait — short-circuits as
+                    # soon as <main>/<article> has real (non-skeleton)
+                    # text, and falls back to plain DOM-quiet for
+                    # pages without those landmarks.
+                    await tab.wait_for_content(
+                        min_chars=400, quiet_ms=400, max_ms=8000)
                 except CDPError:
                     pass
             else:
@@ -1281,14 +1841,18 @@ def read_page_via_cdp(*, url: str | None = None,
                     selector=selector, max_chars=max_chars)
                 if not content:
                     content = "(selector matched no element)"
-                return {"title": title, "url": current,
-                        "content": content, "source": "selector"}
+                return await _attach_xhr(tab, capture_was_armed,
+                    capture_max_bodies, capture_per_body_max,
+                    {"title": title, "url": current,
+                     "content": content, "source": "selector"})
 
             # ── raw mode: full innerText, current behavior ─────────
             if mode == "raw":
                 content = await tab.extract_text(max_chars=max_chars)
-                return {"title": title, "url": current,
-                        "content": content, "source": "innerText"}
+                return await _attach_xhr(tab, capture_was_armed,
+                    capture_max_bodies, capture_per_body_max,
+                    {"title": title, "url": current,
+                     "content": content, "source": "innerText"})
 
             # ── auto / article: try Readability ────────────────────
             article = await _extract_article_inpage(tab)
@@ -1337,10 +1901,12 @@ def read_page_via_cdp(*, url: str | None = None,
                     meta = " · ".join(head_bits)
                     article_title = article.get("title") or title
                     content = (f"{meta}\n\n{md}" if meta else md)
-                    return {"title": article_title or title,
-                            "url": current,
-                            "content": content,
-                            "source": article.get("source") or "readability"}
+                    return await _attach_xhr(tab, capture_was_armed,
+                        capture_max_bodies, capture_per_body_max,
+                        {"title": article_title or title,
+                         "url": current,
+                         "content": content,
+                         "source": article.get("source") or "readability"})
 
             # ── auto fallback / article failure ────────────────────
             if mode == "article":
@@ -1349,8 +1915,10 @@ def read_page_via_cdp(*, url: str | None = None,
                     f"{current!r}. Set mode='auto' to fall back to "
                     f"innerText, or mode='raw' to skip extraction.")
             content = await tab.extract_text(max_chars=max_chars)
-            return {"title": title, "url": current,
-                    "content": content, "source": "innerText"}
+            return await _attach_xhr(tab, capture_was_armed,
+                capture_max_bodies, capture_per_body_max,
+                {"title": title, "url": current,
+                 "content": content, "source": "innerText"})
         finally:
             # Drop the websocket but LEAVE the OS-level tab open: the
             # agent's natural follow-up is `click(selector=...)` /
@@ -1364,6 +1932,182 @@ def read_page_via_cdp(*, url: str | None = None,
             # multi-tab workflows show up.
             await tab.close()
     return _run_cdp(_run, what="read_page")
+
+
+def read_pages_via_cdp(urls: list[str], *,
+                        mode: str = "auto",
+                        max_chars: int = 8000,
+                        parallelism: int = 4,
+                        per_url_timeout: float = 20.0,
+                        ) -> list[dict]:
+    """Batch read N URLs through the OpenSeer Chrome, in parallel.
+
+    Returns a list aligned with ``urls`` — same length, same order.
+    Each entry is either the dict ``read_page_via_cdp`` returns, or
+    ``{"url": <url>, "error": "<msg>"}`` if that URL failed (a single
+    bad URL doesn't kill the whole batch).
+
+    ``parallelism`` caps how many tabs run concurrently. 4 is the
+    sweet spot on a typical Mac: enough to overlap network latency,
+    not so many that Chrome's renderer thread thrashes. Each tab
+    gets ``per_url_timeout`` seconds before it's marked failed; the
+    batch as a whole has no separate timeout — total time is bounded
+    by ``ceil(len(urls)/parallelism) * per_url_timeout``.
+
+    No XHR capture / selector support in batch mode — those are
+    per-URL flags that don't translate to a "compare these N pages"
+    workflow. Use the single ``read_page`` call when you need them.
+    """
+    if mode not in ("auto", "article", "raw"):
+        raise ValueError(
+            f"read_pages_via_cdp mode must be auto|article|raw, got {mode!r}")
+    if not urls:
+        return []
+
+    async def _one(url: str) -> dict:
+        """Single-URL read using its OWN tab — no front_tab reuse,
+        no remember_target (would race between concurrent calls).
+        The tab AND the underlying Chrome target are closed in the
+        finally so a 10-URL batch doesn't leave 10 stale renderers
+        in the OpenSeer Chrome profile."""
+        mgr = ChromeManager.shared()
+        tab = mgr.open_tab(url)
+        target_id = tab.target_id
+        port = tab._port
+        try:
+            await tab._ensure_client()
+            await tab._wait_document_committed(
+                pre_href=None, timeout=min(per_url_timeout, 8.0))
+            try:
+                await tab.wait_for_content(
+                    min_chars=400, quiet_ms=400,
+                    max_ms=int(per_url_timeout * 1000))
+            except CDPError:
+                pass
+            title = await tab.title()
+            current = await tab.current_url()
+            if mode == "raw":
+                content = await tab.extract_text(max_chars=max_chars)
+                return {"title": title, "url": current,
+                        "content": content, "source": "innerText"}
+            article = await _extract_article_inpage(tab)
+            if (mode == "article" and article
+                    and article.get("source") != "readability"):
+                article = None
+            if article and article.get("html"):
+                md = _html_to_markdown(article["html"])
+                stripped = md.strip()
+                if (article.get("source") == "fallback"
+                        and len(stripped) < 40):
+                    article = None
+                else:
+                    if len(md) > max_chars:
+                        md = md[:max_chars].rstrip() + "\n\n[truncated]"
+                    elif article.get("truncated"):
+                        md = md.rstrip() + "\n\n[truncated (HTML cap)]"
+                    head_bits = []
+                    if article.get("byline"):
+                        head_bits.append(f"_By {article['byline']}_")
+                    if article.get("publishedTime"):
+                        head_bits.append(f"_{article['publishedTime']}_")
+                    if article.get("siteName"):
+                        head_bits.append(f"_via {article['siteName']}_")
+                    meta = " · ".join(head_bits)
+                    article_title = article.get("title") or title
+                    content = (f"{meta}\n\n{md}" if meta else md)
+                    return {"title": article_title or title,
+                            "url": current, "content": content,
+                            "source": article.get("source") or "readability"}
+            if mode == "article":
+                raise CDPError(
+                    f"Readability could not extract an article from {url!r}")
+            content = await tab.extract_text(max_chars=max_chars)
+            return {"title": title, "url": current,
+                    "content": content, "source": "innerText"}
+        finally:
+            await tab.close()
+            # Each batch URL opened its own /json/new tab — close it
+            # now or 10 tabs leak per call.
+            if target_id:
+                _close_target(port, target_id)
+
+    async def _run() -> list[dict]:
+        # Bounded concurrency via a semaphore. Each task wraps its
+        # own exceptions so one bad URL doesn't poison the gather.
+        sem = asyncio.Semaphore(max(1, parallelism))
+
+        async def _guarded(u: str) -> dict:
+            async with sem:
+                try:
+                    return await asyncio.wait_for(
+                        _one(u), timeout=per_url_timeout)
+                except asyncio.TimeoutError:
+                    return {"url": u,
+                            "error": f"timed out after {per_url_timeout}s"}
+                except CDPError as e:
+                    return {"url": u, "error": str(e)}
+                except Exception as e:
+                    return {"url": u,
+                            "error": f"{type(e).__name__}: {e}"}
+
+        return await asyncio.gather(*(_guarded(u) for u in urls))
+
+    # ceil(N/parallelism) * per_url_timeout is the worst case;
+    # add a 5s buffer for the asyncio.gather / tab-close overhead.
+    import math as _math
+    bridge_timeout = (
+        _math.ceil(len(urls) / max(1, parallelism)) * per_url_timeout
+        + 5.0)
+    return _run_cdp(_run, what="read_pages", timeout=bridge_timeout)
+
+
+def save_pdf_via_cdp(*, url: str | None = None,
+                      path: str,
+                      landscape: bool = False) -> dict:
+    """Sync bridge: navigate to `url` (or use the front tab if
+    omitted), then save the current page to `path` as PDF.
+
+    Returns ``{"path": <abs>, "bytes": N, "url": <final-url>}``.
+    """
+    async def _run() -> dict:
+        mgr = ChromeManager.shared()
+        opened_new = False
+        if url:
+            tab = mgr.open_tab(url)
+            if tab.target_id:
+                mgr.remember_target(tab.target_id)
+            opened_new = True
+        else:
+            tab = mgr.front_tab()
+            if tab is None:
+                raise CDPError(
+                    "no front tab and no url — pass url=... or "
+                    "open the page first via read_page")
+        target_id = tab.target_id
+        port = tab._port
+        try:
+            await tab._ensure_client()
+            if url:
+                await tab._wait_document_committed(
+                    pre_href=None, timeout=8.0)
+                try:
+                    await tab.wait_for_content(
+                        min_chars=200, quiet_ms=400, max_ms=8000)
+                except CDPError:
+                    pass
+            current = await tab.current_url()
+            saved = await tab.save_pdf(path, landscape=landscape)
+            saved["url"] = current
+            return saved
+        finally:
+            await tab.close()
+            # Only close the OS-level tab if WE opened it for this
+            # PDF — when the caller passed no URL and we reused the
+            # front tab, leave that tab alone (it likely belongs to
+            # an ongoing agent workflow).
+            if opened_new and target_id:
+                _close_target(port, target_id)
+    return _run_cdp(_run, what="save_pdf")
 
 
 def click_via_cdp(selector: str) -> dict:

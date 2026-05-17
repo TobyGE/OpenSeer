@@ -955,6 +955,234 @@ def cdp_required() -> bool:
         .lower() == "on"
 
 
+# ── Article extraction (Mozilla Readability + html2text) ─────────────
+#
+# `read_page` was historically `document.body.innerText` truncated to
+# 8 kB — a giant string that dragged in nav, sidebar, footer, cookie
+# banner, related-content sidebar, ad slots, and the actual article
+# all mashed together. The model spent token budget reading the
+# cruft and lost structure (no headings, lists, tables — innerText
+# flattens everything).
+#
+# Better path:
+#   1. After the page has rendered (handled by goto / _wait_document_committed),
+#      inject Mozilla Readability (Apache-2.0; vendored under
+#      openseer/browser_assets/readability/) into the page.
+#   2. Readability picks the dominant article subtree and returns
+#      clean HTML — nav/footer/ads stripped out.
+#   3. We pull that HTML back to Python and run html2text on it to
+#      produce compact Markdown that preserves headings, lists,
+#      code blocks, tables, and link text.
+#
+# Three modes the executor (or any caller) can pick:
+#   - "article": run Readability; raise if no article is found
+#   - "raw":     skip Readability entirely, return body.innerText (today's behaviour)
+#   - "auto":    try Readability, fall back to raw innerText on miss.
+#                Default — best UX, never empty unless the page truly is.
+
+
+_READABILITY_DIR = Path(__file__).resolve().parent / "browser_assets" / "readability"
+_readability_cache: tuple[str, str] | None = None
+
+
+def _readability_sources() -> tuple[str, str]:
+    """Read Readability.js + Readability-readerable.js from disk
+    (lazily, once per process). Returns (readability_src, readerable_src)."""
+    global _readability_cache
+    if _readability_cache is not None:
+        return _readability_cache
+    try:
+        readability = (_READABILITY_DIR / "Readability.js").read_text(
+            encoding="utf-8")
+        readerable = (_READABILITY_DIR / "Readability-readerable.js").read_text(
+            encoding="utf-8")
+    except FileNotFoundError as e:
+        raise CDPError(
+            f"Readability source missing at {_READABILITY_DIR}. The wheel "
+            f"may have been built without browser_assets package-data. "
+            f"Reinstall the package or copy Readability.js + "
+            f"Readability-readerable.js from upstream "
+            f"(github.com/mozilla/readability).") from e
+    _readability_cache = (readability, readerable)
+    return _readability_cache
+
+
+# Heuristic fallback chain when Readability declines to parse.
+# Matches OpenCLI's pick for the same problem (article-extract.ts).
+_DEFAULT_FALLBACK_SELECTORS = [
+    "main", '[role="main"]', "#main-content", "#main",
+    "#content", ".content", "article", "body",
+]
+_FALLBACK_MIN_TEXT = 80  # chars; below this a fallback root is skipped
+
+
+def _build_extract_article_js(*, force: bool = False,
+                               clean_selectors: list[str] | None = None,
+                               fallback_selectors: list[str] | None = None,
+                               ) -> str:
+    """Build the JS expression that runs in-page. Adapted from
+    OpenCLI's article-extract.ts buildExtractArticleJs — same
+    high-level pipeline, slimmed down where we don't need every
+    feature.
+
+    Returns the JS string. Inject via tab.evaluate(..., await_promise=False)
+    since the body is sync (no awaits inside).
+    """
+    readability, readerable = _readability_sources()
+    return f"""
+(() => {{
+  const cleanSelectors = {json.dumps(clean_selectors or [])};
+  const fallbackSelectors = {json.dumps(fallback_selectors
+                                          or _DEFAULT_FALLBACK_SELECTORS)};
+  const force = {json.dumps(bool(force))};
+  const minFallbackText = {_FALLBACK_MIN_TEXT};
+  const readabilitySrc = {json.dumps(readability)};
+  const readerableSrc = {json.dumps(readerable)};
+
+  // Cap every outgoing payload at 200 kB BEFORE serializing back
+  // through Runtime.evaluate. Two reasons:
+  //   1. websocket frame limits (we set max_size=32 MB, but the
+  //      JSON round-trip + ProtocolReply size is what burns memory)
+  //   2. html2text is fast but not free; feeding it the full DOM
+  //      of a 10 MB SPA wastes seconds. Python-side max_chars caps
+  //      the FINAL markdown; this caps the raw HTML on the way out.
+  const MAX_HTML_BYTES = 200000;
+  function cap(html) {{
+    if (typeof html !== "string") return {{ html: "", truncated: false }};
+    if (html.length <= MAX_HTML_BYTES) {{
+      return {{ html: html, truncated: false }};
+    }}
+    return {{ html: html.slice(0, MAX_HTML_BYTES), truncated: true }};
+  }}
+
+  function esc(s) {{
+    return String(s).replace(/[&<>]/g,
+      c => ({{ "&": "&amp;", "<": "&lt;", ">": "&gt;" }}[c]));
+  }}
+
+  // Short-circuit: non-HTML document. The browser may render a raw
+  // text / JSON file inside <pre>; pass it through as-is rather than
+  // sending Readability after something it can't make sense of.
+  const ct = document.contentType || "";
+  if (ct && ct !== "text/html" && ct !== "application/xhtml+xml") {{
+    const body = document.body ? (document.body.textContent || "") : "";
+    // Cap the inner text BEFORE the <pre> wrap so the whole payload
+    // stays under MAX_HTML_BYTES even when esc() expands a few chars.
+    const slice = body.length > MAX_HTML_BYTES
+      ? body.slice(0, MAX_HTML_BYTES) : body;
+    return {{ source: "raw-text",
+             html: "<pre>" + esc(slice) + "</pre>",
+             title: document.title || "",
+             truncated: body.length > MAX_HTML_BYTES }};
+  }}
+  if (document.body) {{
+    const kids = document.body.children;
+    if (kids.length === 1 && kids[0] && kids[0].tagName === "PRE") {{
+      const capped = cap(document.body.outerHTML);
+      return {{ source: "pre",
+               html: capped.html,
+               title: document.title || "",
+               truncated: capped.truncated }};
+    }}
+  }}
+
+  // Deep-clone the doc; mutations on the clone don't affect the
+  // live page (we may still want to click / type later).
+  const cloneDoc = document.cloneNode(true);
+  for (const sel of cleanSelectors) {{
+    try {{ for (const n of cloneDoc.querySelectorAll(sel)) n.remove(); }}
+    catch (e) {{ /* invalid selector — ignore */ }}
+  }}
+
+  // Inject Readability sources inside an isolated Function scope
+  // so their var declarations don't pollute window.* on the live
+  // page. Both library files include a CommonJS guard that's falsy
+  // here, so the constructor lands in local scope and we return it.
+  const libs = (new Function(
+    readabilitySrc + "\\n" + readerableSrc + "\\nreturn {{" +
+    " Readability: typeof Readability !== 'undefined' ? Readability : null," +
+    " isProbablyReaderable: typeof isProbablyReaderable !== 'undefined' ? isProbablyReaderable : null" +
+    " }};"
+  ))();
+  const Readability = libs.Readability;
+  const isProbablyReaderable = libs.isProbablyReaderable;
+
+  const readerableOk = force ||
+    (typeof isProbablyReaderable === "function"
+      ? isProbablyReaderable(cloneDoc) : true);
+  let article = null;
+  if (readerableOk && typeof Readability === "function") {{
+    try {{ article = new Readability(cloneDoc).parse(); }}
+    catch (e) {{ article = null; }}
+  }}
+  if (article && article.content) {{
+    const capped = cap(article.content);
+    return {{
+      source: "readability",
+      html: capped.html,
+      title: article.title || document.title || "",
+      byline: article.byline || null,
+      publishedTime: article.publishedTime || null,
+      siteName: article.siteName || null,
+      excerpt: article.excerpt || null,
+      truncated: capped.truncated,
+    }};
+  }}
+
+  // Fallback chain: pick the first big-enough structural container.
+  // Uses the same `cap()` as the other paths — a `body` match on a
+  // heavy SPA can be megabytes of hydration scripts.
+  for (const sel of fallbackSelectors) {{
+    let el = null;
+    try {{ el = cloneDoc.querySelector(sel); }} catch (e) {{ continue; }}
+    if (!el) continue;
+    const text = (el.textContent || "").trim();
+    if (text.length < minFallbackText) continue;
+    const capped = cap(el.outerHTML || "");
+    return {{ source: "fallback", html: capped.html,
+             title: document.title || "",
+             truncated: capped.truncated }};
+  }}
+  return null;
+}})()
+"""
+
+
+def _html_to_markdown(html: str) -> str:
+    """HTML → Markdown via html2text. Tuned for LLM consumption:
+    no body wrap (long lines are fine, no need to break for humans),
+    no ASCII rulers (`* * *`) for <hr>, preserve link text.
+
+    html2text is imported lazily so import-time isn't slowed by it
+    on hosts that never use the article path."""
+    import html2text
+    h = html2text.HTML2Text()
+    h.body_width = 0          # don't wrap — flat lines tokenize better
+    h.ignore_images = True    # alt text wins; img src is noise
+    h.ignore_emphasis = False
+    h.ignore_links = False
+    h.protect_links = True    # never break a URL across lines
+    h.single_line_break = True
+    h.escape_snob = True      # preserve angle brackets etc. literally
+    md = h.handle(html)
+    # Strip trailing whitespace on every line — html2text leaves
+    # trailing spaces after each paragraph and they bloat tokens.
+    return "\n".join(line.rstrip() for line in md.splitlines()).strip()
+
+
+async def _extract_article_inpage(tab: "CDPTab") -> dict | None:
+    """Run Readability inside the tab. Returns a dict shaped like
+    OpenCLI's ExtractedArticle (source, html, title, byline, …)
+    or None when both Readability + the fallback chain fail."""
+    js = _build_extract_article_js()
+    out = await tab.evaluate(js, await_promise=False)
+    if not isinstance(out, dict):
+        return None
+    if "html" not in out or "source" not in out:
+        return None
+    return out
+
+
 def _run_cdp(coro_factory, *, what: str) -> Any:
     """Submit a coroutine-producing callable to the background loop
     and uniformly convert any leaked exception into CDPError. The
@@ -974,11 +1202,41 @@ def _run_cdp(coro_factory, *, what: str) -> Any:
 
 def read_page_via_cdp(*, url: str | None = None,
                       selector: str | None = None,
+                      mode: str = "auto",
                       max_chars: int = 8000) -> dict:
     """Sync entry point used by executor._read_page. Returns a dict
-    with the same shape as the existing AppleScript path's JSON
-    output: ``{title, url, content}``. Raises CDPError on failure;
-    the caller decides whether to fall back to AppleScript."""
+    ``{title, url, content, source}`` where ``source`` reports which
+    extraction path produced ``content``:
+
+      - ``"readability"`` — Mozilla Readability picked an article
+      - ``"fallback"``    — Readability declined; we returned the
+                            first big-enough structural container
+      - ``"pre"`` / ``"raw-text"`` — non-HTML doc passed through
+      - ``"selector"``    — caller passed ``selector=...``, we
+                            returned that element's innerText
+      - ``"innerText"``   — neither Readability nor selector were
+                            used; full ``body.innerText`` dump
+
+    ``mode`` picks the strategy:
+      - ``"auto"`` (default) — try Readability; fall back to
+        body.innerText if no article. Best UX: cleaner data when
+        we have it, never empty when Readability misses.
+      - ``"article"`` — only try Readability. Raises CDPError if
+        nothing usable comes back (caller asked for an article,
+        and there isn't one).
+      - ``"raw"``     — skip Readability; behave like the old
+        path (full body.innerText, truncated).
+
+    ``selector`` (when set) overrides ``mode`` — caller knows
+    exactly which element they want.
+
+    Raises CDPError on transport / launch failure; the executor
+    decides whether to fall back to the AppleScript path.
+    """
+    if mode not in ("auto", "article", "raw"):
+        raise ValueError(
+            f"read_page_via_cdp mode must be auto|article|raw, got {mode!r}")
+
     async def _run() -> dict:
         mgr = ChromeManager.shared()
         if url:
@@ -1002,10 +1260,6 @@ def read_page_via_cdp(*, url: str | None = None,
         try:
             if url:
                 await tab._ensure_client()
-                # pre_href=None: a freshly-spawned target's initial
-                # location.href is 'about:blank' before /json/new's
-                # URL parameter applies, so any non-blank reading is
-                # already evidence of the navigation we asked for.
                 await tab._wait_document_committed(
                     pre_href=None, timeout=8.0)
                 try:
@@ -1017,12 +1271,86 @@ def read_page_via_cdp(*, url: str | None = None,
                 await tab.wait_dom_stable(quiet_ms=300, max_ms=2500)
             title = await tab.title()
             current = await tab.current_url()
-            content = await tab.extract_text(
-                selector=selector, max_chars=max_chars)
-            if selector and not content:
-                content = "(selector matched no element)"
+
+            # ── Selector path takes precedence ──────────────────────
+            # The caller said "I want THIS element," so honor it
+            # regardless of mode. Mostly used for "give me the
+            # comments section only" or "extract this code block."
+            if selector:
+                content = await tab.extract_text(
+                    selector=selector, max_chars=max_chars)
+                if not content:
+                    content = "(selector matched no element)"
+                return {"title": title, "url": current,
+                        "content": content, "source": "selector"}
+
+            # ── raw mode: full innerText, current behavior ─────────
+            if mode == "raw":
+                content = await tab.extract_text(max_chars=max_chars)
+                return {"title": title, "url": current,
+                        "content": content, "source": "innerText"}
+
+            # ── auto / article: try Readability ────────────────────
+            article = await _extract_article_inpage(tab)
+            # In strict `article` mode, only a real Readability hit
+            # counts. The fallback chain (`<main>`, `<body>`, …) is
+            # essentially what `raw` mode already gives, just rendered
+            # through html2text — accepting it would make "article"
+            # indistinguishable from "auto" on most pages with a
+            # non-empty body. Force-fallthrough to the strict-error
+            # branch below by zeroing out non-readability hits.
+            if (mode == "article" and article
+                    and article.get("source") != "readability"):
+                article = None
+            if article and article.get("html"):
+                md = _html_to_markdown(article["html"])
+                # Two failure modes the fallback path is prone to:
+                #   1. The selected <body> matched mostly because of
+                #      script/style/hydration-data textContent, so
+                #      html2text strips it all and we're left with
+                #      ~nothing visible.
+                #   2. We capped the HTML in-page and the resulting
+                #      Markdown happens to fit under max_chars, so
+                #      our Python-side truncation marker never fires
+                #      — the agent gets a silent partial.
+                # For (1): when the fallback path's Markdown is empty
+                # or near-empty, fall through to innerText below
+                # (which preserves visible text including in deeper
+                # body subtrees). For (2): respect the JS-side
+                # `truncated` flag and surface the marker.
+                stripped = md.strip()
+                if (article.get("source") == "fallback"
+                        and len(stripped) < 40):
+                    article = None
+                else:
+                    if len(md) > max_chars:
+                        md = md[:max_chars].rstrip() + "\n\n[truncated]"
+                    elif article.get("truncated"):
+                        md = md.rstrip() + "\n\n[truncated (HTML cap)]"
+                    head_bits = []
+                    if article.get("byline"):
+                        head_bits.append(f"_By {article['byline']}_")
+                    if article.get("publishedTime"):
+                        head_bits.append(f"_{article['publishedTime']}_")
+                    if article.get("siteName"):
+                        head_bits.append(f"_via {article['siteName']}_")
+                    meta = " · ".join(head_bits)
+                    article_title = article.get("title") or title
+                    content = (f"{meta}\n\n{md}" if meta else md)
+                    return {"title": article_title or title,
+                            "url": current,
+                            "content": content,
+                            "source": article.get("source") or "readability"}
+
+            # ── auto fallback / article failure ────────────────────
+            if mode == "article":
+                raise CDPError(
+                    f"Readability could not extract an article from "
+                    f"{current!r}. Set mode='auto' to fall back to "
+                    f"innerText, or mode='raw' to skip extraction.")
+            content = await tab.extract_text(max_chars=max_chars)
             return {"title": title, "url": current,
-                    "content": content}
+                    "content": content, "source": "innerText"}
         finally:
             # Drop the websocket but LEAVE the OS-level tab open: the
             # agent's natural follow-up is `click(selector=...)` /

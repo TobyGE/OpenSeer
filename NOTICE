@@ -1,0 +1,22 @@
+OpenSeer
+Copyright 2025 OpenSeer contributors
+
+This product includes software developed by third parties:
+
+────────────────────────────────────────────────────────────────────────
+Mozilla Readability
+────────────────────────────────────────────────────────────────────────
+
+`openseer/browser_assets/readability/Readability.js` and
+`openseer/browser_assets/readability/Readability-readerable.js` are
+vendored verbatim from the Mozilla Readability project:
+
+    https://github.com/mozilla/readability
+    Copyright (c) 2010 Arc90 Inc.
+    Licensed under the Apache License, Version 2.0
+
+The accompanying `LICENSE.md` is the upstream license, preserved
+unchanged alongside the source files. These libraries are injected
+into the OpenSeer-owned Chrome via Chrome DevTools Protocol's
+Runtime.evaluate from `openseer/browser_cdp.py` to extract the
+main article content from arbitrary web pages.

@@ -456,7 +456,15 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
                 title = (out.get("title") or "").strip()
                 page_url = (out.get("url") or "").strip()
                 content = (out.get("content") or "").strip()
-                head = f"# {title}" if title else "# (untitled)"
+                # Surface which extraction path produced this content
+                # so the agent can tell "clean article" from "kitchen
+                # sink innerText". Quietly omit when it's a selector
+                # match (the selector field already named the target).
+                src = (out.get("source") or "").strip()
+                src_tag = (f" [via {src}]"
+                            if src and src not in ("selector",) else "")
+                head = (f"# {title}{src_tag}"
+                        if title else f"# (untitled){src_tag}")
                 return f"{head}\n{page_url}\n\n{content}"
             except browser_cdp.CDPError as e:
                 if browser_cdp.cdp_required():

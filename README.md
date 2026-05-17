@@ -179,6 +179,15 @@ git config core.hooksPath .githooks
 `pre-push` runs `codex review` against pushed commits (advisory).
 Set `OPENSEER_SKIP_REVIEW=1` to skip.
 
+## Acknowledgments
+
+`read_page`'s article-extraction path vendors
+[Mozilla Readability](https://github.com/mozilla/readability) (Apache
+2.0) under `openseer/browser_assets/readability/`. The same JS that
+powers Firefox's Reader View runs inside the OpenSeer Chrome via
+CDP to isolate the main article DOM before we hand it to `html2text`
+for Markdown conversion. See [NOTICE](./NOTICE) for details.
+
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).

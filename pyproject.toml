@@ -38,6 +38,13 @@ dependencies = [
     # leaking OAuth tokens through `ps` while `/usr/bin/security
     # add-generic-password -w "<token>"` is running).
     "pyobjc-framework-Security>=10.0; platform_system == 'Darwin'",
+    # HTML → Markdown for read_page's article-extraction path. The
+    # CDP layer runs Mozilla Readability inside the page to isolate
+    # the main article DOM (cruft-stripped); html2text turns that
+    # HTML into compact Markdown that the model reads more
+    # accurately than flat innerText. Pure-Python, no transitive
+    # deps.
+    "html2text>=2024.2.26",
 ]
 
 [project.urls]
@@ -56,4 +63,13 @@ openseer = "openseer.cli:main"
 include = ["openseer*", "openseer_ax*"]
 
 [tool.setuptools.package-data]
-openseer = ["skills/**/*.md", "voice_listen.swift"]
+openseer = [
+    "skills/**/*.md",
+    "voice_listen.swift",
+    # Mozilla Readability source (Apache-2.0) — vendored as JS
+    # under browser_assets/readability/. browser_cdp.py reads
+    # these at import time so the article-extraction JS can be
+    # built and injected via Runtime.evaluate.
+    "browser_assets/readability/*.js",
+    "browser_assets/readability/LICENSE.md",
+]

@@ -889,6 +889,15 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
     # block on stdin (breaks for the daemon) or re-import the cbs
     # list, which is a closure-local detail of this function.
     ctx["_emit_event"] = emit
+    # ANY caller that wired ask_user is a remote daemon bridge —
+    # WS, Telegram, future MCP. This is the broader "do not touch
+    # this process's stdin" signal. Post-run callbacks combine it
+    # with a narrower `_has_remote_client` flag (set by callbacks
+    # that ALSO know how to handle approval chips) to decide
+    # between deferring via event vs parking the proposal on disk
+    # for next time. Daemons launched from a terminal during dev
+    # have isatty()==True, so stdin alone is not a safe gate.
+    ctx["_has_ask_user"] = ask_user is not None
 
     def record_step(step) -> None:
         """Append a Step to history and fire BOTH the legacy on_step_recorded

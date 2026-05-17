@@ -948,18 +948,28 @@ class RunReflectionCallback(Callback):
 
         if self.memory_mode == "ask":
             emit_event = ctx.get("_emit_event")
-            # Three-way discriminator. `_emit_event` is ALWAYS
-            # populated by agent.run (it's the trajectory event
-            # bus) so its presence alone doesn't mean a GUI is
-            # listening. WsStreamCallback marks `_has_remote_client`
-            # on its first event — that's the reliable "agentd is
-            # bridging to a GUI/Telegram client" signal, and it
-            # handles the gotcha that a developer-launched agentd
-            # has stdin.isatty()==True but no terminal user to
-            # answer an input() prompt. stdin.isatty() only enters
-            # the picture for actual bare CLI runs (no agentd).
+            # Four-way routing — two flags, three valid outcomes.
+            #
+            # `_has_remote_client` (set by WsStreamCallback): a bridge
+            # that ALSO handles memory_proposed events is listening.
+            # `_has_ask_user` (set by agent.run from `ask_user`): SOME
+            # remote daemon bridge is in play (WS, Telegram, MCP …),
+            # but it may or may not actually surface chips.
+            #
+            #   chip-capable bridge          → emit memory_proposed
+            #   any other remote daemon      → park on disk (no
+            #                                   stdin — would block
+            #                                   the daemon worker)
+            #   bare CLI on a TTY            → input() prompt
+            #   no TTY, no bridge            → park on disk
+            #
+            # The Telegram-launched-from-terminal case (codex P2):
+            # _has_ask_user=True, _has_remote_client=False,
+            # isatty()=True. Without the `_has_ask_user` gate it
+            # would fall to input() and block. With it, it parks.
             import sys
             has_remote = bool(ctx.get("_has_remote_client"))
+            has_ask_user = bool(ctx.get("_has_ask_user"))
             if callable(emit_event) and has_remote:
                 run_id = out_dir.name
                 emit_event(
@@ -974,16 +984,17 @@ class RunReflectionCallback(Callback):
                     f"({len(memory_body)} bytes); waiting for user.",
                 )
                 return
-            if not sys.stdin.isatty():
-                # No remote client AND no interactive terminal —
-                # nothing can confirm. Leave the proposal on disk
-                # so the next interactive run / GUI session can
-                # offer it, but don't apply silently.
+            if has_ask_user or not sys.stdin.isatty():
+                # Either a non-chip-capable daemon bridge is wired
+                # (Telegram today; never block its worker on stdin)
+                # or there's no terminal user to answer either way.
+                # Park the proposal; the next interactive run or
+                # chip-capable session can offer it.
                 self._append_note(
                     trace_path,
-                    f"Memory apply deferred: no remote client and "
-                    f"stdin is not a TTY; proposal parked at "
-                    f"proposed_memory.md ({len(memory_body)} bytes).",
+                    f"Memory apply deferred: no chip-capable remote "
+                    f"client; proposal parked at proposed_memory.md "
+                    f"({len(memory_body)} bytes).",
                 )
                 return
             # CLI fallback: print preview + input() prompt.

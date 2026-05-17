@@ -179,6 +179,17 @@ git config core.hooksPath .githooks
 `pre-push` runs `codex review` against pushed commits (advisory).
 Set `OPENSEER_SKIP_REVIEW=1` to skip.
 
+## Acknowledgments
+
+The per-site mini-CLIs (`openseer site arxiv …`, `openseer site bili
+…`) are Python ports of site adapters from
+[OpenCLI](https://github.com/JackWener/OpenCLI) (Apache 2.0). OpenCLI
+pioneered the "browser-as-logged-in-fetch-wrapper" pattern that
+makes deterministic site automation cheap. We use their site
+selectors, API endpoints, and signing logic (notably bilibili's WBI),
+adapted to OpenSeer's own CDP layer. See [NOTICE](./NOTICE) for
+file-by-file attribution.
+
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).

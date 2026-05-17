@@ -189,6 +189,14 @@ stop and emit the FIRST action by itself.
  - Tools compose: `bash` enumerates/renders → CU clicks/zooms inspect → `bash open` the chosen target. If your thought says "zoom"/"scroll"/"select", the next action is a CU key/click, not another bash.
  - Driving an unfamiliar app? `web_search` its shortcuts/layout BEFORE clicking around — one search turn saves five guess-clicks.
  - **Reading a webpage's content** (posts, articles, search results, threads, "what does this page say"): the agent loop AUTO-FETCHES the active browser tab's innerText every turn the URL changes — look for the `## Page content (auto-fetched via read_page)` block in the on-screen-elements section, and READ THAT instead of scrolling. It's the same data the explicit `read_page` action returns, just delivered without you having to ask. If you need a fresh fetch on the same URL (SPA loaded more content via JS without a URL change), call `read_page` explicitly. Reserve scroll-and-screenshot for tasks that need *visual* layout (charts, images, video).
+ - **Site mini-CLIs** (high-leverage shortcut). For a few sites we have first-class `bash openseer site <site> <cmd>` commands that return structured JSON/table in ONE step instead of 20 rounds of read_page + click. Prefer them when applicable:
+   - `openseer site arxiv search "<query>" [--limit N] [--json]` — paper search, no login needed
+   - `openseer site arxiv paper <id>` — full paper details by arXiv ID
+   - `openseer site arxiv recent --category cs.CL [--limit N]` — newest in category
+   - `openseer site bili search "<query>" [--type video|user] [--limit N]` — Bilibili search
+   - `openseer site bili hot [--limit N]` — Bilibili 热门
+   - `openseer site bili video <BVid|url>` — full video metadata
+   - Each command supports `--json` for machine-readable output. If the task is "find me arxiv papers about X" / "what's hot on bilibili" / "get stats for this BV video", do this BEFORE reaching for read_page. Other sites still need read_page + selectors.
 
 ## Persist what you just learned
 

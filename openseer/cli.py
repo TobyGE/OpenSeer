@@ -239,6 +239,54 @@ def cmd_daemon_launcher(args: argparse.Namespace) -> int:
     return launcher_main()
 
 
+def cmd_site(args: argparse.Namespace) -> int:
+    """Dispatch `openseer site <name> <cmd> [args]` to the per-site
+    command in `openseer/site_cli/<name>.py`. Output is a Markdown
+    table by default; pass `--json` for a JSON array on stdout."""
+    from .site_cli import _registry
+    from .site_cli.output import render
+    reg = _registry()
+    site = getattr(args, "site_name", None)
+    if not site:
+        print("Available sites:", ", ".join(sorted(reg)))
+        print('Run `openseer site <name>` to list commands.')
+        return 2
+    site_cmds = reg.get(site)
+    if site_cmds is None:
+        print(f"Unknown site {site!r}. Available: {', '.join(sorted(reg))}",
+              file=sys.stderr)
+        return 2
+    sub_cmd = getattr(args, "site_cmd", None)
+    if not sub_cmd:
+        print(f"Commands for {site!r}:")
+        for name, h in sorted(site_cmds.items()):
+            print(f"  {name:12s} {h.description}")
+        return 2
+    handler = site_cmds.get(sub_cmd)
+    if handler is None:
+        print(f"Unknown command {sub_cmd!r} for site {site!r}. "
+              f"Available: {', '.join(sorted(site_cmds))}", file=sys.stderr)
+        return 2
+    # browser_cdp.CDPError is the expected failure mode for any
+    # site that drives Chrome (bili* today). It's NOT a RuntimeError,
+    # so catch it explicitly — otherwise a missing Chrome / busy
+    # eval / closed tab would print a traceback instead of the
+    # clean ERROR: line that lets the agent loop's bash result
+    # surface a useful message.
+    try:
+        from .browser_cdp import CDPError as _CDPError
+    except Exception:
+        _CDPError = ()  # type: ignore[assignment]
+    try:
+        rows = handler.run(args)
+    except (ValueError, RuntimeError, _CDPError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print(render(rows, handler.columns,
+                  as_json=bool(getattr(args, "json", False))))
+    return 0
+
+
 def cmd_voice(args: argparse.Namespace) -> int:
     from .voice import run_voice
     return run_voice(args)
@@ -385,10 +433,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_login.set_defaults(func=cmd_auth_login)
     sub_auth.add_parser("logout", help="Wipe local tokens").set_defaults(func=cmd_auth_logout)
 
+    # `openseer site <name> <cmd> [args]` — per-site mini-CLIs that
+    # drive the OpenSeer Chrome via CDP. See openseer/site_cli/ for
+    # the list of supported sites.
+    p_site = sub.add_parser(
+        "site",
+        help="Per-site mini-CLIs (arxiv, bili, ...) that hit the "
+             "OpenSeer Chrome via CDP and return structured data.",
+    )
+    # Lazy-build the site/cmd subparsers so adding a new site
+    # doesn't require touching cli.py. `_registry()` imports the
+    # site modules; each module's import-time `Cmd.register()`
+    # populates the table we then walk to define argparse subs.
+    sub_site = p_site.add_subparsers(dest="site_name")
+    try:
+        from .site_cli import _registry as _site_registry
+        _reg = _site_registry()
+    except Exception as _e:
+        _reg = {}
+    for _site, _cmds in sorted(_reg.items()):
+        _p_one_site = sub_site.add_parser(_site, help=f"{_site} commands")
+        _sub_one_site = _p_one_site.add_subparsers(dest="site_cmd")
+        for _cmd_name, _handler in sorted(_cmds.items()):
+            _p_cmd = _sub_one_site.add_parser(
+                _cmd_name, help=_handler.description or _cmd_name)
+            # --json on every leaf command — putting it on the
+            # parent `site` parser doesn't work because argparse
+            # processes flags positionally per-subparser and a
+            # post-subcommand `--json` would be unrecognized.
+            _p_cmd.add_argument(
+                "--json", action="store_true",
+                help="Emit JSON instead of a Markdown table")
+            _handler.add_args(_p_cmd)
+            _p_cmd.set_defaults(func=cmd_site)
+        _p_one_site.set_defaults(func=cmd_site)
+    p_site.set_defaults(func=cmd_site)
+
     return ap
 
 
-_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "site", "-h", "--help"}
 
 
 def main() -> None:

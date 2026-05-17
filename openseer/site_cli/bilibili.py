@@ -97,9 +97,16 @@ def _ensure_bili_tab() -> browser_cdp.CDPTab:
         ok = is_bili_home or (is_bili_host and "/search" in url)
         if ok:
             return tab
+        # Tab isn't reusable, but it may belong to a parallel
+        # agent step / prior unrelated workflow (a half-open
+        # Notion page, a research thread, the OAuth callback
+        # window, …). DO NOT close it — just drop our local
+        # websocket and open a fresh bilibili tab alongside.
+        # Closing what we didn't open would be silent state loss
+        # the user can't recover from.
         try:
             browser_cdp._BackgroundLoop.shared().run(
-                tab.close(), timeout=2.0)
+                tab.close(), timeout=2.0)  # closes WS only, not OS tab
         except Exception:
             pass
     new_tab = mgr.open_tab("https://www.bilibili.com")

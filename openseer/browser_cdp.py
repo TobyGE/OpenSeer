@@ -55,6 +55,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -94,6 +95,66 @@ _CHROME_PATHS = [
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
 ]
+
+
+# ── User-profile snapshot ────────────────────────────────────────────
+# OpenSeer's Chrome runs from its OWN user-data-dir (kept isolated
+# from the user's daily Chrome so we never clobber their tabs). On
+# first launch we copy a curated slice of the user's real Chrome
+# profile into ours so the OpenSeer Chrome inherits their logins,
+# cookies, password manager extension data — making "read this
+# logged-in page" work out of the box instead of requiring the
+# user to log into every site twice.
+#
+# What we include (~300 MB on a typical profile):
+#   - Top-level "Local State" (encryption key reference + install id)
+#   - Default/Cookies (+ journal)
+#   - Default/Login Data (+ journal + "Login Data For Account")
+#   - Default/Preferences (browser settings, language, etc.)
+#   - Default/Bookmarks (so the agent can `bash open <bookmark url>`)
+#   - Default/Local Storage/        — many SPAs stash auth here
+#   - Default/IndexedDB/             — modern auth state
+#   - Default/Local Extension Settings/ — 1Password etc. extension data
+#   - Default/Extension Cookies (+ journal)
+#   - Default/Network/Cookies (newer Chromium puts cookies here too)
+#
+# What we deliberately skip:
+#   - Cache, Code Cache, GPUCache, DawnCache, *Cache (all rebuild)
+#   - Service Worker (registers from origin code)
+#   - Sessions (literally the open tabs — we don't want to inherit
+#     30 tabs of someone's morning reading)
+#   - History (privacy; the agent doesn't need it)
+#   - Extensions/ (extension code; tied to install id, often re-installs
+#     in a copied profile, can break. We copy SETTINGS, not the code)
+#
+# Cookies decrypt fine in our Chrome because macOS Keychain's
+# "Chrome Safe Storage" entry is shared across Chrome instances on
+# the same user account — same encryption key, same machine.
+_USER_CHROME_DIR_MACOS = (
+    Path.home() / "Library" / "Application Support" / "Google" / "Chrome")
+
+_PROFILE_TOPLEVEL_FILES = ["Local State"]
+
+_PROFILE_DEFAULT_FILES = [
+    "Cookies", "Cookies-journal",
+    "Login Data", "Login Data-journal",
+    "Login Data For Account", "Login Data For Account-journal",
+    "Preferences",
+    "Bookmarks", "Bookmarks.bak",
+    "Extension Cookies", "Extension Cookies-journal",
+]
+
+# Recursive subdir copies. ignored_patterns kept small — leveldb
+# `LOG` / `LOG.old` and `*.log` files are noisy and Chrome rebuilds
+# them on launch.
+_PROFILE_DEFAULT_DIRS = [
+    "Local Storage",
+    "IndexedDB",
+    "Local Extension Settings",
+    "Network",  # newer Chrome relocates Cookies here; copy whole dir
+]
+_PROFILE_DEFAULT_DIR_IGNORE = ("LOG", "LOG.old", "*.log", "*-shm", "*-wal",
+                                  "LOCK")
 
 
 # ── errors ───────────────────────────────────────────────────────────
@@ -235,6 +296,253 @@ def _write_stamp(port: int, pid: int | None) -> None:
     }))
 
 
+def _detect_user_chrome_profile() -> Path | None:
+    """Return the user's actual Chrome user-data-dir root (the
+    parent of Default/, not Default/ itself), or None if not
+    found. Env var ``OPENSEER_CHROME_PROFILE_SOURCE`` overrides
+    auto-detection (useful for Canary / Beta / non-Mac users).
+    """
+    override = os.environ.get("OPENSEER_CHROME_PROFILE_SOURCE")
+    if override:
+        p = Path(override).expanduser()
+        return p if p.exists() else None
+    if sys.platform == "darwin" and _USER_CHROME_DIR_MACOS.exists():
+        return _USER_CHROME_DIR_MACOS
+    return None
+
+
+def _user_chrome_running() -> bool:
+    """True iff a Google Chrome.app process is currently active.
+    When Chrome is running, the SQLite-backed files in its profile
+    (Cookies, Login Data, Local Storage) are mid-write and a naive
+    copy can capture inconsistent state. We surface that as a
+    warning rather than refusing — most of the time the snapshot
+    is fine even mid-flight, and forcing the user to quit Chrome
+    every time would be hostile."""
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f",
+             "Google Chrome.app/Contents/MacOS/Google Chrome"],
+            capture_output=True, text=True, timeout=2.0)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False
+
+
+def _detect_active_chrome_profile(source: Path) -> str:
+    """Return the source profile directory name (`Default`,
+    `Profile 1`, …) that Chrome would open by default for this
+    user. Read from `<source>/Local State` → `profile.last_used`.
+
+    Critical for users with multiple Chrome profiles ("Work" /
+    "Personal" / etc.) — copying only `Default` when they last
+    used `Profile 1` would leave the OpenSeer Chrome with empty
+    cookies. We collapse whatever profile they use into our
+    `Default` so the launch flag `--profile-directory=Default`
+    always finds the right state.
+    """
+    local_state = source / "Local State"
+    if not local_state.is_file():
+        return "Default"
+    try:
+        data = json.loads(local_state.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return "Default"
+    last_used = (data.get("profile") or {}).get("last_used")
+    if isinstance(last_used, str) and last_used.strip():
+        # Validate the dir actually exists — Local State can drift
+        # behind a profile delete and we'd snapshot a stale name.
+        if (source / last_used).is_dir():
+            return last_used
+    return "Default"
+
+
+def _openseer_chrome_running() -> tuple[bool, int | None]:
+    """Detect whether an OpenSeer-spawned Chrome is currently
+    holding our user-data-dir open. Returns (is_running, pid).
+
+    Reading files under a live Chrome's `--user-data-dir` is a
+    no-op for the agent — Chrome's in-memory cookie store wins,
+    and it overwrites the on-disk DBs on exit, losing whatever
+    we copied. snapshot/refresh must refuse in that state.
+
+    Detection has TWO layers because `_STAMP_FILE` only records a
+    pid when WE spawned the process. If we attached to an existing
+    OpenSeer Chrome (started by a prior agentd run) the stamp has
+    `pid: null` and the pid check alone returns false — but Chrome
+    is very much still up. So we fall back to `pgrep -f` scanning
+    the cmdline for our profile path, which catches both cases.
+    """
+    pid_from_stamp = None
+    if _STAMP_FILE.is_file():
+        try:
+            stamp = json.loads(_STAMP_FILE.read_text())
+            pid_from_stamp = stamp.get("pid")
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Layer 1: our spawned pid is alive AND its cmdline still
+    # references our profile dir (handles pid recycling).
+    if isinstance(pid_from_stamp, int):
+        try:
+            os.kill(pid_from_stamp, 0)
+            r = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid_from_stamp)],
+                capture_output=True, text=True, timeout=2.0)
+            if (r.returncode == 0 and
+                    f"--user-data-dir={_PROFILE_DIR}" in r.stdout):
+                return (True, pid_from_stamp)
+        except (ProcessLookupError, PermissionError,
+                subprocess.SubprocessError, OSError):
+            pass
+    # Layer 2: scan all processes for one whose cmdline references
+    # our profile dir. Catches the "attached, not spawned" case
+    # (stamp has pid: null) AND the "Chrome restarted under us"
+    # case (stamp pid is stale but a fresh Chrome owns the dir).
+    #
+    # Critical: pass `--` before the pattern. BSD/macOS pgrep
+    # parses anything starting with `-` as an option flag and
+    # errors out, which would make this entire layer a no-op
+    # exactly when we need it most (codex P2 caught this).
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", "--", f"--user-data-dir={_PROFILE_DIR}"],
+            capture_output=True, text=True, timeout=2.0)
+        if r.returncode == 0 and r.stdout.strip():
+            pid = int(r.stdout.strip().splitlines()[0])
+            return (True, pid)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    return (False, None)
+
+
+def snapshot_user_chrome_profile(*, force: bool = False,
+                                  target: Path | None = None) -> dict:
+    """Copy a curated slice of the user's Chrome profile into
+    OpenSeer's user-data-dir so the OpenSeer Chrome inherits
+    their logins / cookies / IndexedDB.
+
+    With ``force=False`` (default) this is a no-op if our profile
+    is already initialized (Default/ exists). ``force=True`` always
+    re-copies — for ``openseer chrome-refresh`` after the user
+    logs into a new site.
+
+    Multi-profile aware: reads `<source>/Local State`'s
+    `profile.last_used` and snapshots THAT profile (whether it's
+    `Default`, `Profile 1`, etc.) into our target/Default. The
+    launcher then pins `--profile-directory=Default` so we always
+    open the snapshotted state.
+
+    Returns a status dict with ``status`` in
+    {"snapshotted", "exists", "skipped"}, plus ``files``, ``bytes``,
+    ``source``, ``source_profile``, ``target``, optional ``warning``.
+    """
+    if target is None:
+        target = _PROFILE_DIR
+    source = _detect_user_chrome_profile()
+    if source is None:
+        return {
+            "status": "skipped",
+            "reason": ("Could not locate user Chrome profile "
+                        "(macOS: ~/Library/Application Support/Google/Chrome/). "
+                        "OpenSeer will start with an empty profile — "
+                        "you can log into sites manually. Set "
+                        "OPENSEER_CHROME_PROFILE_SOURCE to override "
+                        "auto-detection."),
+        }
+    target.mkdir(parents=True, exist_ok=True)
+    if not force and (target / "Default").is_dir():
+        return {"status": "exists", "target": str(target)}
+    # OpenSeer's own Chrome must NOT be running during a snapshot:
+    # we'd copy files under its feet, it'd keep using its in-memory
+    # state, and it'd overwrite our copy on exit. Refuse with a
+    # clear "quit it" message instead of silently producing a
+    # garbage profile. (Refusing only on force=True would still
+    # allow the same bug on subsequent refreshes; refuse always.)
+    running, pid = _openseer_chrome_running()
+    if running:
+        return {
+            "status": "skipped",
+            "reason": (
+                f"OpenSeer's Chrome is still running (pid {pid}). "
+                f"Quit it (or stop any running `openseer agentd`) "
+                f"and retry — snapshotting under a live Chrome "
+                f"corrupts the copy."),
+        }
+    source_profile_name = _detect_active_chrome_profile(source)
+
+    warning = None
+    if _user_chrome_running():
+        warning = ("Chrome is running; snapshot taken mid-write may "
+                   "miss recent logins. Quit Chrome and run "
+                   "`openseer chrome-refresh` for a guaranteed-"
+                   "consistent copy.")
+
+    (target / "Default").mkdir(parents=True, exist_ok=True)
+    copied_files = 0
+    copied_bytes = 0
+    ignore = shutil.ignore_patterns(*_PROFILE_DEFAULT_DIR_IGNORE)
+
+    def _copy_file(src: Path, dst: Path) -> None:
+        nonlocal copied_files, copied_bytes
+        if not src.is_file():
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, dst)
+        except (OSError, PermissionError) as e:
+            log.warning("profile snapshot: couldn't copy %s: %s",
+                         src, e)
+            return
+        copied_files += 1
+        try:
+            copied_bytes += dst.stat().st_size
+        except OSError:
+            pass
+
+    def _copy_tree(src: Path, dst: Path) -> None:
+        nonlocal copied_files, copied_bytes
+        if not src.is_dir():
+            return
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        try:
+            shutil.copytree(src, dst, ignore=ignore,
+                            symlinks=False, copy_function=shutil.copy2)
+        except (OSError, PermissionError, shutil.Error) as e:
+            log.warning("profile snapshot: copytree %s -> %s "
+                         "had errors: %s", src, dst, e)
+        # Count what landed, ignoring directories.
+        for f in dst.rglob("*"):
+            if f.is_file():
+                copied_files += 1
+                try:
+                    copied_bytes += f.stat().st_size
+                except OSError:
+                    pass
+
+    src_profile = source / source_profile_name
+    for rel in _PROFILE_TOPLEVEL_FILES:
+        _copy_file(source / rel, target / rel)
+    for rel in _PROFILE_DEFAULT_FILES:
+        _copy_file(src_profile / rel, target / "Default" / rel)
+    for rel in _PROFILE_DEFAULT_DIRS:
+        _copy_tree(src_profile / rel, target / "Default" / rel)
+
+    log.info("snapshotted user Chrome profile %s/%s: "
+              "%d files, %.1f MB",
+              source.name, source_profile_name,
+              copied_files, copied_bytes / 1024 / 1024)
+    return {
+        "status": "snapshotted",
+        "source": str(source),
+        "source_profile": source_profile_name,
+        "target": str(target),
+        "files": copied_files,
+        "bytes": copied_bytes,
+        "warning": warning,
+    }
+
+
 # ── Chrome process lifecycle ─────────────────────────────────────────
 
 
@@ -257,6 +565,13 @@ def _build_launch_args(chrome_bin: str, port: int) -> list[str]:
         chrome_bin,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={_PROFILE_DIR}",
+        # Pin the profile directory we use INSIDE the user-data-dir.
+        # snapshot_user_chrome_profile collapses whatever profile the
+        # user actually uses (Default / Profile 1 / …) into our
+        # `Default` subdir, so we always open that one. Without this
+        # flag Chrome would read Local State's `profile.last_used`
+        # and could open a non-Default subdir that we never populated.
+        "--profile-directory=Default",
         # Open with a blank tab — DON'T restore from the user's last
         # session and DON'T pop the "Welcome to Chrome" first-run UI.
         "about:blank",
@@ -306,6 +621,30 @@ def launch_chrome() -> ChromeHandle:
         return ChromeHandle(port=port, proc=None)
 
     _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # First-launch profile snapshot: if our profile is empty (no
+    # Default/ subdir yet), copy a curated slice of the user's
+    # real Chrome profile so the OpenSeer Chrome inherits their
+    # logins / cookies / extension auth. Subsequent launches see
+    # an existing Default/ and skip — refresh is manual via
+    # `openseer chrome-refresh`. Failures are non-fatal: we just
+    # log and proceed with an empty profile (user can log in
+    # manually).
+    if not (_PROFILE_DIR / "Default").is_dir():
+        try:
+            result = snapshot_user_chrome_profile()
+            if result.get("status") == "snapshotted":
+                if result.get("warning"):
+                    log.warning("profile snapshot: %s",
+                                 result["warning"])
+            elif result.get("status") == "skipped":
+                log.info("profile snapshot skipped: %s",
+                          result.get("reason", ""))
+        except Exception as e:
+            log.warning(
+                "profile snapshot raised %s: %s — Chrome will start "
+                "with an empty profile (log into sites manually).",
+                type(e).__name__, e)
+
     args = _build_launch_args(chrome_bin, port)
     log.info("CDP launching Chrome on port %d (profile=%s)",
               port, _PROFILE_DIR)
@@ -1247,6 +1586,15 @@ class ChromeManager:
         # different tab, user clicks into the OpenSeer Chrome, etc.).
         self._last_target_id: str | None = None
         self._last_target_lock = threading.Lock()
+        # Singleton "scratch tab" for read_page. Without it every
+        # read_page(url=...) call goes through /json/new and leaves a
+        # tab behind — after a long run the OpenSeer Chrome window
+        # has 50+ stale tabs. The scratch model: one tab, Page.navigate
+        # to each new URL. ChromeManager owns its target_id; CDPTab
+        # wrappers are recreated each call (websocket lifecycle is
+        # per-CDPTab, target lifecycle is per-ChromeManager).
+        self._scratch_target_id: str | None = None
+        self._scratch_lock = threading.Lock()
 
     def remember_target(self, target_id: str) -> None:
         with self._last_target_lock:
@@ -1322,6 +1670,31 @@ class ChromeManager:
                 if self._last_target_id == remembered:
                     self._last_target_id = None
         return CDPTab(handle.port, tabs[0])
+
+    def scratch_tab(self) -> CDPTab:
+        """Return a CDPTab bound to the singleton scratch target.
+
+        Used by read_page_via_cdp so repeated reads navigate the
+        SAME tab via Page.navigate rather than spawning new ones
+        through /json/new. Heals itself if the cached target was
+        closed (by user clicking 'x' on the tab, by Chrome restart,
+        or by `openseer chrome-refresh` wiping the profile).
+        """
+        handle = self.ensure_running()
+        with self._scratch_lock:
+            current = self._scratch_target_id
+            if current:
+                tabs = fetch_tabs(handle.port)
+                for t in tabs:
+                    if t.get("id") == current:
+                        return CDPTab(handle.port, t)
+                # Cached target gone — fall through and recreate.
+                self._scratch_target_id = None
+            target = _new_tab(handle.port, "about:blank")
+            tid = target.get("id")
+            if tid:
+                self._scratch_target_id = tid
+            return CDPTab(handle.port, target)
 
     def shutdown(self) -> None:
         """Kill the Chrome we spawned (if any). Doesn't touch
@@ -1762,45 +2135,45 @@ def read_page_via_cdp(*, url: str | None = None,
     async def _run() -> dict:
         mgr = ChromeManager.shared()
         capture_was_armed = False
+        pre_href: str | None = None
         if url:
-            # When XHR capture is requested, we MUST enable the
-            # Network domain before the document starts loading or
-            # the page's first wave of fetches (the actual data
-            # XHRs on SPAs like Twitter/LinkedIn/Reddit) fire while
-            # we're not listening. Two-step open in that case:
-            # open an about:blank tab, enable capture, THEN
-            # Page.navigate to the real URL. For non-capture
-            # requests the single-step /json/new?url= path stays —
-            # it's faster and shares cookie state with subsequent
-            # follow-up actions.
+            # Single-scratch-tab model: reuse the persistent OpenSeer
+            # scratch tab and Page.navigate it to `url`. Without this
+            # every read_page leaves a fresh tab behind and a long
+            # agent run accumulates 50+ stale tabs in the OpenSeer
+            # Chrome window. The scratch tab heals itself if the
+            # cached target was closed (e.g. user clicked 'x').
+            #
+            # For XHR capture we need to enable the Network domain
+            # BEFORE the navigation fires, otherwise the page's first
+            # wave of data fetches escapes the subscription window.
+            # Reusing the scratch tab works for that too — we enable,
+            # then Page.navigate.
+            tab = mgr.scratch_tab()
+            if tab.target_id:
+                mgr.remember_target(tab.target_id)
+            await tab._ensure_client()
+            # Capture the pre-navigate href so _wait_document_committed
+            # can distinguish "we landed on the new doc" from "we're
+            # still on the previous URL". The scratch tab's prior
+            # state is whatever read_page left it on last time
+            # (or about:blank if first call), so we MUST read it.
+            try:
+                pre_href = await tab.current_url() or None
+            except CDPError:
+                pre_href = None
             if capture_xhr:
-                tab = mgr.open_tab("about:blank")
-                if tab.target_id:
-                    mgr.remember_target(tab.target_id)
-                await tab._ensure_client()
                 try:
                     await tab.enable_network_capture()
                     capture_was_armed = True
                 except CDPError:
                     capture_was_armed = False
-                # Now actually navigate. Use Page.navigate so the
-                # _wait_document_committed pre_href tracking still
-                # works (the tab IS on about:blank now, that's a
-                # real distinguishable pre-state).
-                client = await tab._ensure_client()
-                await client.send("Page.navigate", {"url": url})
-            else:
-                # `/json/new?url=...` (inside open_tab) ALREADY
-                # initiated navigation to `url`. Calling Page.navigate
-                # again would defeat the _wait_document_committed
-                # heuristic.
-                tab = mgr.open_tab(url)
-                if tab.target_id:
-                    mgr.remember_target(tab.target_id)
+            client = await tab._ensure_client()
+            await client.send("Page.navigate", {"url": url})
         else:
             tab = mgr.front_tab()
             if tab is None:
-                tab = mgr.open_tab("about:blank")
+                tab = mgr.scratch_tab()
             if capture_xhr:
                 try:
                     await tab.enable_network_capture()
@@ -1810,14 +2183,27 @@ def read_page_via_cdp(*, url: str | None = None,
         try:
             if url:
                 await tab._ensure_client()
-                # For the capture path we navigated AWAY from
-                # about:blank, so the pre_href ("about:blank") IS
-                # the distinguishable signal. For the no-capture
-                # path the tab is mid-load from /json/new; same
-                # heuristic with pre_href=None still works.
-                pre = ("about:blank" if capture_was_armed else None)
+                # `pre_href` was captured pre-navigate above. Two
+                # cases:
+                #  - Fresh navigation: readyState transitions
+                #    through `loading`, or href changes — 8s is
+                #    the generous-but-bounded budget.
+                #  - Same-URL re-navigation: bfcache restore can
+                #    keep href unchanged + readyState `complete`,
+                #    so the two-signal heuristic in
+                #    _wait_document_committed never satisfies and
+                #    the 8s deadline expires. Use a SHORT 2s
+                #    deadline for same-URL — we still let Chrome
+                #    flush any in-flight reload, but we don't burn
+                #    the full 8s on every refresh. Skipping
+                #    entirely (codex P2) would risk reading the
+                #    pre-reload DOM before Chrome rebuilds the
+                #    execution context.
+                same_url = (pre_href is not None
+                             and pre_href.rstrip("/") == url.rstrip("/"))
+                commit_timeout = 2.0 if same_url else 8.0
                 await tab._wait_document_committed(
-                    pre_href=pre, timeout=8.0)
+                    pre_href=pre_href, timeout=commit_timeout)
                 try:
                     # Prefer content-aware wait — short-circuits as
                     # soon as <main>/<article> has real (non-skeleton)

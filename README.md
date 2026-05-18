@@ -137,14 +137,22 @@ whichever you're missing. Your choice persists to
 - **Read pages** — `read_page` pulls a webpage's full text in one
   call, no scroll-and-screenshot loops. When a URL is supplied,
   OpenSeer drives a dedicated Chrome instance (separate
-  `--user-data-dir=~/.openseer/chrome-profile`, never your normal
-  browser) via Chrome DevTools Protocol — Promise-awaiting,
-  DOM-stable waits, no "Allow JavaScript from Apple Events" toggle
-  required. First time you need a logged-in site, log in once
-  inside that profile; cookies persist. Set
-  `OPENSEER_BROWSER_CDP=off` to disable and stay on the
-  AppleScript path; `=on` to make CDP failures hard errors
-  (default `auto` falls back silently).
+  `--user-data-dir=~/.openseer/chrome-profile`, never racing with
+  your normal browser) via Chrome DevTools Protocol — Promise-
+  awaiting, DOM-stable waits, no "Allow JavaScript from Apple
+  Events" toggle required. On first launch OpenSeer copies a
+  curated slice of your real Chrome profile (cookies, password
+  manager extension data, IndexedDB / Local Storage auth tokens)
+  into its own profile so you don't have to log into every site
+  twice. After you log into a new site in your real Chrome,
+  `openseer chrome-refresh` resyncs (quit Chrome first for a
+  guaranteed-consistent copy). A single "scratch tab" gets
+  navigated for each call instead of opening fresh ones, so tabs
+  don't accumulate. Set `OPENSEER_BROWSER_CDP=off` to disable and
+  stay on the AppleScript path; `=on` to make CDP failures hard
+  errors (default `auto` falls back silently).
+  `OPENSEER_CHROME_PROFILE_SOURCE` overrides profile auto-detection
+  if your Chrome lives somewhere non-standard.
 - **Bash + web** — runs shell commands, fetches URLs, web search.
   The agent picks the right tool itself.
 - **Skills that grow themselves** — per-site / per-app markdown

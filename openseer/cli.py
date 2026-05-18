@@ -190,6 +190,34 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return run_repl()
 
 
+def cmd_chrome_refresh(args: argparse.Namespace) -> int:
+    """Re-sync the OpenSeer Chrome profile from the user's real Chrome.
+
+    First launch already copies the user's Chrome profile into
+    OpenSeer's user-data-dir so logins / cookies / extension auth
+    flow through automatically. After the user logs into a NEW
+    site in their real Chrome (or rotates a session), this command
+    re-runs the snapshot so the next read_page picks up the fresh
+    state. Use after Chrome is quit for a guaranteed-consistent copy.
+    """
+    from . import browser_cdp
+    result = browser_cdp.snapshot_user_chrome_profile(force=True)
+    status = result.get("status")
+    if status == "skipped":
+        print(f"chrome-refresh skipped: {result.get('reason', '')}")
+        return 2
+    if status == "snapshotted":
+        mb = result.get("bytes", 0) / 1024 / 1024
+        print(f"snapshotted {result.get('files', 0)} files "
+              f"({mb:.1f} MB) from {result.get('source')} "
+              f"→ {result.get('target')}")
+        if result.get("warning"):
+            print(f"  warning: {result['warning']}")
+        return 0
+    print(f"chrome-refresh: unexpected status {status!r}")
+    return 1
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Print system status: provider logins, TCC permissions, Telegram
     config. Used by the macOS GUI's setup wizard (calls with --json)
@@ -269,6 +297,13 @@ def build_parser() -> argparse.ArgumentParser:
         "reset",
         help="Factory-reset: wipe OAuth tokens, configs, TCC grants",
     ).set_defaults(func=cmd_reset)
+
+    sub.add_parser(
+        "chrome-refresh",
+        help="Re-sync OpenSeer Chrome's profile from your real "
+             "Chrome (cookies, logins, extension auth). Quit Chrome "
+             "first for a guaranteed-consistent copy.",
+    ).set_defaults(func=cmd_chrome_refresh)
 
     p_perm = sub.add_parser(
         "permissions",
@@ -395,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
 # an agent run with that prompt — surprising for anyone with a
 # script still calling the old mini-CLI. Keeping it reserved makes
 # argparse fail fast with "invalid choice" instead.
-_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "site", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "chrome-refresh", "site", "-h", "--help"}
 
 
 def main() -> None:

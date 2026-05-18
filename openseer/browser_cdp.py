@@ -136,12 +136,23 @@ _USER_CHROME_DIR_MACOS = (
 _PROFILE_TOPLEVEL_FILES = ["Local State"]
 
 _PROFILE_DEFAULT_FILES = [
-    "Cookies", "Cookies-journal",
+    # SQLite DBs use two side files in WAL mode: `-wal` (write-ahead
+    # log holding uncommitted rows) and `-shm` (shared memory index).
+    # Recent Chrome uses WAL mode by default for Cookies / Login Data,
+    # so copying ONLY the main DB drops every cookie written since the
+    # last WAL checkpoint — i.e. fresh logins go missing. Include the
+    # side files explicitly; SQLite reattaches them on open and sees
+    # the full state. `-journal` is the legacy rollback format Chrome
+    # used pre-WAL; we list both for backward compatibility.
+    "Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm",
     "Login Data", "Login Data-journal",
+    "Login Data-wal", "Login Data-shm",
     "Login Data For Account", "Login Data For Account-journal",
+    "Login Data For Account-wal", "Login Data For Account-shm",
     "Preferences",
     "Bookmarks", "Bookmarks.bak",
     "Extension Cookies", "Extension Cookies-journal",
+    "Extension Cookies-wal", "Extension Cookies-shm",
 ]
 
 # Recursive subdir copies. ignored_patterns kept small — leveldb
@@ -153,8 +164,15 @@ _PROFILE_DEFAULT_DIRS = [
     "Local Extension Settings",
     "Network",  # newer Chrome relocates Cookies here; copy whole dir
 ]
-_PROFILE_DEFAULT_DIR_IGNORE = ("LOG", "LOG.old", "*.log", "*-shm", "*-wal",
-                                  "LOCK")
+_PROFILE_DEFAULT_DIR_IGNORE = (
+    # LevelDB internals — runtime files that Chrome rebuilds on open
+    # and that fail to copy cleanly anyway (LOCK held; LOG.old +
+    # numeric *.log files are append-only WAL we don't need).
+    "LOCK", "LOG", "LOG.old", "*.log",
+    # NOTE: deliberately NOT excluding `*-shm` / `*-wal` — those are
+    # SQLite WAL side files that hold fresh cookies / logins. Codex
+    # P2 on the initial push.
+)
 
 
 # ── errors ───────────────────────────────────────────────────────────

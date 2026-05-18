@@ -47,6 +47,10 @@ class Action:
     urls: list[str] | None = None  # for read_pages: list of URLs to read in parallel — replaces N sequential read_page calls when comparing/aggregating pages
     path: str | None = None        # for save_pdf: output PDF file path (absolute or cwd-relative)
     landscape: bool = False        # for save_pdf: landscape orientation (default portrait)
+    value: str | None = None       # for set_value: the string to write to the element's AXValue
+    ax_action: str | None = None   # for perform_action: AX action name (AXPress, AXShowMenu, AXIncrement, ...)
+    ax_query: str | None = None    # for click/type/set_value/perform_action: natural-language label match against this turn's AX tree; agent loop resolves to `index` before dispatch ("Sign in" → matched-row index)
+    snapshot: str | None = None    # for click/type/set_value/perform_action: snapshot_id from a prior `see` action — resolves index/ax_query against THAT cached AX tree instead of the live one (avoids re-dumping when the screen hasn't changed across N actions)
     # ask_user: pause and request user input. `kind` ∈ {"confirm", "choose", "text"}.
     # `question` is the prompt shown to the user; `options` is required for kind="choose"
     # and ignored otherwise (kind="confirm" auto-uses Yes/No). `attachments` reuses
@@ -477,6 +481,86 @@ def _save_pdf(action: "Action", *, dry_run: bool) -> str:
             f"({out.get('bytes')} bytes) from {out.get('url')}")
 
 
+def _set_value(action: "Action", *, dry_run: bool) -> str:
+    """Write directly to an AX-settable element (text field, slider,
+    switch, etc.). Wraps openseer_ax.set_ax_value, which bypasses
+    click+type+focus orchestration and just sets the attribute
+    atomically. ~10x faster + far more reliable for form fields,
+    especially the ones with autocomplete / virtualization quirks.
+
+    Requires ``index`` (the element's flat index from the AX dump)
+    and ``value`` (the string to write). Index is the same numbering
+    `click(index=N)` uses, so the agent can read the AX listing and
+    pick the same target.
+    """
+    if action.index is None:
+        return "ERROR: set_value needs `index` (the AX element index)"
+    if action.value is None:
+        return "ERROR: set_value needs `value` (the string to write)"
+    if dry_run:
+        return (f"would set_value at AX index {action.index} = "
+                f"{action.value!r}")
+    # Resolve the target pid. set_value operates on whatever app the
+    # agent's last get_app_state was reading — typically the
+    # foreground app. If the agent passed `app=` we honor it instead.
+    try:
+        from openseer_ax import (
+            set_ax_value, active_app_pid, app_pid_by_name)
+    except Exception as e:
+        return f"ERROR: openseer_ax not available: {e}"
+    target_pid: int | None = None
+    if (action.app or "").strip():
+        target_pid = app_pid_by_name(action.app.strip())
+        if target_pid is None:
+            return (f"ERROR: app {action.app!r} is not running — "
+                    f"open_app it first")
+    else:
+        target_pid = active_app_pid()
+    if not target_pid:
+        return "ERROR: no foreground app found to set_value on"
+    ok, err = set_ax_value(target_pid, int(action.index), action.value)
+    if not ok:
+        return f"ERROR: set_value failed: {err}"
+    preview = (action.value[:60] + "…") if len(action.value) > 60 \
+        else action.value
+    return (f"set_value: AX[{action.index}] (pid={target_pid}) "
+            f"= {preview!r}")
+
+
+def _perform_action(action: "Action", *, dry_run: bool) -> str:
+    """Invoke a named AX action (AXPress, AXShowMenu, AXIncrement, …)
+    on the element at ``index``. Faster + more semantic than synthesizing
+    a mouse click — fires the same notification path the OS uses when
+    the user activates the element directly.
+    """
+    if action.index is None:
+        return "ERROR: perform_action needs `index` (the AX element index)"
+    ax_action = (action.ax_action or "AXPress").strip()
+    if dry_run:
+        return (f"would perform_action {ax_action} on AX[{action.index}]")
+    try:
+        from openseer_ax import (
+            perform_ax_action, active_app_pid, app_pid_by_name)
+    except Exception as e:
+        return f"ERROR: openseer_ax not available: {e}"
+    target_pid: int | None = None
+    if (action.app or "").strip():
+        target_pid = app_pid_by_name(action.app.strip())
+        if target_pid is None:
+            return (f"ERROR: app {action.app!r} is not running — "
+                    f"open_app it first")
+    else:
+        target_pid = active_app_pid()
+    if not target_pid:
+        return "ERROR: no foreground app found to perform_action on"
+    ok, err = perform_ax_action(
+        target_pid, int(action.index), ax_action)
+    if not ok:
+        return f"ERROR: perform_action failed: {err}"
+    return (f"perform_action {ax_action} on AX[{action.index}] "
+            f"(pid={target_pid}) ok")
+
+
 def _read_page(action: "Action", *, dry_run: bool) -> str:
     """Extract page text from the active tab of a browser via AppleScript
     JavaScript injection. Lets the agent consume a webpage's content in
@@ -573,6 +657,27 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
                             f"- `{u}` (status {st}, {mime}, "
                             f"{x.get('size', 0)} bytes)\n"
                             f"  preview: {preview}\n"
+                        )
+                # Interactive elements: the page's top-N buttons /
+                # links / inputs with their CSS selectors, so the
+                # agent's next `click(selector=...)` / `type(selector=...)`
+                # has somewhere concrete to point. Cap to keep prompt
+                # weight manageable; agent can re-read with a tighter
+                # selector if it needs more.
+                interactives = out.get("interactives") or []
+                if interactives:
+                    body += "\n\n## Interactive elements"
+                    body += ("\n(use these selectors with "
+                              "`click` / `type`; `set_value` is "
+                              "AX-only and takes `index`/`ax_query`, "
+                              "not a CSS selector):\n")
+                    for it in interactives:
+                        label = (it.get("label") or "").strip() or "(no label)"
+                        sel = it.get("selector") or ""
+                        tag = it.get("tag") or "?"
+                        body += (
+                            f"- [{it.get('id')}] `{sel}` — "
+                            f"{tag} {label!r}\n"
                         )
                 return body
             except browser_cdp.CDPError as e:
@@ -951,6 +1056,10 @@ def execute(action: Action, *, dry_run: bool = True,
         return _read_pages(action, dry_run=dry_run)
     if name == "save_pdf":
         return _save_pdf(action, dry_run=dry_run)
+    if name == "set_value":
+        return _set_value(action, dry_run=dry_run)
+    if name == "perform_action":
+        return _perform_action(action, dry_run=dry_run)
 
     if name == "web_fetch":
         from .web import web_fetch

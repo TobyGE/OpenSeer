@@ -35,6 +35,10 @@ try:
     from ApplicationServices import (  # type: ignore[import-untyped]
         AXUIElementCreateApplication,
         AXUIElementCopyAttributeValue,
+        AXUIElementSetAttributeValue,
+        AXUIElementIsAttributeSettable,
+        AXUIElementCopyActionNames,
+        AXUIElementPerformAction,
         AXUIElementSetMessagingTimeout,
         AXValueGetValue,
         kAXValueCGPointType,
@@ -406,6 +410,232 @@ def dump_ax_tree(pid: int | None = None,
 
     visit(app, 0)
     return out
+
+
+def resolve_ax_index(elems: list[AXElem], query: str,
+                      *, prefer_interactive: bool = True,
+                      min_score: int = 30) -> tuple[int, int] | None:
+    """Fuzzy-match ``query`` against the labels in a dumped AX tree.
+    Returns ``(idx, score)`` for the best match, or ``None`` if no
+    element scores above ``min_score``.
+
+    Scoring (max 100):
+      - exact label match (case-insensitive)           → 100
+      - label starts with query                        → 80
+      - query is a substring of label                  → 60
+      - word-overlap ratio (set intersection / |q|)    → 0-50
+      + interactive role bonus (button/link/etc.)      → +10
+      + role match (e.g. query="button: submit")       → +15
+
+    Why this exists: makes the agent's ``click(ax_query="Sign in")``
+    work without forcing the model to count rows in the AX listing.
+    Peekaboo's ``--on "Sign in"`` UX boiled down — same idea,
+    different scoring weights.
+    """
+    if not query.strip():
+        return None
+    q = query.strip().lower()
+    # Allow "role: label" syntax (e.g. "button: submit" / "link: docs")
+    role_hint: str | None = None
+    if ":" in q:
+        head, tail = q.split(":", 1)
+        head = head.strip()
+        tail = tail.strip()
+        if head and tail:
+            role_hint = head
+            q = tail
+    best_idx: int | None = None
+    best_score = -1
+    for elem in elems:
+        label = (elem.label or "").strip().lower()
+        if not label:
+            continue
+        score = 0
+        if label == q:
+            score = 100
+        elif label.startswith(q):
+            score = 80
+        elif q in label:
+            score = 60
+        else:
+            qw = set(q.split())
+            lw = set(label.split())
+            if qw and lw:
+                overlap = len(qw & lw) / len(qw)
+                score = int(overlap * 50)
+        if prefer_interactive and elem.interactive:
+            score += 10
+        if role_hint and role_hint in elem.role.lower():
+            score += 15
+        if score > best_score and score >= min_score:
+            best_idx = elem.idx
+            best_score = score
+    if best_idx is None:
+        return None
+    return (best_idx, best_score)
+
+
+def _resolve_to_live_element(pid: int, target_idx: int,
+                              *, max_depth: int = 14,
+                              timeout: float = 5.0):
+    """Re-walk the AX tree of `pid` using the SAME visit/keep rules as
+    `dump_ax_tree`, return the live ``AXUIElementRef`` whose flat
+    index in that walk matches ``target_idx``.
+
+    Used by ``set_ax_value`` and ``perform_ax_action`` so the
+    agent's "act on element N" referencing a prior dump still works
+    AX-side. Re-walking per action is the cost we pay until the
+    snapshot-cache work (P1.1) lands and we can pin live refs
+    inside a snapshot.
+
+    Returns None on AX unavailable, bad pid, tree shorter than N+1,
+    or on any AX exception (defensive — callers map None to a clean
+    "element not found" error string for the agent).
+    """
+    if not _AX_AVAILABLE:
+        return None
+    app = AXUIElementCreateApplication(pid)
+    if app is None:
+        return None
+    try:
+        AXUIElementSetMessagingTimeout(app, float(timeout))
+    except Exception:
+        pass
+
+    counter = [0]
+    found = [None]
+
+    def visit(elem, depth: int) -> None:
+        if found[0] is not None or depth > max_depth:
+            return
+        role = _attr(elem, "AXRole") or ""
+        title = _attr(elem, "AXTitle") or ""
+        desc = _attr(elem, "AXDescription") or ""
+        value = _attr(elem, "AXValue")
+        value_str = value if isinstance(value, str) else ""
+        label = title or desc or value_str
+
+        pos = _unbox_pos(_attr(elem, "AXPosition"))
+        size = _unbox_size(_attr(elem, "AXSize"))
+        bbox = None
+        if pos is not None and size is not None:
+            x, y = pos
+            w, h = size
+            if w > 0 and h > 0:
+                bbox = (int(x), int(y), int(w), int(h))
+
+        is_interactive = role in _INTERACTIVE_ROLES
+        is_static = role in _STATIC_ROLES
+        keep = (
+            (is_interactive and bbox is not None)
+            or (is_static and (label or "").strip() and bbox is not None)
+        )
+        if keep:
+            if counter[0] == target_idx:
+                found[0] = elem
+                return
+            counter[0] += 1
+
+        children = _attr(elem, "AXChildren")
+        if children:
+            try:
+                for c in children:
+                    visit(c, depth + 1)
+                    if found[0] is not None:
+                        return
+            except TypeError:
+                pass
+
+    visit(app, 0)
+    return found[0]
+
+
+def set_ax_value(pid: int, idx: int, value: str,
+                  *, timeout: float = 5.0) -> tuple[bool, str]:
+    """Set the AXValue of the AX element at flat-index ``idx`` for
+    process ``pid``. Works on text fields, sliders, switches, etc.
+    — anything whose ``AXValue`` attribute is settable.
+
+    Faster + more reliable than click+type chains: writes the
+    value atomically without going through focus management,
+    keyboard repeat, or autocomplete races. Sliders / checkboxes
+    that can't accept keystrokes are this path's bread and butter.
+
+    Returns ``(ok, error_message)``. The error message is short
+    and meant for the agent's next-turn prompt.
+    """
+    if not _AX_AVAILABLE:
+        return (False, "AX framework not available on this platform")
+    elem = _resolve_to_live_element(pid, idx, timeout=timeout)
+    if elem is None:
+        return (False, f"no AX element at index {idx} for pid {pid} "
+                       f"— tree may have shifted since last dump")
+    # Verify settability first — AX will silently no-op on some
+    # elements without returning an error, so this guard saves the
+    # agent from "success → why didn't it change".
+    try:
+        err, settable = AXUIElementIsAttributeSettable(
+            elem, "AXValue", None)
+    except Exception as e:
+        return (False, f"AXUIElementIsAttributeSettable raised: {e}")
+    if err != 0:
+        return (False, f"settability check failed (err={err})")
+    if not settable:
+        return (False,
+                "element's AXValue is not settable — try `click` + "
+                "`type` instead, or pick a different element")
+    try:
+        err = AXUIElementSetAttributeValue(elem, "AXValue", value)
+    except Exception as e:
+        return (False, f"AXUIElementSetAttributeValue raised: {e}")
+    if err != 0:
+        return (False, f"AX setValue returned err={err}")
+    return (True, "")
+
+
+def perform_ax_action(pid: int, idx: int, action: str = "AXPress",
+                       *, timeout: float = 5.0) -> tuple[bool, str]:
+    """Invoke a named AX action on the element at flat-index ``idx``.
+
+    Common actions:
+      - ``AXPress``      — primary activation (button / link / row)
+      - ``AXShowMenu``   — open context menu (right-click semantic)
+      - ``AXIncrement`` / ``AXDecrement`` — stepper / slider nudge
+      - ``AXConfirm`` / ``AXCancel``      — dialog buttons
+      - ``AXPick``       — popup-button selection
+
+    These hit the same code path the OS dispatcher uses when YOU
+    click, so they fire all the right notification / a11y events
+    without going through synthetic mouse generation.
+
+    Returns ``(ok, error_message)``.
+    """
+    if not _AX_AVAILABLE:
+        return (False, "AX framework not available on this platform")
+    elem = _resolve_to_live_element(pid, idx, timeout=timeout)
+    if elem is None:
+        return (False, f"no AX element at index {idx} for pid {pid} "
+                       f"— tree may have shifted since last dump")
+    # Enumerate supported actions so the error message can tell the
+    # agent EXACTLY what is supported instead of just "err=...".
+    try:
+        err, names = AXUIElementCopyActionNames(elem, None)
+    except Exception as e:
+        return (False, f"AXUIElementCopyActionNames raised: {e}")
+    if err != 0:
+        return (False, f"could not list AX actions (err={err})")
+    supported = list(names or [])
+    if action not in supported:
+        return (False,
+                f"element doesn't support {action!r}. "
+                f"Supported: {supported or '(none)'}")
+    try:
+        err = AXUIElementPerformAction(elem, action)
+    except Exception as e:
+        return (False, f"AXUIElementPerformAction raised: {e}")
+    if err != 0:
+        return (False, f"AX performAction({action}) returned err={err}")
+    return (True, "")
 
 
 def render_ax_for_prompt(elems: list[AXElem],

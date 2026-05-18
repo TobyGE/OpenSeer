@@ -136,23 +136,20 @@ whichever you're missing. Your choice persists to
   automation projects.
 - **Read pages** — `read_page` pulls a webpage's full text in one
   call, no scroll-and-screenshot loops. When a URL is supplied,
-  OpenSeer drives a dedicated Chrome instance (separate
-  `--user-data-dir=~/.openseer/chrome-profile`, never racing with
-  your normal browser) via Chrome DevTools Protocol — Promise-
-  awaiting, DOM-stable waits, no "Allow JavaScript from Apple
-  Events" toggle required. On first launch OpenSeer copies a
-  curated slice of your real Chrome profile (cookies, password
-  manager extension data, IndexedDB / Local Storage auth tokens)
-  into its own profile so you don't have to log into every site
-  twice. After you log into a new site in your real Chrome,
-  `openseer chrome-refresh` resyncs (quit Chrome first for a
-  guaranteed-consistent copy). A single "scratch tab" gets
-  navigated for each call instead of opening fresh ones, so tabs
-  don't accumulate. Set `OPENSEER_BROWSER_CDP=off` to disable and
-  stay on the AppleScript path; `=on` to make CDP failures hard
-  errors (default `auto` falls back silently).
-  `OPENSEER_CHROME_PROFILE_SOURCE` overrides profile auto-detection
-  if your Chrome lives somewhere non-standard.
+  OpenSeer attaches to **your** Chrome via Chrome DevTools Protocol
+  (no separate browser, no profile snapshot, no copy-and-pray
+  cookies). One-time setup: run `openseer chrome restart` to
+  relaunch your Chrome with `--remote-debugging-port=9222`, OR
+  `openseer chrome enable-login-item` to make macOS auto-launch
+  Chrome with the flag at every login. Status check:
+  `openseer chrome status`. Once attached, the agent gets
+  Promise-awaiting, DOM-stable waits, Mozilla Readability article
+  extraction, JSON XHR capture, Shadow DOM / iframe piercing,
+  batch reads, and PDF save — all on the actual tabs you're
+  already logged into. Without the flag, `read_page` falls back to
+  AppleScript JS injection (requires "Allow JavaScript from Apple
+  Events" in the browser menu) — degraded but functional.
+  `OPENSEER_BROWSER_CDP=off` hard-disables the CDP path.
 - **Bash + web** — runs shell commands, fetches URLs, web search.
   The agent picks the right tool itself.
 - **Skills that grow themselves** — per-site / per-app markdown

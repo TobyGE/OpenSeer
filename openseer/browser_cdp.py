@@ -72,107 +72,24 @@ log = logging.getLogger("openseer.browser_cdp")
 
 # ── configuration ────────────────────────────────────────────────────
 
-_PROFILE_DIR = Path.home() / ".openseer" / "chrome-profile"
-# Stamp file written on every successful spawn. Stores the port + the
-# spawned pid + a canonical profile path, so a subsequent run can
-# verify "the Chrome answering on this port is ACTUALLY mine"
-# before attaching. Without this validation a stale cache could
-# point us at the user's regular Chrome (which is a disaster: we'd
-# clobber their open tabs in the next smoke / read_page).
-_STAMP_FILE = Path.home() / ".openseer" / "cdp-chrome.json"
-_PORT_RANGE = range(9222, 9232)    # try 9222..9231 if earlier ones busy
-_LAUNCH_TIMEOUT_S = 12
+# Attach-only model: OpenSeer NEVER spawns its own Chrome. The user
+# launches their real Chrome with `--remote-debugging-port=9222`
+# (via `openseer chrome restart` or the LaunchAgent installed by
+# `openseer chrome enable-login-item`); we connect to that port and
+# drive their actual browser. Logins / extensions / cookies are
+# theirs as-is, no profile snapshot / refresh / sandbox process.
+#
+# Tradeoffs vs the old sandbox model:
+#   + half the RAM (one Chrome, not two)
+#   + zero-friction logins (no copy-and-pray)
+#   + agent actions visible in user's window (we mitigate by opening
+#     scratch tabs in a new background window via
+#     Target.createTarget(newWindow=true, background=true))
+#   - user must remember to launch with the flag (Login Item solves it)
+#   - agent shares cookie pool with user (a feature when the agent
+#     IS the user's helper; a footgun if untrusted code drives it)
+_CDP_PORT = 9222
 _RPC_TIMEOUT_S = 30
-
-# Standard macOS install locations, ordered by user preference.
-# We pick the first that exists; users who symlink Chrome elsewhere
-# can override via OPENSEER_CHROME env var.
-_CHROME_PATHS = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-    "/Applications/Arc.app/Contents/MacOS/Arc",
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-]
-
-
-# ── User-profile snapshot ────────────────────────────────────────────
-# OpenSeer's Chrome runs from its OWN user-data-dir (kept isolated
-# from the user's daily Chrome so we never clobber their tabs). On
-# first launch we copy a curated slice of the user's real Chrome
-# profile into ours so the OpenSeer Chrome inherits their logins,
-# cookies, password manager extension data — making "read this
-# logged-in page" work out of the box instead of requiring the
-# user to log into every site twice.
-#
-# What we include (~300 MB on a typical profile):
-#   - Top-level "Local State" (encryption key reference + install id)
-#   - Default/Cookies (+ journal)
-#   - Default/Login Data (+ journal + "Login Data For Account")
-#   - Default/Preferences (browser settings, language, etc.)
-#   - Default/Bookmarks (so the agent can `bash open <bookmark url>`)
-#   - Default/Local Storage/        — many SPAs stash auth here
-#   - Default/IndexedDB/             — modern auth state
-#   - Default/Local Extension Settings/ — 1Password etc. extension data
-#   - Default/Extension Cookies (+ journal)
-#   - Default/Network/Cookies (newer Chromium puts cookies here too)
-#
-# What we deliberately skip:
-#   - Cache, Code Cache, GPUCache, DawnCache, *Cache (all rebuild)
-#   - Service Worker (registers from origin code)
-#   - Sessions (literally the open tabs — we don't want to inherit
-#     30 tabs of someone's morning reading)
-#   - History (privacy; the agent doesn't need it)
-#   - Extensions/ (extension code; tied to install id, often re-installs
-#     in a copied profile, can break. We copy SETTINGS, not the code)
-#
-# Cookies decrypt fine in our Chrome because macOS Keychain's
-# "Chrome Safe Storage" entry is shared across Chrome instances on
-# the same user account — same encryption key, same machine.
-_USER_CHROME_DIR_MACOS = (
-    Path.home() / "Library" / "Application Support" / "Google" / "Chrome")
-
-_PROFILE_TOPLEVEL_FILES = ["Local State"]
-
-_PROFILE_DEFAULT_FILES = [
-    # SQLite DBs use two side files in WAL mode: `-wal` (write-ahead
-    # log holding uncommitted rows) and `-shm` (shared memory index).
-    # Recent Chrome uses WAL mode by default for Cookies / Login Data,
-    # so copying ONLY the main DB drops every cookie written since the
-    # last WAL checkpoint — i.e. fresh logins go missing. Include the
-    # side files explicitly; SQLite reattaches them on open and sees
-    # the full state. `-journal` is the legacy rollback format Chrome
-    # used pre-WAL; we list both for backward compatibility.
-    "Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm",
-    "Login Data", "Login Data-journal",
-    "Login Data-wal", "Login Data-shm",
-    "Login Data For Account", "Login Data For Account-journal",
-    "Login Data For Account-wal", "Login Data For Account-shm",
-    "Preferences",
-    "Bookmarks", "Bookmarks.bak",
-    "Extension Cookies", "Extension Cookies-journal",
-    "Extension Cookies-wal", "Extension Cookies-shm",
-]
-
-# Recursive subdir copies. ignored_patterns kept small — leveldb
-# `LOG` / `LOG.old` and `*.log` files are noisy and Chrome rebuilds
-# them on launch.
-_PROFILE_DEFAULT_DIRS = [
-    "Local Storage",
-    "IndexedDB",
-    "Local Extension Settings",
-    "Network",  # newer Chrome relocates Cookies here; copy whole dir
-]
-_PROFILE_DEFAULT_DIR_IGNORE = (
-    # LevelDB internals — runtime files that Chrome rebuilds on open
-    # and that fail to copy cleanly anyway (LOCK held; LOG.old +
-    # numeric *.log files are append-only WAL we don't need).
-    "LOCK", "LOG", "LOG.old", "*.log",
-    # NOTE: deliberately NOT excluding `*-shm` / `*-wal` — those are
-    # SQLite WAL side files that hold fresh cookies / logins. Codex
-    # P2 on the initial push.
-)
 
 
 # ── errors ───────────────────────────────────────────────────────────
@@ -184,49 +101,15 @@ class CDPError(Exception):
     detail."""
 
 
-# ── locating Chrome ──────────────────────────────────────────────────
+# ── attach probe (the ONLY pre-CDP infra we still need) ─────────────
 
 
-def find_chrome_binary() -> str | None:
-    """First Chromium-family binary that actually exists on disk.
-
-    Override via `OPENSEER_CHROME` (full path to the Mach-O inside the
-    .app, e.g. `/Applications/X.app/Contents/MacOS/X`). Returns None
-    when nothing is installed; the caller is expected to surface that
-    to the user instead of trying to launch.
-    """
-    override = os.environ.get("OPENSEER_CHROME")
-    if override and Path(override).exists():
-        return override
-    for p in _CHROME_PATHS:
-        if Path(p).exists():
-            return p
-    return None
-
-
-# ── port discovery ───────────────────────────────────────────────────
-
-
-def _is_port_free(port: int) -> bool:
-    """True iff binding to 127.0.0.1:port would succeed RIGHT NOW.
-
-    There's an unavoidable TOCTOU window between checking and launch,
-    but Chrome's own port-grabbing handles the collision case cleanly
-    by refusing to start; we re-probe in `wait_for_ready`.
-    """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", port))
-            return True
-    except OSError:
-        return False
-
-
-def _devtools_reachable(port: int, timeout: float = 0.4) -> bool:
-    """True iff `http://127.0.0.1:<port>/json/version` answers. Quick
-    way to detect a pre-existing OpenSeer Chrome we should attach to
-    instead of spawning a new one."""
+def _devtools_reachable(port: int = _CDP_PORT,
+                         timeout: float = 0.4) -> bool:
+    """True iff ``http://127.0.0.1:<port>/json/version`` answers.
+    Sole port-probe in attach mode: if it's open, we connect; if
+    not, we surface a clean ``CDPError`` that tells the user how
+    to run ``openseer chrome restart``."""
     try:
         req = urllib.request.Request(
             f"http://127.0.0.1:{port}/json/version")
@@ -236,467 +119,38 @@ def _devtools_reachable(port: int, timeout: float = 0.4) -> bool:
         return False
 
 
-def _our_chrome_on_port(port: int) -> bool:
-    """True iff a Chrome we previously spawned is still listening on
-    `port`. We MUST verify the cmdline points at our profile dir —
-    the user might be running their regular Chrome with
-    `--remote-debugging-port=9222` for unrelated dev work, and
-    attaching to that would clobber their tabs. Codex P2 on the
-    Day 1 commit caught this.
-    """
-    if not _devtools_reachable(port):
-        return False
-    # `lsof` → pid of the LISTEN socket on that port.
-    try:
-        out = subprocess.run(
-            ["lsof", "-iTCP:" + str(port), "-sTCP:LISTEN", "-t", "-n"],
-            capture_output=True, text=True, timeout=1.5)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    pid_line = (out.stdout or "").strip().splitlines()
-    if not pid_line:
-        return False
-    pid = pid_line[0]
-    # Inspect that pid's command line. ps -ww disables column
-    # truncation so a long --user-data-dir argument shows in full.
-    try:
-        ps = subprocess.run(
-            ["ps", "-ww", "-p", pid, "-o", "command="],
-            capture_output=True, text=True, timeout=1.5)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    cmd = (ps.stdout or "").strip()
-    # Match against the absolute profile path we use. Both
-    # `--user-data-dir=/abs/path` and `--user-data-dir /abs/path`
-    # forms work; require the exact path so a sibling profile (eg.
-    # an experimental OpenSeer fork on the same machine) doesn't
-    # false-positive.
-    needle = f"--user-data-dir={_PROFILE_DIR}"
-    return needle in cmd
 
-
-def _pick_port() -> int:
-    """Reuse a live OpenSeer Chrome's port if one's verifiably ours.
-    Otherwise scan for a free one.
-
-    Stamp file (`~/.openseer/cdp-chrome.json`) carries port + pid +
-    profile path; the live process at that port must still be one we
-    spawned (matching cmdline) before we'll reattach. This is the
-    isolation guarantee — `b1` only works if we never accidentally
-    drive the user's normal Chrome.
-    """
-    if _STAMP_FILE.exists():
-        try:
-            stamp = json.loads(_STAMP_FILE.read_text())
-            cached_port = int(stamp.get("port", 0))
-        except (json.JSONDecodeError, OSError, ValueError):
-            cached_port = 0
-        if cached_port and _our_chrome_on_port(cached_port):
-            return cached_port
-    # Either no stamp, stamp pointed at a dead/foreign Chrome.
-    # Scan upward for a fresh port that's free AND not already
-    # answering DevTools (another Chromium running there is fine —
-    # we just don't want to land on it).
-    for p in _PORT_RANGE:
-        if _is_port_free(p) and not _devtools_reachable(p):
-            return p
-    raise CDPError(
-        f"no free port in {_PORT_RANGE.start}-{_PORT_RANGE.stop-1} for "
-        "the OpenSeer Chrome debug interface")
-
-
-def _write_stamp(port: int, pid: int | None) -> None:
-    _STAMP_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _STAMP_FILE.write_text(json.dumps({
-        "port": port,
-        "pid": pid,
-        "profile": str(_PROFILE_DIR),
-    }))
-
-
-def _detect_user_chrome_profile() -> Path | None:
-    """Return the user's actual Chrome user-data-dir root (the
-    parent of Default/, not Default/ itself), or None if not
-    found. Env var ``OPENSEER_CHROME_PROFILE_SOURCE`` overrides
-    auto-detection (useful for Canary / Beta / non-Mac users).
-    """
-    override = os.environ.get("OPENSEER_CHROME_PROFILE_SOURCE")
-    if override:
-        p = Path(override).expanduser()
-        return p if p.exists() else None
-    if sys.platform == "darwin" and _USER_CHROME_DIR_MACOS.exists():
-        return _USER_CHROME_DIR_MACOS
-    return None
-
-
-def _user_chrome_running() -> bool:
-    """True iff a Google Chrome.app process is currently active.
-    When Chrome is running, the SQLite-backed files in its profile
-    (Cookies, Login Data, Local Storage) are mid-write and a naive
-    copy can capture inconsistent state. We surface that as a
-    warning rather than refusing — most of the time the snapshot
-    is fine even mid-flight, and forcing the user to quit Chrome
-    every time would be hostile."""
-    try:
-        r = subprocess.run(
-            ["pgrep", "-f",
-             "Google Chrome.app/Contents/MacOS/Google Chrome"],
-            capture_output=True, text=True, timeout=2.0)
-        return r.returncode == 0 and bool(r.stdout.strip())
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return False
-
-
-def _detect_active_chrome_profile(source: Path) -> str:
-    """Return the source profile directory name (`Default`,
-    `Profile 1`, …) that Chrome would open by default for this
-    user. Read from `<source>/Local State` → `profile.last_used`.
-
-    Critical for users with multiple Chrome profiles ("Work" /
-    "Personal" / etc.) — copying only `Default` when they last
-    used `Profile 1` would leave the OpenSeer Chrome with empty
-    cookies. We collapse whatever profile they use into our
-    `Default` so the launch flag `--profile-directory=Default`
-    always finds the right state.
-    """
-    local_state = source / "Local State"
-    if not local_state.is_file():
-        return "Default"
-    try:
-        data = json.loads(local_state.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return "Default"
-    last_used = (data.get("profile") or {}).get("last_used")
-    if isinstance(last_used, str) and last_used.strip():
-        # Validate the dir actually exists — Local State can drift
-        # behind a profile delete and we'd snapshot a stale name.
-        if (source / last_used).is_dir():
-            return last_used
-    return "Default"
-
-
-def _openseer_chrome_running() -> tuple[bool, int | None]:
-    """Detect whether an OpenSeer-spawned Chrome is currently
-    holding our user-data-dir open. Returns (is_running, pid).
-
-    Reading files under a live Chrome's `--user-data-dir` is a
-    no-op for the agent — Chrome's in-memory cookie store wins,
-    and it overwrites the on-disk DBs on exit, losing whatever
-    we copied. snapshot/refresh must refuse in that state.
-
-    Detection has TWO layers because `_STAMP_FILE` only records a
-    pid when WE spawned the process. If we attached to an existing
-    OpenSeer Chrome (started by a prior agentd run) the stamp has
-    `pid: null` and the pid check alone returns false — but Chrome
-    is very much still up. So we fall back to `pgrep -f` scanning
-    the cmdline for our profile path, which catches both cases.
-    """
-    pid_from_stamp = None
-    if _STAMP_FILE.is_file():
-        try:
-            stamp = json.loads(_STAMP_FILE.read_text())
-            pid_from_stamp = stamp.get("pid")
-        except (json.JSONDecodeError, OSError):
-            pass
-    # Layer 1: our spawned pid is alive AND its cmdline still
-    # references our profile dir (handles pid recycling).
-    if isinstance(pid_from_stamp, int):
-        try:
-            os.kill(pid_from_stamp, 0)
-            r = subprocess.run(
-                ["ps", "-o", "command=", "-p", str(pid_from_stamp)],
-                capture_output=True, text=True, timeout=2.0)
-            if (r.returncode == 0 and
-                    f"--user-data-dir={_PROFILE_DIR}" in r.stdout):
-                return (True, pid_from_stamp)
-        except (ProcessLookupError, PermissionError,
-                subprocess.SubprocessError, OSError):
-            pass
-    # Layer 2: scan all processes for one whose cmdline references
-    # our profile dir. Catches the "attached, not spawned" case
-    # (stamp has pid: null) AND the "Chrome restarted under us"
-    # case (stamp pid is stale but a fresh Chrome owns the dir).
-    #
-    # Critical: pass `--` before the pattern. BSD/macOS pgrep
-    # parses anything starting with `-` as an option flag and
-    # errors out, which would make this entire layer a no-op
-    # exactly when we need it most (codex P2 caught this).
-    try:
-        r = subprocess.run(
-            ["pgrep", "-f", "--", f"--user-data-dir={_PROFILE_DIR}"],
-            capture_output=True, text=True, timeout=2.0)
-        if r.returncode == 0 and r.stdout.strip():
-            pid = int(r.stdout.strip().splitlines()[0])
-            return (True, pid)
-    except (subprocess.SubprocessError, OSError, ValueError):
-        pass
-    return (False, None)
-
-
-def snapshot_user_chrome_profile(*, force: bool = False,
-                                  target: Path | None = None) -> dict:
-    """Copy a curated slice of the user's Chrome profile into
-    OpenSeer's user-data-dir so the OpenSeer Chrome inherits
-    their logins / cookies / IndexedDB.
-
-    With ``force=False`` (default) this is a no-op if our profile
-    is already initialized (Default/ exists). ``force=True`` always
-    re-copies — for ``openseer chrome-refresh`` after the user
-    logs into a new site.
-
-    Multi-profile aware: reads `<source>/Local State`'s
-    `profile.last_used` and snapshots THAT profile (whether it's
-    `Default`, `Profile 1`, etc.) into our target/Default. The
-    launcher then pins `--profile-directory=Default` so we always
-    open the snapshotted state.
-
-    Returns a status dict with ``status`` in
-    {"snapshotted", "exists", "skipped"}, plus ``files``, ``bytes``,
-    ``source``, ``source_profile``, ``target``, optional ``warning``.
-    """
-    if target is None:
-        target = _PROFILE_DIR
-    source = _detect_user_chrome_profile()
-    if source is None:
-        return {
-            "status": "skipped",
-            "reason": ("Could not locate user Chrome profile "
-                        "(macOS: ~/Library/Application Support/Google/Chrome/). "
-                        "OpenSeer will start with an empty profile — "
-                        "you can log into sites manually. Set "
-                        "OPENSEER_CHROME_PROFILE_SOURCE to override "
-                        "auto-detection."),
-        }
-    target.mkdir(parents=True, exist_ok=True)
-    if not force and (target / "Default").is_dir():
-        return {"status": "exists", "target": str(target)}
-    # OpenSeer's own Chrome must NOT be running during a snapshot:
-    # we'd copy files under its feet, it'd keep using its in-memory
-    # state, and it'd overwrite our copy on exit. Refuse with a
-    # clear "quit it" message instead of silently producing a
-    # garbage profile. (Refusing only on force=True would still
-    # allow the same bug on subsequent refreshes; refuse always.)
-    running, pid = _openseer_chrome_running()
-    if running:
-        return {
-            "status": "skipped",
-            "reason": (
-                f"OpenSeer's Chrome is still running (pid {pid}). "
-                f"Quit it (or stop any running `openseer agentd`) "
-                f"and retry — snapshotting under a live Chrome "
-                f"corrupts the copy."),
-        }
-    source_profile_name = _detect_active_chrome_profile(source)
-
-    warning = None
-    if _user_chrome_running():
-        warning = ("Chrome is running; snapshot taken mid-write may "
-                   "miss recent logins. Quit Chrome and run "
-                   "`openseer chrome-refresh` for a guaranteed-"
-                   "consistent copy.")
-
-    (target / "Default").mkdir(parents=True, exist_ok=True)
-    copied_files = 0
-    copied_bytes = 0
-    ignore = shutil.ignore_patterns(*_PROFILE_DEFAULT_DIR_IGNORE)
-
-    def _copy_file(src: Path, dst: Path) -> None:
-        nonlocal copied_files, copied_bytes
-        if not src.is_file():
-            return
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.copy2(src, dst)
-        except (OSError, PermissionError) as e:
-            log.warning("profile snapshot: couldn't copy %s: %s",
-                         src, e)
-            return
-        copied_files += 1
-        try:
-            copied_bytes += dst.stat().st_size
-        except OSError:
-            pass
-
-    def _copy_tree(src: Path, dst: Path) -> None:
-        nonlocal copied_files, copied_bytes
-        if not src.is_dir():
-            return
-        if dst.exists():
-            shutil.rmtree(dst, ignore_errors=True)
-        try:
-            shutil.copytree(src, dst, ignore=ignore,
-                            symlinks=False, copy_function=shutil.copy2)
-        except (OSError, PermissionError, shutil.Error) as e:
-            log.warning("profile snapshot: copytree %s -> %s "
-                         "had errors: %s", src, dst, e)
-        # Count what landed, ignoring directories.
-        for f in dst.rglob("*"):
-            if f.is_file():
-                copied_files += 1
-                try:
-                    copied_bytes += f.stat().st_size
-                except OSError:
-                    pass
-
-    src_profile = source / source_profile_name
-    for rel in _PROFILE_TOPLEVEL_FILES:
-        _copy_file(source / rel, target / rel)
-    for rel in _PROFILE_DEFAULT_FILES:
-        _copy_file(src_profile / rel, target / "Default" / rel)
-    for rel in _PROFILE_DEFAULT_DIRS:
-        _copy_tree(src_profile / rel, target / "Default" / rel)
-
-    log.info("snapshotted user Chrome profile %s/%s: "
-              "%d files, %.1f MB",
-              source.name, source_profile_name,
-              copied_files, copied_bytes / 1024 / 1024)
-    return {
-        "status": "snapshotted",
-        "source": str(source),
-        "source_profile": source_profile_name,
-        "target": str(target),
-        "files": copied_files,
-        "bytes": copied_bytes,
-        "warning": warning,
-    }
-
-
-# ── Chrome process lifecycle ─────────────────────────────────────────
+# ── Chrome attach (NO spawn; user runs `openseer chrome` for setup) ──
 
 
 @dataclass
 class ChromeHandle:
-    """Pointer to a launched (or reattached) OpenSeer Chrome."""
-    port: int
-    proc: subprocess.Popen | None   # None when we attached to a Chrome
-                                     # we didn't start (eg. a daemon
-                                     # restart finding an existing one)
+    """Pointer to the user's Chrome that OpenSeer is attached to.
 
-
-def _build_launch_args(chrome_bin: str, port: int) -> list[str]:
-    """Flags we hand the bundled Chrome.
-
-    Each flag has a reason — keep them annotated so future-me doesn't
-    "clean up" something load-bearing.
+    ``proc`` is ALWAYS None now — we never spawn. Kept for source
+    compatibility with the sandbox-era code that used to check it
+    before terminate(). Anything still touching ``handle.proc``
+    is dead-code-paths-by-design and will safely no-op.
     """
-    return [
-        chrome_bin,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={_PROFILE_DIR}",
-        # Pin the profile directory we use INSIDE the user-data-dir.
-        # snapshot_user_chrome_profile collapses whatever profile the
-        # user actually uses (Default / Profile 1 / …) into our
-        # `Default` subdir, so we always open that one. Without this
-        # flag Chrome would read Local State's `profile.last_used`
-        # and could open a non-Default subdir that we never populated.
-        "--profile-directory=Default",
-        # Open with a blank tab — DON'T restore from the user's last
-        # session and DON'T pop the "Welcome to Chrome" first-run UI.
-        "about:blank",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-features=Translate,InfiniteSessionRestore",
-        # We're driving a Chrome we own; suppress automated-Chrome
-        # warning ribbon ("Chrome is being controlled by automated
-        # test software") that some users find alarming on a regular
-        # browsing window.
-        "--disable-blink-features=AutomationControlled",
-        # CRITICAL: drop the multiprocess-shared-memory dependency.
-        # `/dev/shm` is tiny on macOS; without this, complex pages
-        # OOM-tabs within seconds.
-        "--disable-dev-shm-usage",
-        # Reduce CPU on idle background tabs so we don't fight the
-        # user's own Chrome for fan time.
-        "--disable-background-timer-throttling=false",
-    ]
+    port: int = _CDP_PORT
+    proc: subprocess.Popen | None = None
 
 
-def launch_chrome() -> ChromeHandle:
-    """Spawn (or attach to) an OpenSeer-controlled Chrome.
-
-    Returns a `ChromeHandle` whose `.port` answers DevTools requests.
-    Raises CDPError if Chrome isn't installed, no port is available,
-    or the spawned process doesn't open the DevTools endpoint within
-    `_LAUNCH_TIMEOUT_S`. Callers should treat that as the cue to
-    fall back to the AppleScript path silently.
+def attach_to_user_chrome(*, port: int = _CDP_PORT) -> ChromeHandle:
+    """Attach to the user's Chrome on ``port``. Raise a clear
+    actionable CDPError if the port isn't answering — we never
+    spawn from this module; the user runs `openseer chrome` to
+    set things up first.
     """
-    chrome_bin = find_chrome_binary()
-    if chrome_bin is None:
+    if not _devtools_reachable(port):
         raise CDPError(
-            "no Chromium-family browser found in /Applications. "
-            "Install Google Chrome (or set OPENSEER_CHROME) to enable "
-            "the CDP-backed browser path.")
-    port = _pick_port()
-    # `_pick_port` returns a port that's either VERIFIED ours (live
-    # Chrome whose cmdline matches our profile path) or empty/free.
-    # In the verified-ours case `_our_chrome_on_port` already gated
-    # the answer; attach with proc=None so future shutdown logic
-    # knows "not our process, don't kill it."
-    if _our_chrome_on_port(port):
-        log.info("CDP attaching to existing OpenSeer Chrome on port %d",
-                  port)
-        _write_stamp(port, pid=None)
-        return ChromeHandle(port=port, proc=None)
+            f"Chrome isn't listening on 127.0.0.1:{port}. "
+            f"Run `openseer chrome restart` to (re)launch Chrome "
+            f"with --remote-debugging-port={port}, or "
+            f"`openseer chrome enable-login-item` to set it up "
+            f"persistently.")
+    return ChromeHandle(port=port, proc=None)
 
-    _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    # First-launch profile snapshot: if our profile is empty (no
-    # Default/ subdir yet), copy a curated slice of the user's
-    # real Chrome profile so the OpenSeer Chrome inherits their
-    # logins / cookies / extension auth. Subsequent launches see
-    # an existing Default/ and skip — refresh is manual via
-    # `openseer chrome-refresh`. Failures are non-fatal: we just
-    # log and proceed with an empty profile (user can log in
-    # manually).
-    if not (_PROFILE_DIR / "Default").is_dir():
-        try:
-            result = snapshot_user_chrome_profile()
-            if result.get("status") == "snapshotted":
-                if result.get("warning"):
-                    log.warning("profile snapshot: %s",
-                                 result["warning"])
-            elif result.get("status") == "skipped":
-                log.info("profile snapshot skipped: %s",
-                          result.get("reason", ""))
-        except Exception as e:
-            log.warning(
-                "profile snapshot raised %s: %s — Chrome will start "
-                "with an empty profile (log into sites manually).",
-                type(e).__name__, e)
-
-    args = _build_launch_args(chrome_bin, port)
-    log.info("CDP launching Chrome on port %d (profile=%s)",
-              port, _PROFILE_DIR)
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        # Detach from controlling terminal so a user quitting OpenSeer
-        # from a terminal doesn't SIGINT-cascade into Chrome.
-        start_new_session=True,
-    )
-    _write_stamp(port, pid=proc.pid)
-
-    # Poll the DevTools endpoint until it answers (Chrome's WS server
-    # takes 1-3 seconds to come up cold).
-    deadline = time.monotonic() + _LAUNCH_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if _devtools_reachable(port):
-            return ChromeHandle(port=port, proc=proc)
-        if proc.poll() is not None:
-            # Chrome exited before opening DevTools (port already in
-            # use by a process we couldn't see, missing dyld lib, …).
-            raise CDPError(
-                f"Chrome exited with code {proc.returncode} before "
-                "opening the DevTools endpoint")
-        time.sleep(0.15)
-    # Timed out — kill the child so we don't leak Chromes.
-    try:
-        proc.terminate()
-    except OSError:
-        pass
-    raise CDPError(
-        f"Chrome didn't open DevTools on :{port} within "
-        f"{_LAUNCH_TIMEOUT_S}s")
 
 
 def fetch_tabs(port: int) -> list[dict]:
@@ -1623,27 +1077,23 @@ class ChromeManager:
             return self._last_target_id
 
     def ensure_running(self) -> ChromeHandle:
-        """Returns a usable ChromeHandle, launching if needed. Idempotent.
-        Re-launches if a previously-cached handle's port no longer
-        answers DevTools (Chrome was quit by the user, OS killed it,
-        etc.) OR if the port is now held by some OTHER Chrome (we got
-        race-displaced after our Chrome exited and a regular Chrome
-        bound the port). The lsof+cmdline cross-check is the SAME
-        guard `launch_chrome` uses on first attach — without it here
-        we'd silently route the agent into the user's regular Chrome
-        and clobber whatever they had open. Real edge case but the
-        blast radius (writing into the user's tabs) is large enough
-        that paying ~5ms of lsof per request is fine."""
+        """Return an attached ChromeHandle. NEVER spawns Chrome.
+
+        Probes port 9222 — if it answers, returns a handle wrapping
+        it. If not, raises a CDPError telling the user to run
+        ``openseer chrome restart``. Cached handles are
+        re-validated cheaply on each call so a Chrome quit + relaunch
+        flows through naturally on the next attempt.
+        """
         with self._handle_lock:
             if self._handle is not None:
-                port = self._handle.port
-                if _devtools_reachable(port) and _our_chrome_on_port(port):
+                if _devtools_reachable(self._handle.port):
                     return self._handle
-                log.info(
-                    "CDP cached Chrome on :%d no longer ours (gone or "
-                    "displaced); relaunching", port)
+                # Port stopped answering — Chrome was quit or
+                # never came back. Drop the cache; next call will
+                # try a fresh attach.
                 self._handle = None
-            self._handle = launch_chrome()
+            self._handle = attach_to_user_chrome()
             return self._handle
 
     def open_tab(self, url: str | None = None) -> CDPTab:
@@ -1695,8 +1145,7 @@ class ChromeManager:
         Used by read_page_via_cdp so repeated reads navigate the
         SAME tab via Page.navigate rather than spawning new ones
         through /json/new. Heals itself if the cached target was
-        closed (by user clicking 'x' on the tab, by Chrome restart,
-        or by `openseer chrome-refresh` wiping the profile).
+        closed (user clicking 'x' on the tab, Chrome restart, …).
         """
         handle = self.ensure_running()
         with self._scratch_lock:
@@ -1732,16 +1181,20 @@ class ChromeManager:
 
 
 def cdp_available() -> bool:
-    """Cheap, non-throwing probe — does the system have what we need?
+    """Is the user's Chrome listening on the CDP port?
+
     Used by executor.py as the gate: try CDP only if this returns
-    True, otherwise fall straight through to AppleScript without
-    paying the launch cost or the user-visible Chrome flash.
+    True, otherwise fall straight through to the AppleScript path.
+    Attach-only model: we never spawn, so availability is just
+    "is port 9222 answering AND not env-disabled."
+
+    ``OPENSEER_BROWSER_CDP=off`` hard-disables for users who want
+    AppleScript-only regardless of port state.
     """
-    # Hard gate via env var so a user can force-off if CDP is misbehaving.
-    mode = (os.environ.get("OPENSEER_BROWSER_CDP", "auto") or "").lower()
-    if mode == "off":
+    if (os.environ.get("OPENSEER_BROWSER_CDP", "auto") or "")\
+            .lower() == "off":
         return False
-    return find_chrome_binary() is not None
+    return _devtools_reachable(_CDP_PORT)
 
 
 def cdp_required() -> bool:
@@ -2070,6 +1523,178 @@ async def _attach_xhr(tab: "CDPTab", armed: bool,
     return result
 
 
+async def _attach_interactives(tab: "CDPTab", enabled: bool,
+                                  result: dict) -> dict:
+    """Run the interactive-element scanner inside the tab and
+    merge the list into ``result["interactives"]``. Best-effort —
+    a scanner failure shouldn't mask the content extraction."""
+    if not enabled:
+        return result
+    try:
+        items = await _interactive_elements_inpage(tab)
+    except CDPError:
+        return result
+    if items:
+        result["interactives"] = items
+    return result
+
+
+async def _finalize_read_result(
+    tab: "CDPTab",
+    *, capture_was_armed: bool,
+    capture_max_bodies: int,
+    capture_per_body_max: int,
+    show_interactives: bool,
+    result: dict,
+) -> dict:
+    """Run XHR capture finalization + interactive-element scan
+    + any future enrichment in one place so the four return
+    sites in _run don't drift out of sync."""
+    result = await _attach_xhr(tab, capture_was_armed,
+                                 capture_max_bodies,
+                                 capture_per_body_max, result)
+    result = await _attach_interactives(tab, show_interactives, result)
+    return result
+
+
+# Walk the page DOM for interactive elements + emit a stable
+# CSS selector for each. Appended to read_page output as
+# "## Interactive elements" so the agent has selectors handy
+# for follow-up click(selector=...) / type(selector=...) without
+# having to bash + curl the HTML to grep for them.
+_INTERACTIVES_JS = r"""
+(() => {
+  const MAX = 30;
+  function ok(el) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return false;
+    const cs = el.ownerDocument.defaultView
+      ? el.ownerDocument.defaultView.getComputedStyle(el) : null;
+    if (cs && (cs.display === 'none' || cs.visibility === 'hidden'
+                || cs.opacity === '0')) return false;
+    return true;
+  }
+  function escSel(s) {
+    if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(s);
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, c => '\\' + c);
+  }
+  function uniqueSelector(el) {
+    // 1. Stable id (unique on page) — best case
+    if (el.id) {
+      const sel = '#' + escSel(el.id);
+      try {
+        if (document.querySelectorAll(sel).length === 1) return sel;
+      } catch (e) {}
+    }
+    // 2. data-testid — common in modern SPAs, stable across releases
+    if (el.dataset && el.dataset.testid) {
+      return '[data-testid="' + el.dataset.testid + '"]';
+    }
+    if (el.dataset && el.dataset.test) {
+      return '[data-test="' + el.dataset.test + '"]';
+    }
+    // 3. name attribute on form controls
+    if (el.name && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+                     || el.tagName === 'SELECT')) {
+      return el.tagName.toLowerCase()
+        + '[name="' + el.name + '"]';
+    }
+    // 4. aria-label — short, descriptive, often stable
+    const aria = el.getAttribute('aria-label');
+    if (aria && aria.length < 60 && !/[\n"]/.test(aria)) {
+      const sel = el.tagName.toLowerCase()
+        + '[aria-label="' + aria + '"]';
+      try {
+        if (document.querySelectorAll(sel).length <= 3) return sel;
+      } catch (e) {}
+    }
+    // 5. role + accessible name
+    const role = el.getAttribute('role');
+    if (role && aria) {
+      return '[role="' + role + '"][aria-label="' + aria + '"]';
+    }
+    // 6. tag + non-state classes (skip state-flippy / framework noise)
+    if (el.classList.length) {
+      const cls = Array.from(el.classList)
+        .filter(c => c.length < 40
+                   && !/^(active|hover|focus|disabled|is-|has-|js-|ng-)/i.test(c))
+        .slice(0, 2);
+      if (cls.length) {
+        const sel = el.tagName.toLowerCase()
+          + '.' + cls.map(escSel).join('.');
+        try {
+          if (document.querySelectorAll(sel).length <= 5) return sel;
+        } catch (e) {}
+      }
+    }
+    // 7. Fallback: short nth-of-type path (max 4 segments)
+    const parts = [];
+    let cur = el;
+    while (cur && cur !== document.body && parts.length < 4) {
+      let p = cur.tagName.toLowerCase();
+      if (cur.parentElement) {
+        const sib = Array.from(cur.parentElement.children)
+          .filter(c => c.tagName === cur.tagName);
+        if (sib.length > 1) {
+          p += ':nth-of-type(' + (sib.indexOf(cur) + 1) + ')';
+        }
+      }
+      parts.unshift(p);
+      cur = cur.parentElement;
+    }
+    return parts.join(' > ');
+  }
+  const Q = 'a[href], button, input:not([type=hidden]), '
+          + 'select, textarea, '
+          + '[role="button"], [role="link"], [role="menuitem"], '
+          + '[role="checkbox"], [role="radio"], [role="tab"]';
+  const els = Array.from(document.querySelectorAll(Q)).filter(ok);
+  return els.slice(0, MAX).map((el, i) => {
+    const label = (el.innerText || el.value
+                    || el.getAttribute('aria-label')
+                    || el.getAttribute('placeholder')
+                    || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    return {
+      id: 'I' + (i + 1),
+      tag: el.tagName.toLowerCase(),
+      role: el.getAttribute('role') || null,
+      label: label,
+      selector: uniqueSelector(el),
+    };
+  });
+})()
+"""
+
+
+async def _interactive_elements_inpage(tab: "CDPTab"
+                                         ) -> list[dict]:
+    """Run the interactive-element scanner and return the list.
+    Empty list on any failure (best-effort enhancement)."""
+    try:
+        out = await tab.evaluate(_INTERACTIVES_JS, await_promise=False)
+    except CDPError:
+        return []
+    if not isinstance(out, list):
+        return []
+    return [x for x in out if isinstance(x, dict) and x.get("selector")]
+
+
+def _format_interactives(items: list[dict]) -> str:
+    """Markdown table of interactive elements: id, label, selector.
+    Returns empty string when items is empty (so the caller can
+    cleanly skip the section)."""
+    if not items:
+        return ""
+    lines = ["## Interactive elements",
+              "(use `click`/`type`/`set_value` with `selector=`)"]
+    for it in items:
+        label = (it.get("label") or "").strip() or "(no label)"
+        sel = it.get("selector") or ""
+        tag = it.get("tag") or "?"
+        lines.append(f"- [{it.get('id')}] `{sel}` — {tag} {label!r}")
+    return "\n".join(lines)
+
+
 async def _extract_article_inpage(tab: "CDPTab") -> dict | None:
     """Run Readability inside the tab. Returns a dict shaped like
     OpenCLI's ExtractedArticle (source, html, title, byline, …)
@@ -2116,7 +1741,8 @@ def read_page_via_cdp(*, url: str | None = None,
                       max_chars: int = 8000,
                       capture_xhr: bool = False,
                       capture_max_bodies: int = 20,
-                      capture_per_body_max: int = 20000) -> dict:
+                      capture_per_body_max: int = 20000,
+                      show_interactives: bool = True) -> dict:
     """Sync entry point used by executor._read_page. Returns a dict
     ``{title, url, content, source}`` where ``source`` reports which
     extraction path produced ``content``:
@@ -2245,18 +1871,26 @@ def read_page_via_cdp(*, url: str | None = None,
                     selector=selector, max_chars=max_chars)
                 if not content:
                     content = "(selector matched no element)"
-                return await _attach_xhr(tab, capture_was_armed,
-                    capture_max_bodies, capture_per_body_max,
-                    {"title": title, "url": current,
-                     "content": content, "source": "selector"})
+                return await _finalize_read_result(
+                    tab,
+                    capture_was_armed=capture_was_armed,
+                    capture_max_bodies=capture_max_bodies,
+                    capture_per_body_max=capture_per_body_max,
+                    show_interactives=show_interactives,
+                    result={"title": title, "url": current,
+                            "content": content, "source": "selector"})
 
             # ── raw mode: full innerText, current behavior ─────────
             if mode == "raw":
                 content = await tab.extract_text(max_chars=max_chars)
-                return await _attach_xhr(tab, capture_was_armed,
-                    capture_max_bodies, capture_per_body_max,
-                    {"title": title, "url": current,
-                     "content": content, "source": "innerText"})
+                return await _finalize_read_result(
+                    tab,
+                    capture_was_armed=capture_was_armed,
+                    capture_max_bodies=capture_max_bodies,
+                    capture_per_body_max=capture_per_body_max,
+                    show_interactives=show_interactives,
+                    result={"title": title, "url": current,
+                            "content": content, "source": "innerText"})
 
             # ── auto / article: try Readability ────────────────────
             article = await _extract_article_inpage(tab)
@@ -2305,12 +1939,17 @@ def read_page_via_cdp(*, url: str | None = None,
                     meta = " · ".join(head_bits)
                     article_title = article.get("title") or title
                     content = (f"{meta}\n\n{md}" if meta else md)
-                    return await _attach_xhr(tab, capture_was_armed,
-                        capture_max_bodies, capture_per_body_max,
-                        {"title": article_title or title,
-                         "url": current,
-                         "content": content,
-                         "source": article.get("source") or "readability"})
+                    return await _finalize_read_result(
+                        tab,
+                        capture_was_armed=capture_was_armed,
+                        capture_max_bodies=capture_max_bodies,
+                        capture_per_body_max=capture_per_body_max,
+                        show_interactives=show_interactives,
+                        result={
+                            "title": article_title or title,
+                            "url": current,
+                            "content": content,
+                            "source": article.get("source") or "readability"})
 
             # ── auto fallback / article failure ────────────────────
             if mode == "article":
@@ -2319,10 +1958,14 @@ def read_page_via_cdp(*, url: str | None = None,
                     f"{current!r}. Set mode='auto' to fall back to "
                     f"innerText, or mode='raw' to skip extraction.")
             content = await tab.extract_text(max_chars=max_chars)
-            return await _attach_xhr(tab, capture_was_armed,
-                capture_max_bodies, capture_per_body_max,
-                {"title": title, "url": current,
-                 "content": content, "source": "innerText"})
+            return await _finalize_read_result(
+                tab,
+                capture_was_armed=capture_was_armed,
+                capture_max_bodies=capture_max_bodies,
+                capture_per_body_max=capture_per_body_max,
+                show_interactives=show_interactives,
+                result={"title": title, "url": current,
+                        "content": content, "source": "innerText"})
         finally:
             # Drop the websocket but LEAVE the OS-level tab open: the
             # agent's natural follow-up is `click(selector=...)` /
@@ -2568,13 +2211,14 @@ def _new_tab(port: int, url: str) -> dict:
 
 
 async def _smoke_test(url: str) -> str:
-    """End-to-end Day 1 check: launch (or attach to) Chrome, open a
-    NEW tab pointed at `url`, return `document.title`, then close
-    that tab so the smoke test leaves no trace. Run via:
+    """End-to-end smoke: attach to the user's Chrome (must already
+    be running with --remote-debugging-port via `openseer chrome`),
+    open a NEW tab pointed at `url`, return `document.title`, then
+    close that tab so the smoke test leaves no trace.
 
         python -m openseer.browser_cdp test https://example.com
     """
-    handle = launch_chrome()
+    handle = attach_to_user_chrome()
     target = _new_tab(handle.port, url)
     target_id = target.get("id")
     ws_url = target.get("webSocketDebuggerUrl")

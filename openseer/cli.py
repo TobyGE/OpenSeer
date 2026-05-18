@@ -190,32 +190,70 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return run_repl()
 
 
-def cmd_chrome_refresh(args: argparse.Namespace) -> int:
-    """Re-sync the OpenSeer Chrome profile from the user's real Chrome.
+def cmd_chrome(args: argparse.Namespace) -> int:
+    """Manage the OpenSeer ↔ Chrome bridge.
 
-    First launch already copies the user's Chrome profile into
-    OpenSeer's user-data-dir so logins / cookies / extension auth
-    flow through automatically. After the user logs into a NEW
-    site in their real Chrome (or rotates a session), this command
-    re-runs the snapshot so the next read_page picks up the fresh
-    state. Use after Chrome is quit for a guaranteed-consistent copy.
+    Subcommands:
+      status               Show current attach state + port
+      restart              Quit Chrome, relaunch with debug port
+      launch               Launch Chrome with debug port (no quit)
+      enable-login-item    Auto-launch Chrome with debug port on login
+      disable-login-item   Remove the launch-at-login plist
     """
-    from . import browser_cdp
-    result = browser_cdp.snapshot_user_chrome_profile(force=True)
-    status = result.get("status")
-    if status == "skipped":
-        print(f"chrome-refresh skipped: {result.get('reason', '')}")
-        return 2
-    if status == "snapshotted":
-        mb = result.get("bytes", 0) / 1024 / 1024
-        print(f"snapshotted {result.get('files', 0)} files "
-              f"({mb:.1f} MB) from {result.get('source')} "
-              f"→ {result.get('target')}")
-        if result.get("warning"):
-            print(f"  warning: {result['warning']}")
+    from . import chrome_launcher
+    sub = getattr(args, "chrome_cmd", None) or "status"
+
+    if sub == "status":
+        st = chrome_launcher.status()
+        print(f"Chrome running:      {st['chrome_running']} "
+              f"(pids={st['chrome_pids']})")
+        print(f"CDP port open:       {st['cdp_port_open']} "
+              f"(port={st['cdp_port']})")
+        print(f"Login Item:          "
+              f"{'installed' if st['login_item_installed'] else 'not installed'}")
+        if not st["cdp_port_open"]:
+            print("\n  Chrome isn't reachable on port 9222 yet.")
+            print("  Run `openseer chrome restart` for a one-off setup, or")
+            print("  `openseer chrome enable-login-item` to make it permanent.")
         return 0
-    print(f"chrome-refresh: unexpected status {status!r}")
-    return 1
+
+    if sub == "restart":
+        result = chrome_launcher.launch_with_flag(restart_if_running=True)
+        print(f"chrome restart: {result.get('status')}")
+        for k in ("pid", "port", "error", "hint"):
+            if result.get(k) is not None:
+                print(f"  {k}: {result[k]}")
+        return 0 if result.get("status") in (
+            "launched", "already_running_with_flag") else 1
+
+    if sub == "launch":
+        result = chrome_launcher.launch_with_flag(restart_if_running=False)
+        print(f"chrome launch: {result.get('status')}")
+        for k in ("pid", "port", "error", "hint"):
+            if result.get(k) is not None:
+                print(f"  {k}: {result[k]}")
+        return 0 if result.get("status") in (
+            "launched", "already_running_with_flag") else 1
+
+    if sub == "enable-login-item":
+        result = chrome_launcher.install_login_item()
+        print(f"login item: {result.get('status')}")
+        for k in ("plist", "port", "error"):
+            if result.get(k) is not None:
+                print(f"  {k}: {result[k]}")
+        return 0 if result.get("status") == "installed" else 1
+
+    if sub == "disable-login-item":
+        result = chrome_launcher.uninstall_login_item()
+        print(f"login item: {result.get('status')}")
+        for k in ("plist", "error"):
+            if result.get(k) is not None:
+                print(f"  {k}: {result[k]}")
+        return 0 if result.get("status") in (
+            "uninstalled", "not_installed") else 1
+
+    print(f"ERROR: unknown chrome subcommand: {sub!r}", file=sys.stderr)
+    return 2
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -298,12 +336,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Factory-reset: wipe OAuth tokens, configs, TCC grants",
     ).set_defaults(func=cmd_reset)
 
-    sub.add_parser(
-        "chrome-refresh",
-        help="Re-sync OpenSeer Chrome's profile from your real "
-             "Chrome (cookies, logins, extension auth). Quit Chrome "
-             "first for a guaranteed-consistent copy.",
-    ).set_defaults(func=cmd_chrome_refresh)
+    # `openseer chrome ...` — manage the Chrome attach.
+    p_chrome = sub.add_parser(
+        "chrome",
+        help="Manage the Chrome attach (status, restart, launch, "
+             "enable/disable login item).",
+    )
+    sub_chrome = p_chrome.add_subparsers(dest="chrome_cmd")
+    sub_chrome.add_parser(
+        "status",
+        help="Show current Chrome attach state").set_defaults(
+        func=cmd_chrome)
+    sub_chrome.add_parser(
+        "restart",
+        help="Quit Chrome and relaunch with --remote-debugging-port"
+    ).set_defaults(func=cmd_chrome)
+    sub_chrome.add_parser(
+        "launch",
+        help="Launch Chrome with --remote-debugging-port (does NOT "
+             "restart if Chrome is already running without the flag)"
+    ).set_defaults(func=cmd_chrome)
+    sub_chrome.add_parser(
+        "enable-login-item",
+        help="Install a macOS LaunchAgent so Chrome auto-launches "
+             "with the debug flag at every login"
+    ).set_defaults(func=cmd_chrome)
+    sub_chrome.add_parser(
+        "disable-login-item",
+        help="Remove the LaunchAgent installed by enable-login-item"
+    ).set_defaults(func=cmd_chrome)
+    # Bare `openseer chrome` defaults to status
+    p_chrome.set_defaults(func=cmd_chrome)
 
     p_perm = sub.add_parser(
         "permissions",
@@ -430,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
 # an agent run with that prompt — surprising for anyone with a
 # script still calling the old mini-CLI. Keeping it reserved makes
 # argparse fail fast with "invalid choice" instead.
-_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "chrome-refresh", "site", "-h", "--help"}
+_KNOWN_SUBCOMMANDS = {"chat", "task", "voice", "daemon", "daemon-launcher", "agentd", "mcp", "auth", "setup", "check", "permissions", "reset", "chrome", "chrome-refresh", "site", "-h", "--help"}
 
 
 def main() -> None:

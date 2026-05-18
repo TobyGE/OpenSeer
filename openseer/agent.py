@@ -124,9 +124,12 @@ For `answer` (purely conversational), write the reply itself — no preamble.
   web_fetch      `url` → page text. Best for static pages; SPAs (X / LinkedIn / etc.) need read_page instead.
   read_page      READ a webpage's content (posts/articles/search results/threads). When `url` is given, OpenSeer drives its own Chrome via CDP and runs Mozilla Readability inside the page to isolate the main article — what you get back is compact Markdown (preserved headings, lists, code blocks, links), NOT a raw innerText dump. The result header is tagged with the extraction source: `[via readability]` = clean article path; `[via fallback]` = Readability declined and we returned a structural container; `[via innerText]` = body.innerText dump (no Readability hit, or AppleScript path). Optional `url` (navigate first, in the same call), `app` (Safari/Chrome/Arc/Brave/Edge — default = frontmost), `selector` (CSS like `"article"`/`"main"` for one section only — overrides Readability), `capture_xhr: true` (record JSON XHRs the page fetches during load and append a `## Captured XHR` section to the result — switch this on for SPAs like Twitter/LinkedIn/Reddit/Bilibili where the rendered text is mostly chrome but the underlying API call is the actual data). Use this for ANY task that says "summarize / read / browse / find X in posts / what does this page say". Legacy AppleScript path (no URL → frontmost user browser): still requires the one-time "Allow JavaScript from Apple Events" toggle.
   read_pages     READ multiple webpages in ONE call. `urls`: list of strings (≤10). Each URL is fetched in parallel (4 tabs concurrent) and the results concatenated with per-URL section headers `## [i/N] Title [via readability]`. Use when the task is "compare these 3 articles", "summarize these N papers", "which of these listings is cheapest" — replaces sequential read_page chains and is faster (parallel) AND cheaper (one tool result, model reads them together). Per-URL errors don't kill the batch.
-  save_pdf       SAVE a webpage to local PDF via Chrome's Page.printToPDF (CDP only). `path` (required, must end in `.pdf`), `url` (optional — if omitted, saves the current OpenSeer Chrome tab), `landscape: true` (default portrait). Output PDF is what Chrome itself renders, preserving CSS / fonts / images / lazy-loaded content. Use for "save this article as PDF", "archive this receipt", "PDF this thread for me".
-  click          `index` (AX-tree, preferred when present) OR `x`, `y`. Optional `count`. ALSO `selector` (CSS) when the target is inside the OpenSeer-owned Chrome — drives via DevTools Protocol; use after `read_page` with a `url` has populated that browser. Don't use `selector` for native macOS UI — only for web elements you've just inspected via read_page.
-  type           `text` + one of: `index`, `x,y`, `selector` (CSS, OpenSeer Chrome only — types via the native value setter so React/Vue change handlers fire), or NEITHER (use currently-focused field).
+  save_pdf       SAVE a webpage to local PDF via Chrome's Page.printToPDF (CDP only — requires `openseer chrome restart` once for setup). `path` (required, must end in `.pdf`), `url` (optional — if omitted, saves whatever the attached Chrome's scratch tab is currently on), `landscape: true` (default portrait). Output PDF is what Chrome itself renders, preserving CSS / fonts / images / lazy-loaded content. Use for "save this article as PDF", "archive this receipt", "PDF this thread for me".
+  click          `ax_query` (preferred — natural-language label match against the AX tree, e.g. `ax_query="Sign in"` or `ax_query="button: Submit"`) OR `index` (AX-tree row number — use when ax_query is ambiguous and you've eyeballed the right row) OR `x`, `y`. Optional `count`. ALSO `selector` (CSS) when the target is inside the attached Chrome (after `read_page` populated the scratch tab) — drives via DevTools Protocol, requires `openseer chrome restart` setup. Don't use `selector` for native macOS UI — only for web elements you've just inspected via read_page.
+  type           `text` + one of: `ax_query` (preferred), `index`, `x,y`, `selector` (CSS — requires CDP attach via `openseer chrome restart`; types via the native value setter so React/Vue change handlers fire), or NEITHER (use currently-focused field).
+  set_value      WRITE directly to an AX-settable element. `ax_query` (preferred — `ax_query="Email"`) OR `index` + `value` (string). Wraps `AXUIElementSetAttributeValue` so text fields / sliders / switches get the value atomically — no click+focus+type chain, no autocomplete races, no keyboard-pacing concerns. **Strongly prefer this over click+type for text fields when the AX listing shows the element is settable.** Errors clearly if AXValue isn't settable on that element (suggests fallback). Optional `app=<name>` to target a non-foreground app.
+  perform_action INVOKE a named AX action (`AXPress`, `AXShowMenu`, `AXIncrement`, `AXDecrement`, `AXConfirm`, `AXCancel`, `AXPick`, ...) on `ax_query`-matched (preferred) or `index`-referenced element. Same effect as clicking the element but goes through the OS dispatcher rather than synthesizing a mouse event, so it fires every notification the real activation does. Use when click coordinates are unreliable (off-screen / overlayed) or when the action is non-clicky (a stepper's increment, a context menu opener). Defaults to `AXPress` when `ax_action` is omitted.
+  see            CAPTURE the current AX tree + screenshot context under a snapshot id (returned as `snapshot_id=XXXXXXXX`). Subsequent click/type/set_value/perform_action can pass `snapshot="XXXXXXXX"` to resolve `index` / `ax_query` against THAT cached dump instead of re-walking the AX tree every step. **Use this when you're about to do ≥3 actions on the same screen** (fill a form, navigate a multi-step dialog, scrub through a list). Saves both latency and tokens vs re-AX-dumping each turn. Snapshots auto-expire after 5 minutes. Re-`see` whenever the screen changes structurally (new window, navigation, modal opened).
   key            `key` combo like `"cmd+a"`, `"enter"`, `"pageup"`, `"esc"`.
   scroll         `x`, `y`, `amount` (positive=down, 50–200 for fast).
   open_app       `app` = name. Activates via AppleScript; bypasses the Dock.
@@ -358,6 +361,15 @@ def _action_from_obj(obj: dict, fallback_thought: str | None = None) -> Action:
               if isinstance(obj.get("urls"), list) else None),
         path=obj.get("path"),
         landscape=bool(obj.get("landscape") or False),
+        value=(obj.get("value")
+                if isinstance(obj.get("value"), str) else None),
+        ax_action=(obj.get("ax_action") or obj.get("action_name")
+                    if isinstance(obj.get("ax_action") or
+                                    obj.get("action_name"), str) else None),
+        ax_query=(obj.get("ax_query")
+                   if isinstance(obj.get("ax_query"), str) else None),
+        snapshot=(obj.get("snapshot")
+                   if isinstance(obj.get("snapshot"), str) else None),
         kind=obj.get("kind"),
         question=obj.get("question"),
         options=obj.get("options"),
@@ -414,6 +426,7 @@ def _parse_actions(raw: str) -> list[Action]:
 _PRODUCING_ACTIONS = {"click", "double_click", "type", "key", "scroll",
                       "open_app", "bash", "web_search", "web_fetch",
                       "read_page", "read_pages", "save_pdf",
+                      "set_value", "perform_action", "see",
                       "write_skill", "write_memory"}
 # `screenshot`, `get_app_state`, and `reground` are passive observers —
 # they do NOT produce or change the requested result. Citing only them
@@ -2037,12 +2050,54 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                 terminate = True
                 break
 
+            # Snapshot lookup: if the action binds to a prior `see`
+            # snapshot_id, use THAT cached AX dump for resolution
+            # instead of this turn's live dump. Cheap way to chain
+            # multiple ID-based actions over an unchanged screen
+            # without paying the AX walk + prompt-bloat cost each
+            # turn. Falls through silently when the snapshot has
+            # been GC'd (>5min) or the id is unknown — caller still
+            # gets the live-dump path.
+            resolution_elems = ax_elems
+            if action.snapshot:
+                snaps = ctx.get("snapshots") or {}
+                snap = snaps.get(action.snapshot)
+                if snap and snap.get("ax_elems"):
+                    resolution_elems = snap["ax_elems"]
+                    say(f"  [{label}] using snapshot {action.snapshot!r} "
+                        f"({len(resolution_elems)} elements, "
+                        f"age {int(time.time() - snap.get('ts', 0))}s)")
+                else:
+                    say(f"  [{label}] snapshot {action.snapshot!r} not "
+                        f"found / expired; falling back to live AX dump")
+
+            # `ax_query="Sign in"` → fuzzy-match against the resolution
+            # AX dump → sets `action.index`. Lets the agent reference
+            # elements by their visible label without counting rows.
+            # Skipped when `index` is already set (explicit wins) or
+            # when there's no AX dump available (browser CDP-only flow).
+            if (action.ax_query and action.index is None
+                    and resolution_elems):
+                from openseer_ax import resolve_ax_index as _rax
+                hit = _rax(resolution_elems, action.ax_query)
+                if hit is not None:
+                    matched_idx, score = hit
+                    matched = resolution_elems[matched_idx]
+                    action.index = matched_idx
+                    say(f"  [{label}] ax_query={action.ax_query!r} "
+                        f"→ index={matched_idx} "
+                        f"[{matched.role} {matched.label!r}] score={score}")
+                else:
+                    say(f"  [{label}] ax_query={action.ax_query!r} "
+                        f"NO MATCH in {len(resolution_elems)} elements "
+                        f"(threshold 30); falling through")
+
             # If the model used `index=N` instead of pixel coords, look it
-            # up in this turn's AX dump and resolve to (x, y) center. The
-            # executor then treats it as a normal click(x, y).
+            # up in the resolution AX dump and resolve to (x, y) center.
+            # The executor then treats it as a normal click(x, y).
             if action.index is not None and action.x is None:
-                if 0 <= action.index < len(ax_elems):
-                    elem = ax_elems[action.index]
+                if 0 <= action.index < len(resolution_elems):
+                    elem = resolution_elems[action.index]
                     if elem.center is not None:
                         action.x, action.y = elem.center
                         say(f"  [{label}] index={action.index} → "
@@ -2053,14 +2108,52 @@ def run(task: str, *, max_steps: int = 200, dry_run: bool = True,
                             f"no bbox, falling back to executor error")
                 else:
                     say(f"  [{label}] index={action.index} OUT OF RANGE "
-                        f"(0..{len(ax_elems) - 1})")
+                        f"(0..{len(resolution_elems) - 1})")
             emit(EventType.ACTION_STARTED, name=action.name,
                  chain_pos=chain_pos, chain_len=len(actions),
                  summary=_action_brief(action))
             bg_pid = (ctx.get("target_pid") if ctx.get("background_mode")
                       else None)
-            result = execute(action, dry_run=dry_run,
-                              background_pid=bg_pid)
+            # `see` is handled in-loop (not in executor) because it
+            # needs to write into ctx["snapshots"] — the per-run
+            # cache that subsequent `snapshot=<id>` actions read.
+            # Keeping it here also avoids re-walking the AX tree:
+            # we already dumped ax_elems for this turn at line ~1025,
+            # so `see` is essentially free (just hands out an id).
+            if action.name == "see":
+                import uuid as _uuid, time as _time
+                snap_id = _uuid.uuid4().hex[:8]
+                snaps = ctx.setdefault("snapshots", {})
+                snaps[snap_id] = {
+                    "ax_elems": list(ax_elems),
+                    "ts": _time.time(),
+                    "app_pid": ctx.get("target_pid"),
+                }
+                # Garbage-collect snapshots older than 5 minutes
+                # so a long-running session doesn't accumulate
+                # stale dumps in memory.
+                now = _time.time()
+                for k in list(snaps.keys()):
+                    if now - (snaps[k].get("ts") or 0) > 300:
+                        snaps.pop(k, None)
+                # Result is the same AX listing the model would
+                # have seen anyway, but tagged with the snapshot
+                # id so subsequent actions can reference it.
+                from openseer_ax import render_ax_for_prompt
+                listing = render_ax_for_prompt(
+                    ax_elems, app_name=ctx.get("front_app_name"),
+                    pid=ctx.get("target_pid"))
+                result = (
+                    f"snapshot_id={snap_id} "
+                    f"({len(ax_elems)} elements):\n{listing}\n\n"
+                    f"Reference these elements in subsequent actions "
+                    f"via `snapshot=\"{snap_id}\"` + `index=N` / "
+                    f"`ax_query=\"...\"` — no need to re-see until the "
+                    f"screen changes meaningfully."
+                )
+            else:
+                result = execute(action, dry_run=dry_run,
+                                  background_pid=bg_pid)
             # If `open_app` succeeded, remember its pid as the AX target
             # for subsequent turns. Active_app_pid() falls back to this
             # when NSWorkspace reports OpenSeer's host terminal frontmost.

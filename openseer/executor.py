@@ -424,8 +424,9 @@ def _read_pages(action: "Action", *, dry_run: bool) -> str:
     from . import browser_cdp
     if not browser_cdp.cdp_available():
         return ("ERROR: read_pages requires CDP "
-                "(currently disabled by default; set "
-                "OPENSEER_BROWSER_CDP=auto to enable it). "
+                "(set OPENSEER_BROWSER_CDP=auto to enable it; if already "
+                "set, run `openseer chrome restart` so Chrome listens on "
+                "port 9222). "
                 "Sequential read_page calls still work via AppleScript.")
     try:
         results = browser_cdp.read_pages_via_cdp(urls, max_chars=4000)
@@ -472,8 +473,9 @@ def _save_pdf(action: "Action", *, dry_run: bool) -> str:
     from . import browser_cdp
     if not browser_cdp.cdp_available():
         return ("ERROR: save_pdf requires CDP "
-                "(currently disabled by default; set "
-                "OPENSEER_BROWSER_CDP=auto to enable it)")
+                "(set OPENSEER_BROWSER_CDP=auto to enable it; if already "
+                "set, run `openseer chrome restart` so Chrome listens on "
+                "port 9222)")
     try:
         out = browser_cdp.save_pdf_via_cdp(
             url=url, path=path, landscape=bool(action.landscape))
@@ -697,8 +699,8 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
             # AppleScript would defeat that intent, so surface a
             # clear error instead.
             return ("ERROR: OPENSEER_BROWSER_CDP=on but CDP isn't "
-                    "available (no Chromium binary found; set "
-                    "OPENSEER_CHROME or install Google Chrome). "
+                    "available (Chrome is not listening on port 9222; "
+                    "run `openseer chrome restart`). "
                     "Unset it or set =off to allow AppleScript fallback.")
 
     # AppleScript string literal escaping: backslash + double-quote.
@@ -846,8 +848,9 @@ def execute(action: Action, *, dry_run: bool = True,
         from . import browser_cdp
         if not browser_cdp.cdp_available():
             return ("ERROR: click(selector=...) requires CDP "
-                    "(currently disabled by default; set "
-                    "OPENSEER_BROWSER_CDP=auto to enable it). "
+                    "(set OPENSEER_BROWSER_CDP=auto to enable it; if "
+                    "already set, run `openseer chrome restart` so Chrome "
+                    "listens on port 9222). "
                     "Use click(x,y) or click(index) instead.")
         try:
             out = browser_cdp.click_via_cdp(sel)
@@ -973,8 +976,9 @@ def execute(action: Action, *, dry_run: bool = True,
             from . import browser_cdp
             if not browser_cdp.cdp_available():
                 return ("ERROR: type(selector=...) requires CDP "
-                        "(currently disabled by default; set "
-                        "OPENSEER_BROWSER_CDP=auto to enable it). "
+                        "(set OPENSEER_BROWSER_CDP=auto to enable it; if "
+                        "already set, run `openseer chrome restart` so "
+                        "Chrome listens on port 9222). "
                         "Use click(x,y) + type(text) instead.")
             try:
                 out = browser_cdp.type_via_cdp(sel, action.text)

@@ -42,8 +42,8 @@ class Action:
     target: str | None = None      # natural-language element description; resolved to (x,y) by Grounder
     region: list[int] | None = None  # for reground: [x1, y1, x2, y2] crop bbox to "zoom" before grounding
     external: bool = False           # for reground: True ⇒ call the specialist (paid) grounder, not the default
-    selector: str | None = None    # CSS selector — for read_page: extract that element's innerText; for click/type: drive via Chrome DevTools Protocol instead of pixel coords
-    capture_xhr: bool = False      # for read_page (CDP path only): also capture JSON XHRs the page fetches and include them in the result — best for SPAs whose rendered text is mostly chrome but whose underlying API call is the actual data
+    selector: str | None = None    # CSS selector — for read_page: extract that element's innerText; for click/type: CDP-only when OPENSEER_BROWSER_CDP is explicitly enabled
+    capture_xhr: bool = False      # for read_page (CDP path only): also capture JSON XHRs the page fetches and include them in the result
     urls: list[str] | None = None  # for read_pages: list of URLs to read in parallel — replaces N sequential read_page calls when comparing/aggregating pages
     path: str | None = None        # for save_pdf: output PDF file path (absolute or cwd-relative)
     landscape: bool = False        # for save_pdf: landscape orientation (default portrait)
@@ -424,7 +424,8 @@ def _read_pages(action: "Action", *, dry_run: bool) -> str:
     from . import browser_cdp
     if not browser_cdp.cdp_available():
         return ("ERROR: read_pages requires CDP "
-                "(install Chrome or set OPENSEER_BROWSER_CDP=auto). "
+                "(currently disabled by default; set "
+                "OPENSEER_BROWSER_CDP=auto to enable it). "
                 "Sequential read_page calls still work via AppleScript.")
     try:
         results = browser_cdp.read_pages_via_cdp(urls, max_chars=4000)
@@ -471,7 +472,8 @@ def _save_pdf(action: "Action", *, dry_run: bool) -> str:
     from . import browser_cdp
     if not browser_cdp.cdp_available():
         return ("ERROR: save_pdf requires CDP "
-                "(install Chrome or set OPENSEER_BROWSER_CDP=auto)")
+                "(currently disabled by default; set "
+                "OPENSEER_BROWSER_CDP=auto to enable it)")
     try:
         out = browser_cdp.save_pdf_via_cdp(
             url=url, path=path, landscape=bool(action.landscape))
@@ -590,9 +592,10 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
     if dry_run:
         return f"would read_page in {app!r}" + (f" after navigate {url}" if url else "")
 
-    # ─── CDP fast path ────────────────────────────────────────────────
+    # ─── optional CDP fast path ───────────────────────────────────────
     # When the agent passes an explicit URL we route to the OpenSeer-
-    # owned Chrome via DevTools Protocol. Why only with a URL: a
+    # attached Chrome via DevTools Protocol if OPENSEER_BROWSER_CDP is
+    # explicitly set to auto/on. Why only with a URL: a
     # bare read_page is "read whatever the user is looking at right
     # now" — that's a different intent than "fetch this URL's text,"
     # and the user's frontmost browser is the right surface for the
@@ -600,16 +603,15 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
     # without an explicit url would be guessing.
     #
     # We do NOT gate on the detected frontmost browser being chromium:
-    # OpenSeer's Chrome is a separate process, and the user's Safari
-    # being frontmost is irrelevant to whether we can use CDP. The
+    # the attached Chrome is a separate browser surface, and the user's
+    # Safari being frontmost is irrelevant to whether we can use CDP. The
     # only honored opt-out is the agent EXPLICITLY setting
     # `app="Safari"` / Firefox etc. — that signals "reuse my actual
     # logged-in browser session" and we respect it.
     #
-    # CDPError is silenced by default (the AppleScript fallback
-    # below has parity for the bare case); the user can set
-    # OPENSEER_BROWSER_CDP=on to make CDP failures hard errors,
-    # which is useful for debugging why CDP isn't picking up.
+    # CDP is disabled by default. With OPENSEER_BROWSER_CDP=auto,
+    # CDPError is silenced and falls back to AppleScript; with =on,
+    # CDP failures become hard errors for debugging.
     explicit_non_chromium = (action.app or "").strip().lower() in (
         "safari", "firefox", "firefox developer edition",
         "librewolf", "waterfox", "tor browser")
@@ -684,7 +686,7 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
                 if browser_cdp.cdp_required():
                     return (f"ERROR: CDP read_page failed ({e}). "
                             f"Unset OPENSEER_BROWSER_CDP or set it to "
-                            f"'auto' to allow AppleScript fallback.")
+                            f"'off' to allow AppleScript fallback.")
                 # Silent fallback to AppleScript: the CDP module
                 # already logged at INFO via its own logger.
         elif browser_cdp.cdp_required():
@@ -697,7 +699,7 @@ def _read_page(action: "Action", *, dry_run: bool) -> str:
             return ("ERROR: OPENSEER_BROWSER_CDP=on but CDP isn't "
                     "available (no Chromium binary found; set "
                     "OPENSEER_CHROME or install Google Chrome). "
-                    "Set =auto to allow AppleScript fallback.")
+                    "Unset it or set =off to allow AppleScript fallback.")
 
     # AppleScript string literal escaping: backslash + double-quote.
     # Without this, a URL or app name containing `"` or `\` breaks
@@ -844,8 +846,8 @@ def execute(action: Action, *, dry_run: bool = True,
         from . import browser_cdp
         if not browser_cdp.cdp_available():
             return ("ERROR: click(selector=...) requires CDP "
-                    "(set OPENSEER_BROWSER_CDP=auto and ensure "
-                    "Google Chrome / Chromium is installed). "
+                    "(currently disabled by default; set "
+                    "OPENSEER_BROWSER_CDP=auto to enable it). "
                     "Use click(x,y) or click(index) instead.")
         try:
             out = browser_cdp.click_via_cdp(sel)
@@ -971,7 +973,8 @@ def execute(action: Action, *, dry_run: bool = True,
             from . import browser_cdp
             if not browser_cdp.cdp_available():
                 return ("ERROR: type(selector=...) requires CDP "
-                        "(OPENSEER_BROWSER_CDP=auto + Chromium). "
+                        "(currently disabled by default; set "
+                        "OPENSEER_BROWSER_CDP=auto to enable it). "
                         "Use click(x,y) + type(text) instead.")
             try:
                 out = browser_cdp.type_via_cdp(sel, action.text)

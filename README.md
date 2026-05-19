@@ -135,21 +135,16 @@ whichever you're missing. Your choice persists to
   [`openseer_ax`](./openseer_ax) package for other macOS
   automation projects.
 - **Read pages** — `read_page` pulls a webpage's full text in one
-  call, no scroll-and-screenshot loops. When a URL is supplied,
-  OpenSeer attaches to **your** Chrome via Chrome DevTools Protocol
-  (no separate browser, no profile snapshot, no copy-and-pray
-  cookies). One-time setup: run `openseer chrome restart` to
-  relaunch your Chrome with `--remote-debugging-port=9222`, OR
-  `openseer chrome enable-login-item` to make macOS auto-launch
-  Chrome with the flag at every login. Status check:
-  `openseer chrome status`. Once attached, the agent gets
-  Promise-awaiting, DOM-stable waits, Mozilla Readability article
-  extraction, JSON XHR capture, Shadow DOM / iframe piercing,
-  batch reads, and PDF save — all on the actual tabs you're
-  already logged into. Without the flag, `read_page` falls back to
-  AppleScript JS injection (requires "Allow JavaScript from Apple
-  Events" in the browser menu) — degraded but functional.
-  `OPENSEER_BROWSER_CDP=off` hard-disables the CDP path.
+  call, no scroll-and-screenshot loops. By default it uses the
+  user's browser via AppleScript JS injection (requires "Allow
+  JavaScript from Apple Events" in the browser menu), so it stays on
+  the same browser/profile the user is already operating. The Chrome
+  DevTools Protocol path is still present for DOM-stable waits,
+  Mozilla Readability extraction, JSON XHR capture, Shadow DOM /
+  iframe piercing, batch reads, and PDF save, but it is disabled by
+  default. Set `OPENSEER_BROWSER_CDP=auto` to enable it when Chrome
+  is listening on port 9222, or `OPENSEER_BROWSER_CDP=on` to require
+  it and surface failures.
 - **Bash + web** — runs shell commands, fetches URLs, web search.
   The agent picks the right tool itself.
 - **Skills that grow themselves** — per-site / per-app markdown

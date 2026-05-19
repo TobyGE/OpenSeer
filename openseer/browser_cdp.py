@@ -1180,6 +1180,11 @@ class ChromeManager:
 # ── sync bridges for executor.py ─────────────────────────────────────
 
 
+def _cdp_mode() -> str:
+    return (os.environ.get("OPENSEER_BROWSER_CDP", "off") or "off")\
+        .strip().lower()
+
+
 def cdp_available() -> bool:
     """Is the user's Chrome listening on the CDP port?
 
@@ -1188,11 +1193,11 @@ def cdp_available() -> bool:
     Attach-only model: we never spawn, so availability is just
     "is port 9222 answering AND not env-disabled."
 
-    ``OPENSEER_BROWSER_CDP=off`` hard-disables for users who want
-    AppleScript-only regardless of port state.
+    CDP is disabled by default. Set ``OPENSEER_BROWSER_CDP=auto``
+    to enable it when the port is reachable, or ``=on`` to also make
+    failures hard errors via ``cdp_required()``.
     """
-    if (os.environ.get("OPENSEER_BROWSER_CDP", "auto") or "")\
-            .lower() == "off":
+    if _cdp_mode() not in ("auto", "on"):
         return False
     return _devtools_reachable(_CDP_PORT)
 
@@ -1202,8 +1207,7 @@ def cdp_required() -> bool:
     that mode a CDP failure should surface to the model as an error
     instead of silently falling back to AppleScript. Useful for
     diagnosing why CDP isn't being picked up."""
-    return (os.environ.get("OPENSEER_BROWSER_CDP", "auto") or "")\
-        .lower() == "on"
+    return _cdp_mode() == "on"
 
 
 # ── Article extraction (Mozilla Readability + html2text) ─────────────

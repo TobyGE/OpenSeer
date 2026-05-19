@@ -9,6 +9,7 @@ final class FloatingVoiceOrbWindow {
     private var panel: VoiceOrbPanel?
     private var hosting: NSHostingView<VoiceOrbWindowRoot>?
     private var lockHandle: FileHandle?
+    private var appActivationObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -41,9 +42,9 @@ final class FloatingVoiceOrbWindow {
                 self?.resize(expanded: expanded)
             }
         )
-        if let panel, let hosting {
+        if panel != nil, let hosting {
             hosting.rootView = root
-            panel.orderFrontRegardless()
+            raisePanel(showIfNeeded: true)
             return
         }
 
@@ -52,7 +53,7 @@ final class FloatingVoiceOrbWindow {
 
         let panel = VoiceOrbPanel(
             contentRect: hosting.frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -61,20 +62,26 @@ final class FloatingVoiceOrbWindow {
         panel.isOpaque = false
         panel.hasShadow = false
         panel.isMovableByWindowBackground = true
-        panel.level = .floating
+        panel.isFloatingPanel = true
+        // `.floating` is not sticky enough across app activation; when
+        // Chrome becomes active it can reorder its normal windows above
+        // another app's floating panel. Status-bar level keeps the orb
+        // above ordinary app windows without jumping to screen-saver level.
+        panel.level = .statusBar
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [
             .canJoinAllSpaces,
             .fullScreenAuxiliary,
+            .ignoresCycle,
             .stationary,
         ]
 
         self.panel = panel
         self.hosting = hosting
         place(panel)
-        NSApp.activate(ignoringOtherApps: true)
-        panel.orderFrontRegardless()
+        installFrontmostObserver()
+        raisePanel(showIfNeeded: true)
     }
 
     private static let collapsedSize = NSSize(width: 96, height: 96)
@@ -112,6 +119,27 @@ final class FloatingVoiceOrbWindow {
             y: visible.minY + 22
         )
         panel.setFrameOrigin(origin)
+    }
+
+    private func installFrontmostObserver() {
+        guard appActivationObserver == nil else { return }
+        appActivationObserver = NSWorkspace.shared.notificationCenter
+            .addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.raisePanel()
+                }
+            }
+    }
+
+    private func raisePanel(showIfNeeded: Bool = false) {
+        guard let panel else { return }
+        guard showIfNeeded || panel.isVisible else { return }
+        panel.level = .statusBar
+        panel.orderFrontRegardless()
     }
 
     /// Two-state resize: collapsed (just the orb) or expanded (room

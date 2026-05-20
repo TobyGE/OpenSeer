@@ -19,6 +19,7 @@ from ..skills import (
     find_skill_for_app,
     parse_skill_text,
     slugify_app,
+    validate_skill_body,
     write_user_skill,
 )
 
@@ -647,6 +648,23 @@ class RunReflectionCallback(Callback):
         skill_body = extract_skill_block(reflection)
         memory_body = extract_memory_block(reflection)
         if skill_body:
+            parsed_for_validation = parse_skill_text(skill_body)
+            if parsed_for_validation is None:
+                self._append_note(
+                    trace_path,
+                    "Skill apply skipped: proposed skill body has invalid frontmatter.",
+                )
+                skill_body = ""
+            else:
+                valid = validate_skill_body(
+                    parsed_for_validation.name, skill_body)
+                if not valid.ok:
+                    self._append_note(
+                        trace_path,
+                        f"Skill apply skipped: {valid.error}",
+                    )
+                    skill_body = ""
+        if skill_body:
             # Persist the expected skill name as a sidecar so the
             # daemon's Telegram "Apply" button (which fires after the
             # run finishes and the in-memory ctx is gone) can re-run
@@ -775,11 +793,12 @@ class RunReflectionCallback(Callback):
             expected_skill_name = canonical_skill_name(app_name)
 
         skill_target = "none"
+        skill_app_name = app_name or ("Google Chrome" if site_domain else "")
         if expected_skill_name:
             target_kind = "website" if site_domain and expected_skill_name.endswith("-web") else "app"
             skill_target = (
                 f"{'update existing' if target_skill else 'create new'} `{expected_skill_name}` "
-                f"for {target_kind} {site_domain or app_name!r} using app {app_name!r}. "
+                f"for {target_kind} {site_domain or app_name!r} using app {skill_app_name!r}. "
                 f"If you propose a skill, the frontmatter name MUST be exactly "
                 f"{expected_skill_name!r}."
             )

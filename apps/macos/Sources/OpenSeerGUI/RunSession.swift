@@ -611,65 +611,122 @@ final class RunSession: ObservableObject, Identifiable {
 /// listen for append events via DispatchSource. Emits each newline-
 /// terminated line through `onLine`. Stops on `stop()` or deinit.
 final class FileTail: @unchecked Sendable {
-    private let path: String
-    private let onLine: @Sendable (String) -> Void
-    private var fd: Int32 = -1
-    private var src: DispatchSourceFileSystemObject?
-    private var carry = Data()
-    private let q = DispatchQueue(label: "openseer.filetail")
-    private var stopped = false
+    private let state: State
 
     init(path: String, onLine: @escaping @Sendable (String) -> Void) {
-        self.path = path
-        self.onLine = onLine
+        self.state = State(path: path, onLine: onLine)
     }
 
     func start() {
-        q.async { [self] in
+        state.start()
+    }
+
+    func stop() {
+        state.stop()
+    }
+
+    deinit { stop() }
+
+    private final class State: @unchecked Sendable {
+        private let path: String
+        private let onLine: @Sendable (String) -> Void
+        private var fd: Int32 = -1
+        private var src: DispatchSourceFileSystemObject?
+        private var carry = Data()
+        private let q = DispatchQueue(label: "openseer.filetail")
+        private let lock = NSLock()
+        private var stopped = false
+
+        init(path: String, onLine: @escaping @Sendable (String) -> Void) {
+            self.path = path
+            self.onLine = onLine
+        }
+
+        func start() {
+            q.async { [self] in
+                startOnQueue()
+            }
+        }
+
+        func stop() {
+            lock.lock()
+            stopped = true
+            lock.unlock()
+
+            q.async { [self] in
+                stopOnQueue()
+            }
+        }
+
+        private func startOnQueue() {
             // The file may not exist yet (daemon still creating the
             // run dir). Poll briefly until it shows up.
             for _ in 0..<60 {
+                if isStopped() { return }
                 if FileManager.default.fileExists(atPath: path) { break }
                 Thread.sleep(forTimeInterval: 0.5)
             }
+            if isStopped() { return }
+
             fd = open(path, O_RDONLY)
             guard fd >= 0 else { return }
+
             // Drain initial contents.
             drain()
+            if isStopped() {
+                closeOpenFile()
+                return
+            }
+
             // Watch for further appends.
             let s = DispatchSource.makeFileSystemObjectSource(
                 fileDescriptor: fd, eventMask: [.extend, .write], queue: q)
             s.setEventHandler { [weak self] in self?.drain() }
-            s.setCancelHandler { [fd = self.fd] in
+            let sourceFD = fd
+            s.setCancelHandler {
+                let fd = sourceFD
                 if fd >= 0 { close(fd) }
             }
             s.resume()
             src = s
         }
-    }
 
-    func stop() {
-        q.async { [self] in
-            stopped = true
-            src?.cancel()
-            src = nil
-            fd = -1
+        private func stopOnQueue() {
+            if let s = src {
+                src = nil
+                fd = -1
+                s.cancel()
+            } else {
+                closeOpenFile()
+            }
+            carry.removeAll(keepingCapacity: false)
         }
-    }
 
-    deinit { stop() }
+        private func isStopped() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return stopped
+        }
 
-    private func drain() {
-        guard fd >= 0, !stopped else { return }
-        var buf = [UInt8](repeating: 0, count: 4096)
-        while true {
-            let n = read(fd, &buf, buf.count)
-            if n <= 0 { break }
-            carry.append(buf, count: n)
-            while let nl = carry.firstIndex(of: 0x0A) {
-                let line = carry.subdata(in: 0..<nl)
-                carry.removeSubrange(0...nl)
-                if let s = String(data: line, encoding: .utf8) { onLine(s) }
+        private func closeOpenFile() {
+            if fd >= 0 {
+                close(fd)
+                fd = -1
+            }
+        }
+
+        private func drain() {
+            guard fd >= 0, !isStopped() else { return }
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while true {
+                let n = read(fd, &buf, buf.count)
+                if n <= 0 { break }
+                carry.append(buf, count: n)
+                while let nl = carry.firstIndex(of: 0x0A) {
+                    let line = carry.subdata(in: 0..<nl)
+                    carry.removeSubrange(0...nl)
+                    if let s = String(data: line, encoding: .utf8) { onLine(s) }
+                }
             }
         }
     }

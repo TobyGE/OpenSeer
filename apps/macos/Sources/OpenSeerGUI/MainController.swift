@@ -474,9 +474,14 @@ final class MainController: ObservableObject {
         let s = RunSession(source: .localPrompt(text), binary: binary)
         s.onFinalAnswer = onFinalAnswer
         daemon.claimLocalPrompt(text)
+        let thread = daemon.addLocalRun(
+            s, continueThread: continueThread?.id)
+        selectedThreadID = thread.id
         let onTraceFound: (String) -> Void = {
-            [weak daemon, prompt = text] traceId in
+            [weak daemon, prompt = text, threadId = thread.id] traceId in
             daemon?.reserveLocalTrace(traceId, prompt: prompt)
+            daemon?.persistLocalThread(threadId: threadId,
+                                       traceId: traceId)
         }
         switch transport {
         case .subprocess:
@@ -490,8 +495,5 @@ final class MainController: ObservableObject {
                              backgroundMode: backgroundMode,
                              onTraceFound: onTraceFound)
         }
-        let thread = daemon.addLocalRun(
-            s, continueThread: continueThread?.id)
-        selectedThreadID = thread.id
     }
 }

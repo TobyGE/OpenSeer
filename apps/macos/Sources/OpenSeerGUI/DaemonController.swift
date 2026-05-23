@@ -174,6 +174,32 @@ final class DaemonController: ObservableObject {
         pendingLocalPrompts.append(prompt)
     }
 
+    /// Persist GUI-local conversation grouping for a run. Agentd
+    /// creates the run directory asynchronously after the start_task
+    /// ack, so retry briefly until the directory exists.
+    func persistLocalThread(threadId: String, traceId: String) {
+        let path = NSHomeDirectory()
+            + "/.openseer/runs/" + traceId + "/gui_thread.json"
+        let payload: [String: String] = [
+            "kind": "local",
+            "thread_id": threadId,
+        ]
+        Task { @MainActor in
+            for _ in 0..<20 {
+                let dir = (path as NSString).deletingLastPathComponent
+                if FileManager.default.fileExists(atPath: dir),
+                   let data = try? JSONSerialization.data(
+                        withJSONObject: payload,
+                        options: [.prettyPrinted, .sortedKeys]) {
+                    try? data.write(to: URL(fileURLWithPath: path),
+                                    options: .atomic)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+    }
+
     private func consumePendingClaim(for dir: String) -> Bool {
         let taskPath = dir + "/task.json"
         guard let data = FileManager.default.contents(atPath: taskPath),
@@ -259,9 +285,9 @@ final class DaemonController: ObservableObject {
     private func attachRunToThread(_ s: RunSession, runDir: String) {
         let key: String
         let kind: ChatThread.Kind
-        if let meta = ChatMeta.load(runDir: runDir) {
-            key = "tg:\(meta.chatId)"
-            kind = .telegram(chatId: meta.chatId)
+        if let meta = RunThreadMeta.load(runDir: runDir) {
+            key = meta.key
+            kind = meta.kind
         } else {
             // No chat.json — likely a pre-grouping trace OR a local
             // run whose dir we observed (claim should have caught

@@ -171,9 +171,31 @@ final class ChatThread: ObservableObject, Identifiable {
     }
 }
 
-/// Sidecar `chat.json` that the daemon writes alongside every run.
-/// Used by the GUI to determine which thread a run belongs to.
-struct ChatMeta: Decodable {
+/// Sidecar metadata used by the GUI to determine which conversation
+/// thread a run belongs to.
+///
+/// Sources:
+///   - `chat.json`: written by Telegram daemon runs.
+///   - `gui_thread.json`: written by the macOS GUI for local runs,
+///     so local conversations survive app restarts.
+struct RunThreadMeta {
+    let key: String
+    let kind: ChatThread.Kind
+
+    static func load(runDir: String) -> RunThreadMeta? {
+        if let telegram = TelegramChatMeta.load(runDir: runDir) {
+            return RunThreadMeta(
+                key: "tg:\(telegram.chatId)",
+                kind: .telegram(chatId: telegram.chatId))
+        }
+        if let local = LocalThreadMeta.load(runDir: runDir) {
+            return RunThreadMeta(key: local.threadId, kind: .local)
+        }
+        return nil
+    }
+}
+
+private struct TelegramChatMeta: Decodable {
     let kind: String
     let chatId: Int64
 
@@ -182,13 +204,34 @@ struct ChatMeta: Decodable {
         case chatId = "chat_id"
     }
 
-    /// Read `<runDir>/chat.json` if present. Returns nil for older
-    /// runs (which never group; they fall back to per-run threads).
-    static func load(runDir: String) -> ChatMeta? {
+    static func load(runDir: String) -> TelegramChatMeta? {
         let path = runDir + "/chat.json"
         guard let data = FileManager.default.contents(atPath: path) else {
             return nil
         }
-        return try? JSONDecoder().decode(ChatMeta.self, from: data)
+        return try? JSONDecoder().decode(TelegramChatMeta.self, from: data)
+    }
+}
+
+private struct LocalThreadMeta: Decodable {
+    let kind: String
+    let threadId: String
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case threadId = "thread_id"
+    }
+
+    static func load(runDir: String) -> LocalThreadMeta? {
+        let path = runDir + "/gui_thread.json"
+        guard let data = FileManager.default.contents(atPath: path) else {
+            return nil
+        }
+        guard let meta = try? JSONDecoder().decode(
+            LocalThreadMeta.self, from: data),
+              meta.kind == "local",
+              meta.threadId.hasPrefix("local:")
+        else { return nil }
+        return meta
     }
 }

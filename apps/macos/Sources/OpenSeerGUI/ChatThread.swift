@@ -9,9 +9,9 @@ import Combine
 /// Identity:
 ///   - Telegram traces group by `tg:<chat_id>` so successive messages
 ///     in the same chat accumulate as turns of one ongoing thread.
-///   - Local prompts each get their own thread (`local:<uuid>`) — the
-///     GUI composer doesn't yet have a "continue this thread" UX, so
-///     every Send is its own conversation. Easy to lift later.
+///   - Local prompts group by a GUI-owned thread id when available;
+///     older local traces without sidecars still fall back to
+///     `trace:<trace_id>` until the user continues them.
 @MainActor
 final class ChatThread: ObservableObject, Identifiable {
     let id: String              // e.g. "tg:12345" or "local:<uuid>"
@@ -231,6 +231,7 @@ private struct LocalThreadMeta: Decodable {
             LocalThreadMeta.self, from: data),
               meta.kind == "local",
               meta.threadId.hasPrefix("local:")
+                || meta.threadId.hasPrefix("trace:")
         else { return nil }
         return meta
     }

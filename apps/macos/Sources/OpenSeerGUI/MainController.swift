@@ -318,6 +318,10 @@ final class MainController: ObservableObject {
                 // Leave the chip up so the user can retry; surface the
                 // error inline via the run's errorMessage so it's
                 // visible somewhere debuggable.
+                run.pendingLesson = pending
+                if run.lastAppliedSkillName == pending.skillName {
+                    run.lastAppliedSkillName = nil
+                }
                 run.errorMessage = "Save skill failed: \(error)"
                 run.objectWillChange.send()
             }

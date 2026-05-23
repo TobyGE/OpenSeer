@@ -5,12 +5,68 @@ firehose, final.json footer, transcript.json (machine), trace.md (human).
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 from .base import Callback
+
+
+_RUN_RETENTION_DAYS_ENV = "OPENSEER_RUN_RETENTION_DAYS"
+_DEFAULT_RUN_RETENTION_DAYS = 7
+
+
+def _run_timestamp(run_dir: Path) -> float:
+    """Best-effort timestamp for retention pruning.
+
+    Prefer trace metadata because directory mtimes can change when
+    auxiliary files are written later. Fall back to filesystem mtime for
+    legacy or partial traces.
+    """
+    for name, key in (("final.json", "ended_at"), ("task.json", "started_at")):
+        path = run_dir / name
+        if not path.exists():
+            continue
+        try:
+            val = json.loads(path.read_text()).get(key)
+            if isinstance(val, (int, float)):
+                return float(val)
+        except Exception:
+            pass
+    return run_dir.stat().st_mtime
+
+
+def _retention_days() -> int | None:
+    raw = os.environ.get(_RUN_RETENTION_DAYS_ENV)
+    if raw is None or raw.strip() == "":
+        return _DEFAULT_RUN_RETENTION_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        return _DEFAULT_RUN_RETENTION_DAYS
+    return days if days > 0 else None
+
+
+def _prune_old_runs(runs_root: Path, *, keep: Path, now: float) -> None:
+    days = _retention_days()
+    if days is None or runs_root.name != "runs" or not runs_root.exists():
+        return
+    cutoff = now - (days * 24 * 60 * 60)
+    keep = keep.resolve()
+    for child in runs_root.iterdir():
+        if child.name == "latest" or child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            if child.resolve() == keep:
+                continue
+            if _run_timestamp(child) >= cutoff:
+                continue
+            shutil.rmtree(child)
+        except OSError:
+            pass
 
 
 def _redact_input_for_log(input_items: list[dict]) -> list[dict]:
@@ -63,6 +119,7 @@ class TrajectoryCallback(Callback):
         # previous run into the current one's final.json.
         self._failed_error = None
         out_dir: Path = ctx["out_dir"]
+        _prune_old_runs(out_dir.parent, keep=out_dir, now=time.time())
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "system_prompt.txt").write_text(ctx["system_prompt"])
         (out_dir / "task.json").write_text(json.dumps({

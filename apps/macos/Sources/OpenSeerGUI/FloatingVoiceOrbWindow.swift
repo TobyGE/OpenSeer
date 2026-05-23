@@ -61,6 +61,11 @@ final class FloatingVoiceOrbWindow {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
+        // Keep the orb out of OpenSeer's Quartz screenshots. The
+        // Python agent captures the full screen, so without this the
+        // floating panel can block the very content it is trying to
+        // inspect.
+        panel.sharingType = .none
         panel.isMovableByWindowBackground = true
         panel.isFloatingPanel = true
         // `.floating` is not sticky enough across app activation; when
@@ -204,8 +209,20 @@ private struct VoiceOrbWindowRoot: View {
                     isTaskHeld: liveObserver.runStatus == .held,
                     spokenAnswer: controller.voiceAnswer,
                     liveStep: liveObserver.current,
+                    pendingLesson: liveObserver.pendingLesson,
+                    savedSkillName: liveObserver.lastAppliedSkillName,
                     onSubmit: controller.submitVoicePrompt,
                     onAnswerConsumed: { controller.voiceAnswer = nil },
+                    onApplyLesson: {
+                        if let run = controller.selectedOrbRun {
+                            controller.applyPendingLesson(on: run)
+                        }
+                    },
+                    onDiscardLesson: {
+                        if let run = controller.selectedOrbRun {
+                            controller.discardPendingLesson(on: run)
+                        }
+                    },
                     onHoldToggle: { controller.toggleHoldOnSelectedRun() },
                     onStop: { controller.stopSelectedRun() },
                     isWindowExpanded: $expanded
@@ -249,6 +266,8 @@ final class LiveTurnObserver: ObservableObject {
     /// so a SwiftUI view binding to LiveTurnObserver re-renders when
     /// the agent enters/leaves the .held state.
     @Published private(set) var runStatus: RunSession.Status? = nil
+    @Published private(set) var pendingLesson: RunSession.ProposedLesson? = nil
+    @Published private(set) var lastAppliedSkillName: String? = nil
     private weak var run: RunSession?
     private var cancellable: AnyCancellable?
 
@@ -259,16 +278,22 @@ final class LiveTurnObserver: ObservableObject {
         guard let run else {
             current = nil
             runStatus = nil
+            pendingLesson = nil
+            lastAppliedSkillName = nil
             return
         }
         cancellable = run.objectWillChange.sink { [weak self, weak run] _ in
             DispatchQueue.main.async {
                 self?.current = Self.snapshot(from: run)
                 self?.runStatus = run?.status
+                self?.pendingLesson = run?.pendingLesson
+                self?.lastAppliedSkillName = run?.lastAppliedSkillName
             }
         }
         current = Self.snapshot(from: run)
         runStatus = run.status
+        pendingLesson = run.pendingLesson
+        lastAppliedSkillName = run.lastAppliedSkillName
     }
 
     private static func snapshot(from run: RunSession?) -> LiveStepInfo? {

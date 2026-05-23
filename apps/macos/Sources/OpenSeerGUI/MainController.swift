@@ -300,6 +300,9 @@ final class MainController: ObservableObject {
     /// pendingLesson" scan and addresses the exact target.
     func applyPendingLesson(on run: RunSession) {
         guard let pending = run.pendingLesson else { return }
+        run.pendingLesson = nil
+        run.lastAppliedSkillName = pending.skillName
+        run.objectWillChange.send()
         Task { @MainActor in
             do {
                 _ = try await AgentdClient.shared.applySkill(

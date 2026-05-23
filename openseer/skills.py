@@ -146,6 +146,17 @@ def parse_skill_text(text: str, path: Path | None = None) -> Skill | None:
     if not m:
         return None
     front = _parse_yaml_lite(m.group(1))
+    # Some generated proposals use dotted keys such as
+    # `requires.apps: []`. Normalize those to the canonical nested
+    # shape so validation and loading behave the same either way.
+    requires = front.get("requires", {})
+    if not isinstance(requires, dict):
+        requires = {}
+    for key in list(front):
+        if not key.startswith("requires."):
+            continue
+        subkey = key.split(".", 1)[1]
+        requires[subkey] = front[key]
     body = m.group(2).strip()
     path = path or Path("<memory>")
     name = str(front.get("name", path.parent.name))
@@ -154,7 +165,7 @@ def parse_skill_text(text: str, path: Path | None = None) -> Skill | None:
         description=str(front.get("description", "")),
         family=str(front.get("family", "")),
         body=body,
-        requires=front.get("requires", {}) if isinstance(front.get("requires"), dict) else {},
+        requires=requires,
         path=path,
     )
 
@@ -202,7 +213,7 @@ def validate_skill_body(skill_name: str, body: str) -> SkillWriteResult:
             f"family {family!r} must match [a-z0-9][a-z0-9_-]{{0,63}}"
         ))
     apps = (parsed.requires or {}).get("apps") or []
-    if family == "cu" and not apps:
+    if family == "cu" and not apps and not nm.endswith("-web"):
         return SkillWriteResult(False, error="cu skills must declare requires.apps")
     return SkillWriteResult(True, skill=parsed)
 

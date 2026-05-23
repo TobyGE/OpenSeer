@@ -198,10 +198,14 @@ struct LessonBubble: View {
                 .help("Dismiss without saving")
             }
             if !lesson.lesson.isEmpty {
-                Text(lesson.lesson)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                ScrollView(.vertical, showsIndicators: true) {
+                    Text(lesson.lesson)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 120)
             }
             HStack(spacing: 8) {
                 Button { showPreview = true } label: {

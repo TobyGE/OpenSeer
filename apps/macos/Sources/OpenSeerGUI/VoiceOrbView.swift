@@ -21,8 +21,12 @@ struct VoiceOrbView: View {
     let isTaskHeld: Bool
     let spokenAnswer: String?
     let liveStep: LiveStepInfo?
+    let pendingLesson: RunSession.ProposedLesson?
+    let savedSkillName: String?
     let onSubmit: (String) -> Void
     let onAnswerConsumed: () -> Void
+    let onApplyLesson: () -> Void
+    let onDiscardLesson: () -> Void
     /// Toggle the hand-off: if running → hold; if held → resume.
     let onHoldToggle: () -> Void
     /// Stop the running task entirely (CANCEL sentinel + asyncio
@@ -84,11 +88,11 @@ struct VoiceOrbView: View {
                 if let displayedAnswer, !displayedAnswer.isEmpty {
                     answerBubble(displayedAnswer)
                 }
-                // Skill chip lives in the main chat thread now
-                // (LessonBubble in BubbleView.swift), not on the
-                // orb — the user expected to see "Learned…" inline
-                // under the answer in the conversation, not as a
-                // separate floating affordance.
+                if let pendingLesson {
+                    lessonBubble(pendingLesson)
+                } else if let savedSkillName, !savedSkillName.isEmpty {
+                    savedSkillBubble(savedSkillName)
+                }
             }
             Button {
                 withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
@@ -113,7 +117,8 @@ struct VoiceOrbView: View {
                 }
             } label: {
                 CrystalOrb(active: input.isRecording,
-                           isOpen: isOpen)
+                           isOpen: isOpen,
+                           isWorking: isTaskRunning && !isTaskHeld)
             }
             .buttonStyle(.plain)
             .help(isOpen ? "Close voice mode" : "Open voice mode")
@@ -265,6 +270,13 @@ struct VoiceOrbView: View {
             if input.isRecording { input.stop() }
             onAnswerConsumed()
             if autoListen { startListeningIfIdle() }
+        }
+        .onChange(of: pendingLesson?.runId) { _, runId in
+            guard runId != nil else { return }
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                isOpen = true
+                isWindowExpanded = true
+            }
         }
     }
 
@@ -548,6 +560,75 @@ struct VoiceOrbView: View {
         .shadow(color: .black.opacity(0.16), radius: 14, y: 7)
     }
 
+    private func lessonBubble(_ lesson: RunSession.ProposedLesson) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "graduationcap.fill")
+                    .foregroundStyle(.yellow)
+                Text(lesson.isNew ? "Save new skill?" : "Update skill?")
+                    .font(.caption.weight(.semibold))
+                Spacer(minLength: 0)
+                Button {
+                    onDiscardLesson()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.bold))
+                }
+                .buttonStyle(.borderless)
+                .help("Dismiss without saving")
+            }
+            Text(lesson.skillName)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+            if !lesson.lesson.isEmpty {
+                ScrollView(.vertical, showsIndicators: true) {
+                    Text(lesson.lesson)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 92)
+            }
+            Button {
+                onApplyLesson()
+            } label: {
+                Label("Save", systemImage: "tray.and.arrow.down")
+            }
+            .controlSize(.small)
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(11)
+        .frame(width: 320, alignment: .leading)
+        .background(.regularMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.yellow.opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .shadow(color: .black.opacity(0.16), radius: 14, y: 7)
+    }
+
+    private func savedSkillBubble(_ name: String) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text("Saved skill \(name)")
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .frame(width: 320, alignment: .leading)
+        .background(.regularMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.green.opacity(0.30), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 6)
+    }
+
     private var transcriptText: String {
         if !input.transcript.isEmpty { return input.transcript }
         if isTaskHeld {
@@ -717,6 +798,7 @@ struct VoiceOrbView: View {
 private struct CrystalOrb: View {
     let active: Bool
     let isOpen: Bool
+    let isWorking: Bool
 
     var body: some View {
         ZStack {
@@ -748,6 +830,31 @@ private struct CrystalOrb: View {
                 .frame(width: 30, height: 22)
                 .rotationEffect(.degrees(-6))
                 .offset(x: -14, y: -12)
+            orbDots
+            micBadge
+            if active {
+                Circle()
+                    .stroke(.white.opacity(0.82), lineWidth: 2.5)
+                    .scaleEffect(1.10)
+            }
+        }
+        .frame(width: 66, height: 66)
+        .shadow(color: .black.opacity(0.22), radius: 12, y: 6)
+        .animation(.easeInOut(duration: 0.18), value: isWorking)
+    }
+
+    private var orbDots: some View {
+        Group {
+            if isWorking {
+                rotatingDots
+            } else {
+                staticDots
+            }
+        }
+    }
+
+    private var staticDots: some View {
+        ZStack {
             Circle()
                 .fill(.white.opacity(0.88))
                 .frame(width: 6, height: 6)
@@ -760,15 +867,45 @@ private struct CrystalOrb: View {
                 .fill(.white.opacity(0.56))
                 .frame(width: 3.5, height: 3.5)
                 .offset(x: -22, y: 19)
-            micBadge
-            if active {
-                Circle()
-                    .stroke(.white.opacity(0.82), lineWidth: 2.5)
-                    .scaleEffect(1.10)
+        }
+    }
+
+    private var rotatingDots: some View {
+        TimelineView(.animation) { context in
+            let seconds = context.date.timeIntervalSinceReferenceDate
+            ZStack {
+                orbitDot(seconds: seconds, phase: 0,
+                         size: 6, opacity: 0.88)
+                orbitDot(seconds: seconds, phase: 2 * .pi / 3,
+                         size: 3.5, opacity: 0.70)
+                orbitDot(seconds: seconds, phase: 4 * .pi / 3,
+                         size: 3.5, opacity: 0.56)
             }
         }
-        .frame(width: 66, height: 66)
-        .shadow(color: .black.opacity(0.22), radius: 12, y: 6)
+    }
+
+    private func orbitDot(seconds: TimeInterval,
+                          phase: Double,
+                          size: CGFloat,
+                          opacity: Double) -> some View {
+        let period = 3.8
+        let tilt = 0.62
+        let t = seconds / period * 2 * .pi + phase
+        let z = sin(t + tilt)
+        let near = (z + 1) / 2
+        let x = cos(t) * 21.6
+        let y = sin(t) * 12.6 - z * 2.4
+        let scale = 0.52 + near * 0.72
+        let alpha = opacity * (0.08 + near * 0.90)
+        let blur = (1 - near) * 1.35
+
+        return Circle()
+            .fill(.white.opacity(alpha))
+            .frame(width: size, height: size)
+            .scaleEffect(scale)
+            .offset(x: x, y: y)
+            .blur(radius: blur)
+            .zIndex(near)
     }
 
     private var micBadge: some View {

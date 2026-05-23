@@ -452,7 +452,10 @@ final class RunSession: ObservableObject, Identifiable {
             // for the preview sheet.
             let runId = ev.data["run_id"]?.string ?? traceId ?? ""
             let name = ev.data["skill_name"]?.string ?? ""
-            if !runId.isEmpty && !name.isEmpty {
+            let sidecar = NSHomeDirectory()
+                + "/.openseer/runs/\(runId)/proposed_skill.md"
+            if !runId.isEmpty && !name.isEmpty
+                && FileManager.default.fileExists(atPath: sidecar) {
                 pendingLesson = ProposedLesson(
                     runId: runId,
                     skillName: name,

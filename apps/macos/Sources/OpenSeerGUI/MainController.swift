@@ -366,6 +366,8 @@ final class MainController: ObservableObject {
                 try await AgentdClient.shared.ensureRunning(binary: binary)
                 _ = try await AgentdClient.shared.applyMemory(
                     runId: pending.runId)
+                run.pendingMemory = nil
+                run.objectWillChange.send()
             } catch {
                 NSLog("[memory] applyMemory failed: %@", "\(error)")
                 run.errorMessage = "Save memory failed: \(error)"

@@ -142,6 +142,7 @@ final class AgentdClient: NSObject {
         let serverVersion = ack["protocol_version"] as? Int
             ?? r.protocol_version
         guard serverVersion >= Self.expectedProtocolVersion else {
+            disconnect()
             throw AgentdError.authFailed(
                 "agentd protocol v\(serverVersion) is older than "
                 + "required v\(Self.expectedProtocolVersion)")

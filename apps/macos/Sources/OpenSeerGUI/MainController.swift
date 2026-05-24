@@ -305,6 +305,7 @@ final class MainController: ObservableObject {
         run.objectWillChange.send()
         Task { @MainActor in
             do {
+                try await AgentdClient.shared.ensureRunning(binary: binary)
                 _ = try await AgentdClient.shared.applySkill(
                     runId: pending.runId)
                 // The 5s toast-clear is scheduled by RunSession's
@@ -342,8 +343,15 @@ final class MainController: ObservableObject {
         run.pendingLesson = nil
         run.objectWillChange.send()
         Task { @MainActor in
-            try? await AgentdClient.shared.discardSkill(
-                runId: pending.runId)
+            do {
+                try await AgentdClient.shared.ensureRunning(binary: binary)
+                try await AgentdClient.shared.discardSkill(
+                    runId: pending.runId)
+            } catch {
+                NSLog("[lesson] discardSkill failed: %@", "\(error)")
+                run.pendingLesson = pending
+                run.objectWillChange.send()
+            }
         }
     }
 
@@ -355,6 +363,7 @@ final class MainController: ObservableObject {
         guard let pending = run.pendingMemory else { return }
         Task { @MainActor in
             do {
+                try await AgentdClient.shared.ensureRunning(binary: binary)
                 _ = try await AgentdClient.shared.applyMemory(
                     runId: pending.runId)
             } catch {
@@ -370,8 +379,15 @@ final class MainController: ObservableObject {
         run.pendingMemory = nil
         run.objectWillChange.send()
         Task { @MainActor in
-            try? await AgentdClient.shared.discardMemory(
-                runId: pending.runId)
+            do {
+                try await AgentdClient.shared.ensureRunning(binary: binary)
+                try await AgentdClient.shared.discardMemory(
+                    runId: pending.runId)
+            } catch {
+                NSLog("[memory] discardMemory failed: %@", "\(error)")
+                run.pendingMemory = pending
+                run.objectWillChange.send()
+            }
         }
     }
 

@@ -57,7 +57,7 @@ from .events import TaskEvent
 _DIR = Path.home() / ".openseer"
 RENDEZVOUS_PATH = _DIR / "agentd.json"
 PIDFILE_PATH = _DIR / "agentd.pid"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 log = logging.getLogger("openseer.agentd")
 

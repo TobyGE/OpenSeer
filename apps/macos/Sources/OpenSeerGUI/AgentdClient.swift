@@ -12,6 +12,7 @@ import Foundation
 @MainActor
 final class AgentdClient: NSObject {
     static let shared = AgentdClient()
+    private static let expectedProtocolVersion = 2
 
     // MARK: - Rendezvous (written by the Python daemon)
 
@@ -138,8 +139,15 @@ final class AgentdClient: NSObject {
         guard ack["type"] as? String == "ack" else {
             throw AgentdError.authFailed("\(ack)")
         }
+        let serverVersion = ack["protocol_version"] as? Int
+            ?? r.protocol_version
+        guard serverVersion >= Self.expectedProtocolVersion else {
+            throw AgentdError.authFailed(
+                "agentd protocol v\(serverVersion) is older than "
+                + "required v\(Self.expectedProtocolVersion)")
+        }
         NSLog("[agentd] connected on :%d (protocol v%d)",
-              r.port, r.protocol_version)
+              r.port, serverVersion)
     }
 
     func disconnect() {
